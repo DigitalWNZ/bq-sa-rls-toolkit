@@ -20,3 +20,9 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Run artifacts
+logs/
+backup/
+*.log
+.pytest_cache/

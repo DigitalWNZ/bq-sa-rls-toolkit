@@ -67,36 +67,7 @@ def list_service_accounts(iam, project):
 # --------------------------------------------------------------------------- #
 # 2. BigQuery 权限检查
 # --------------------------------------------------------------------------- #
-class RoleResolver:
-    """获取角色包含的权限列表，并带缓存。"""
-
-    def __init__(self, iam):
-        self.iam = iam
-        self.cache = {}
-
-    def permissions(self, role):
-        if role in self.cache:
-            return self.cache[role]
-        perms = []
-        try:
-            if role.startswith("roles/"):
-                r = self.iam.roles().get(name=role).execute()
-            elif role.startswith("projects/"):
-                r = self.iam.projects().roles().get(name=role).execute()
-            elif role.startswith("organizations/"):
-                r = self.iam.organizations().roles().get(name=role).execute()
-            else:
-                r = {}
-            perms = r.get("includedPermissions", [])
-        except HttpError as e:
-            log(f"  [WARN] 无法获取角色 {role} 的权限: {e.reason if hasattr(e, 'reason') else e}")
-            # 回退：按角色名粗略判断
-            perms = ["bigquery.unknown"] if "bigquery" in role.lower() else []
-        self.cache[role] = perms
-        return perms
-
-    def has_bq(self, role):
-        return any(p.startswith(BQ_PERMISSION_PREFIX) for p in self.permissions(role))
+from gcp_ops import RoleResolver  # noqa: E402  角色权限展开（带缓存），与 v2 工具共用
 
 
 def collect_project_iam_bq_grants(crm, resolver, projects):
