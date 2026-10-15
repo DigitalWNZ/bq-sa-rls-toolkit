@@ -942,7 +942,7 @@ prod-proj.dw.fact_booking,ext.ref_name,refername
 | 脚本 | 0 | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|---|
 | scan_bq_access.py | 成功 | — | （参数错误） | — | — |
-| list_project_sas.py | 成功 | 部分项目读取失败（其余项目已写入 CSV） | （参数错误） | — | — |
+| list_project_sas.py | 成功 | 部分范围 / 项目读取失败（其余结果已写入 CSV） | （参数错误） | — | — |
 | whitelist_groups.py | 成功 | 名册表有误（未做任何变更）、部分失败或探针未通过 | 名单中混入 Copilot SA（未做任何变更） | — | — |
 | apply_bypass_rls.py | 成功 | 有冲突、执行失败或验证失败 | 首条策略没加 `--force-first-policy`（未做任何变更） | — | — （5：最近有作业运行在 STANDARD 版本，未做任何变更） |
 | setup_copilot_sas.py | 成功 | 输入有误 / 一 SA 多 Group（未做任何变更）、部分失败 | 超出 SA 配额 | API SA 有数据读权限 | 存在扮演风险（仅 `--strict-impersonation`） |

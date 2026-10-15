@@ -10,9 +10,12 @@ T2 存量账号扫描：找出对目标表有读/写权限或真实读写过目�
   4. INFORMATION_SCHEMA.JOBS 最近 N 天真实读写过目标表的账号（可兜底 Folder/Org 继承）
      - 作业历史存放在"提交作业的项目"里：跨项目作业需用 --job-projects 追加扫描提交项目，
        或 --jobs-scope organization 用 JOBS_BY_ORGANIZATION 一次覆盖全组织
-     - 同时检测对目标数据集的通配符表查询（table_*），表启用 RLS 后此类查询会失败（R5）
+     - 同时检测对目标数据集的通配符表查询（table_*），表启用 RLS 后此类查询会失败（R5）；
+       组织级视图没有 query 列，--jobs-scope organization 时跳过这一项
   扫描范围可用 --tables/--tables-file 指定表，或 --datasets 指定数据集（展开为全部表）
 Copilot SA（--copilot-members / --copilot-patterns）会被标记并排除出白名单建议。
+结束时输出 [PROJECTS]：扫描到的（非 Copilot）SA 所属项目，--sa-projects-out 可写成项目列表文件，
+作为 list_project_sas.py --projects-file 的输入。
 
 输出 CSV 列:
   principal, principal_type, can_read, can_write, suggested_group(write/read/空),

@@ -209,7 +209,7 @@ CSV 的列：
 | `copilot` | 是否命中 Copilot SA 规则 |
 | `note` | 提示信息（服务代理、仅出现在作业历史、非具体账号等） |
 
-终端还会逐行打印，并在最后汇总写候选、读候选和排除的 Copilot SA 数量，以及 `[PROJECTS] 涉及的 SA 所属项目`（从 SA 邮箱反推：`x@<project>.iam.gserviceaccount.com`、`<project>@appspot...`、`<项目号>-compute@developer...`；Google 托管服务代理不计）。
+终端还会逐行打印，并在最后汇总写候选、读候选和排除的 Copilot SA 数量，以及 `[PROJECTS] 涉及的 SA 所属项目`（从 SA 邮箱反推：`x@<project>.iam.gserviceaccount.com`、`<project>@appspot...`、`<项目号>-compute@developer...`；Copilot SA 和 Google 托管服务代理不计）。
 
 #### 示例
 
@@ -281,7 +281,7 @@ serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com,serviceAccount
    - 已禁用的 SA：默认不建议（加 `--include-disabled` 时建议加入）；
    - 其余 SA：建议加入 `--group` 指定的白名单。
    - Google 托管服务代理（`service-<项目号>@...`、`*@gcp-sa-*`、`@cloudservices`、`@cloudbuild` 等）会在 `note` 里标注。
-5. 某个项目读取失败时打印 `[ERROR]`，其他项目照常输出，最后返回退出码 1。
+5. 某个范围 / 项目读取失败时打印 `[ERROR]`，其余照常输出，最后返回退出码 1。
 
 #### 输出
 CSV 的列和 `scan_bq_access.py` 相同，另外多了 `display_name`、`disabled` 两列，**可以直接作为 `whitelist_groups.py --scan-csv` 的输入**。终端最后会汇总：项目数、SA 总数、建议加入的数量、排除的数量。
