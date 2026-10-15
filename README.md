@@ -614,7 +614,7 @@ API SA 数据权限检查: OK
 | `--mapping-table` / `--mapping-csv` | 二选一 | — | 映射来源，列为 `table_name,col_name,to_name` |
 | `--condition-table` | ✅ | — | 条件表 |
 | `--groups` | ✅ | — | Copilot Group A/B |
-| `--tables` / `--tables-file` | | 映射表里的全部表 | 只处理这些表（用于分批推广） |
+| `--tables` / `--tables-file` | | 映射表里的全部表 | **范围过滤器**：只处理列出的表，用于分批推广；列名、维度仍全部来自映射表（见下方说明） |
 | `--default-project` | | 条件表所在项目 | `table_name` 只写了 `dataset.table` 时用来补全项目 |
 | `--case-insensitive` | | 关闭 | 两侧都用 `UPPER()` 比较（业务表和条件表大小写不一致时使用，R6）；巡检时要带同样的参数 |
 | `--bypass-policy-name` / `--policy-name` | | `rls_bypass_full_access` / `rls_copilot_subquery_policy` | |
@@ -625,6 +625,18 @@ API SA 数据权限检查: OK
 - `table_name`：目标表；
 - `col_name`：目标表里真实的列名，可以是嵌套路径 `a.b`；
 - `to_name`：条件表的标准维度，取值 `region` / `prdtype` / `refername`，不区分大小写。
+
+> [!IMPORTANT]
+> **`--tables` 是什么、不是什么。** 映射表 `adm_user_mem_copilot_tb_col_mapping` 是客户维护的**全量**配置（最终 100% 的表都在里面），脚本默认会给里面的每一张表挂策略。`--tables` / `--tables-file` 只决定**这一次动哪些表**——它不提供任何映射信息，列名和维度仍然全部来自映射表。没有它就做不了分批灰度，所以 RUNBOOK 阶段 7 / 9 每一批都用和阶段 4 相同的 `batch_N.txt`。
+>
+> | 情况 | 结果 |
+> |---|---|
+> | 不给 `--tables` | 处理映射表里的全部表 |
+> | 给了，且表在映射表里 | 只处理这些表，其他表完全不碰 |
+> | 给了，但某张表**不在映射表里** | 这张表输出 `[SKIP] …: 映射表中没有该表的过滤字段配置`，其余照常；最后退出码 1，提醒清单和映射表对不上。脚本不会"猜"列名 |
+> | 表名只写 `dataset.table` | 用 `--default-project`（缺省为条件表所在项目）补全 |
+>
+> 注意 `inspect_rls.py` 的 `--tables` 语义不同：它是**必填**的巡检范围，映射表里没有的表也会巡检（只查白名单策略）。
 
 #### 处理逻辑
 
