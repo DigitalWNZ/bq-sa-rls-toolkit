@@ -32,14 +32,18 @@ def test_t2_scan_classifies_read_write_and_jobs(world, tmp_path_factory):
     # 通配符表查询（R5）需要数据集级权限：reader 只有表级 dataViewer 会 403，所以用 etl（数据集 WRITER）执行
     L.query(etl, f"SELECT COUNT(*) FROM `{L.PROJECT}.{L.DATASET}.sens*`")
     out = str(tmp_path_factory.mktemp("scan") / "scan.csv")
+    projects_out = out.replace("scan.csv", "sa_projects.txt")
     STATE["scan_csv"] = out
 
     def scan_ok():
         code, log = L.run_cli("scan_bq_access.py", "--tables", f"{L.T_ORDERS},{L.T_SENSITIVE}",
                               "--jobs-days", "1", "--job-projects", L.PROJECT,   # C2：额外作业项目（与目标项目相同，验证去重）
                               "--copilot-patterns", L.COPILOT_PATTERN,
-                              "--copilot-members", L.SA_API, "-o", out)
+                              "--copilot-members", L.SA_API, "-o", out, "--sa-projects-out", projects_out)
         assert code == 0, log
+        # 扫描到的 SA 所属项目：作为 list_project_sas.py 项目列表的数据来源
+        assert "[PROJECTS] 涉及的 SA 所属项目" in log and L.PROJECT in log.split("[PROJECTS]")[1], log
+        assert L.PROJECT in open(projects_out, encoding="utf-8").read().split()
         rows = _csv(out)
         e = rows[f"serviceAccount:{L.SA_ETL}"]
         r = rows[f"serviceAccount:{L.SA_READER}"]
@@ -326,6 +330,24 @@ def test_list_project_sas_from_project_list(world, tmp_path):
                           "--copilot-patterns", L.COPILOT_PATTERN, "--copilot-members", L.SA_API)
     assert code == 0, log
     assert f"{L.G_WRITE} <- {L.SA_ETL}" in log and L.SA_COP_HI not in log
+
+
+@pytest.mark.skipif(not L.ORG, reason="需要 RLS_IT_ORG（组织 ID）")
+def test_list_project_sas_org_scope(world, tmp_path):
+    """组织级盘点（Cloud Asset Inventory）：不需要项目列表；能看到数据集 / 表级的授权。"""
+    out = str(tmp_path / "org_sas.csv")
+    code, log = L.run_cli("list_project_sas.py", "--organization", L.ORG, "--include-iam-bound",
+                          "--quota-project", L.PROJECT, "--copilot-patterns", L.COPILOT_PATTERN,
+                          "--copilot-members", L.SA_API, "-o", out)
+    assert code == 0, log
+    assert f"[ASSET] organizations/{L.ORG}: 范围内" in log and "[ASSET-IAM]" in log
+    rows = _csv(out)
+    etl, reader = rows[f"serviceAccount:{L.SA_ETL}"], rows[f"serviceAccount:{L.SA_READER}"]
+    assert etl["suggested_group"] == "write" and f"{L.PROJECT}:asset-sa" in etl["sources"]
+    assert f"datasets/{L.DATASET}:iam-binding:" in etl["sources"]                 # 数据集级 WRITER（ACL 映射为 IAM 角色）
+    assert f"datasets/{L.DATASET}/tables/orders:iam-binding:roles/bigquery.dataViewer" in reader["sources"]   # 表级
+    for s in (L.SA_COP_HI, L.SA_API):
+        assert rows[f"serviceAccount:{s}"]["copilot"] == "True"
 
 
 # =========================================================================== #

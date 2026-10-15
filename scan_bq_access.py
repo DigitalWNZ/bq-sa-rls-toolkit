@@ -188,6 +188,8 @@ def main():
     p.add_argument("--copilot-members", nargs="*", default=[])
     p.add_argument("--copilot-patterns", nargs="*", default=[])
     p.add_argument("-o", "--output", default="scan_bq_access.csv")
+    p.add_argument("--sa-projects-out", default=None,
+                   help="把扫描到的 SA 所属项目写成项目列表文件（供 list_project_sas.py --projects-file 使用）")
     p.add_argument("--project", default=None, help="quota / 运行查询的项目（默认第一张表的项目）")
     p.add_argument("--gcloud-account", default=None)
     args = p.parse_args()
@@ -225,6 +227,14 @@ def main():
               f"jobs(r/w)={r['jobs_read_count']}/{r['jobs_write_count']} {r['note']}")
     print(f"\n共 {len(rows)} 个主体：写白名单候选 {n_w}，读白名单候选 {n_r}，Copilot 排除 {n_c}，"
           f"使用过通配符查询 {n_wc}。结果已写入 {args.output}（请客户审核后再加组）")
+    # 扫描结果里出现的 SA 分别属于哪些项目：作为 list_project_sas.py 项目列表的数据来源（而不是靠人列）
+    home = core.sa_home_projects(r["principal"] for r in rows if not r["copilot"])
+    ops.log(f"[PROJECTS] 涉及的 SA 所属项目 {len(home)} 个（可作为 list_project_sas.py 的项目列表）: "
+            + ", ".join(home))
+    if args.sa_projects_out:
+        with open(args.sa_projects_out, "w", encoding="utf-8") as f:
+            f.write("# scan_bq_access.py 发现的 SA 所属项目（数字为项目号）\n" + "".join(f"{x}\n" for x in home))
+        ops.log(f"[PROJECTS] 已写入 {args.sa_projects_out}")
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@
 
 | 层级 | 用例数 | 结果 | 耗时 |
 |---|---|---|---|
-| 单元测试（`tests/unit`，不访问 GCP） | 126 | ✅ 全部通过 | < 1 秒 |
-| 集成测试（`tests/integration`，在真实 GCP 项目上运行） | 33 | ✅ 全部通过 | 约 17 分钟 |
+| 单元测试（`tests/unit`，不访问 GCP） | 133 | ✅ 全部通过 | < 1 秒 |
+| 集成测试（`tests/integration`，在真实 GCP 项目上运行） | 34（含 1 个需要组织 ID 的用例） | ✅ 全部通过 | 约 17 分钟 |
 
 最后一次完整运行：2026-10-16，在一个独立的测试项目上执行（Cloud Identity 测试域、项目 Owner + Groups Admin 的执行账号；具体标识不写入公开仓库）。
 
@@ -30,12 +30,13 @@ export RLS_IT=1                         # 不设置时会跳过集成测试
 export RLS_IT_PROJECT=<测试项目>
 export RLS_IT_ACCOUNT=<执行账号：项目 Owner + Groups Admin，已 gcloud auth login>
 export RLS_IT_DOMAIN=<Cloud Identity 域名>
-python -m pytest tests/integration -v   # 用例按顺序执行，后面的用例依赖前面的结果（33 个，约 17 分钟）
+export RLS_IT_ORG=<组织 ID>              # 可选；不设置时跳过组织级 SA 盘点用例
+python -m pytest tests/integration -v   # 用例按顺序执行，后面的用例依赖前面的结果（34 个，约 17 分钟）
 ```
 
 ---
 
-## 一、单元测试（126 个）
+## 一、单元测试（133 个）
 
 文件：[tests/unit/test_rls_core.py](tests/unit/test_rls_core.py)、[tests/unit/test_gcp_auth.py](tests/unit/test_gcp_auth.py)
 
@@ -68,11 +69,13 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | `TestAuthTables`（8 张表） | 6 | `--auth-dataset` + 文档默认表名推导出全名，显式表名优先；缺参数 / 格式错误时报错；读 `user_bind ⋈ condition ⋈ group`、`grant_tb ⋈ group` 的 SQL（`group` 是保留字必须反引号）；拒绝注入 |
 | `TestSaRows`（8 张表） | 4 | 权限 SA 行同时兼容 CSV（`account_id,group`）和表查询（`sa,grp`）两种形状并去重；缺 group 报错；**一 SA 一 Group** 冲突检测；授权范围行解析 |
 | `TestAclRoster`（8 张表） | 5 | 名册 `acl_group` 按 Group 邮箱或 `write` / `read` 后缀解析；未知值、邮箱不在白名单组、缺 `--write-group` 时报错；名册 → 建组计划；多行错误一次汇总；名册 vs. 组成员**双向比对**（忽略探针 SA） |
+| `TestSaHomeProject` | 3 | 从 SA 邮箱反推所属项目：自建 SA、App Engine 默认 SA、默认计算 SA（项目号）；用户 / 服务代理 / specialGroup 返回 None；去重排序 |
+| `TestAssetRows` | 4 | Cloud Asset Inventory 结果解析：SA 资源（邮箱、所属项目、显示名、DISABLED）；IAM 策略结果只保留 SA 成员并带资源简名与角色；两类行可直接进入白名单候选并合并来源；组织 / 文件夹 scope 推导与校验 |
 | `test_gcp_auth.py`（E6） | 3 | gcloud 凭证 refresh 调用 gcloud 并设置过期时间；过期后再次 refresh 拿到新 token；`get_credentials` 返回可刷新凭证；`with_quota_project` 保留账号 |
 
 ---
 
-## 二、集成测试（33 个）
+## 二、集成测试（34 个）
 
 文件：[tests/integration/test_e2e.py](tests/integration/test_e2e.py)；测试环境准备：[conftest.py](tests/integration/conftest.py)；独立的核对工具：[itlib.py](tests/integration/itlib.py)
 
@@ -98,7 +101,7 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 
 | # | 用例 | 对应任务 | 验证内容 | 结果 |
 |---|---|---|---|:-:|
-| 1 | `test_t2_scan_classifies_read_write_and_jobs` | T2 | ETL 先执行 INSERT 和 DELETE、reader 执行查询和一次 `sens*` 通配符查询，然后扫描（`--job-projects` 传入同一项目验证去重）：ETL 判为**可写**、来源是数据集、建议进写白名单、作业历史里写次数 ≥ 1；reader 判为**只读**、来源是表级、读次数 ≥ 1、**`wildcard_jobs` ≥ 1 并有 R5 提醒**；同一项目的作业历史只扫一次 | ✅ |
+| 1 | `test_t2_scan_classifies_read_write_and_jobs` | T2 | ETL 先执行 INSERT、DELETE 和一次 `sens*` 通配符查询，reader 执行查询，然后扫描（`--job-projects` 传入同一项目验证去重）：ETL 判为**可写**、来源是数据集、建议进写白名单、作业历史里写次数 ≥ 1、**`wildcard_jobs` ≥ 1 并有 R5 提醒**；reader 判为**只读**、来源是表级、读次数 ≥ 1；同一项目的作业历史只扫一次；`[PROJECTS]` 汇总和 `--sa-projects-out` 文件都包含测试项目 | ✅ |
 | 1b | `test_t2_scan_org_scope_and_dataset_range` | T2 | `--datasets` 展开整个数据集；`--jobs-scope organization` 用组织级视图仍能找到 reader 的读作业和 ETL 的写作业 | ✅ |
 | 2 | `test_t3_whitelist_rejects_copilot_sa` | T3 | 名单里混入 API SA 时退出码 2，**Group 成员没有任何变化** | ✅ |
 | 3 | `test_t3_whitelist_plan_from_scan_csv` | T3 | 从扫描 CSV 生成计划：ETL 进写白名单、reader 进读白名单 | ✅ |
@@ -113,6 +116,7 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | 11 | `test_t7_setup_copilot_sas` | T7 | API SA 数据权限检查通过；项目级扮演风险主体全部被报告；3 个 SA 都存在；**每个 SA 上 TokenCreator 只授予 API SA**；Group 成员正确；orders 授权给高低两组、sensitive 只授权给高权限组；条件表授权给公共组；项目 jobUser 授权给公共组；**重复执行成功** | ✅ |
 | 11a | `test_t7_setup_from_auth_tables` | T7 / 表 3·4·5 | `--auth-dataset` 直接读 `user_bind ⋈ condition ⋈ group`（2 行）和 `grant_tb ⋈ group`（5 行）：计划与 CSV 方式完全一致（cop-hi→高组、cop-lo→低组，6 条 dataViewer 计划，低组没有 sensitive）；`--apply` 后全部 `[EXISTS]`、没有 `[OK]` / `[ERROR]` | ✅ |
 | 11c | `test_t7_rejects_sa_in_two_groups` | T7 | `sas.csv` 里 cop-hi 同时映射到高、低两组：退出码 1、输出"一 SA 一 Group"，**cop-hi 没有被加进低权限组** | ✅ |
+| 11d | `test_list_project_sas_org_scope`（需 `RLS_IT_ORG`） | 白名单候选（组织范围） | `--organization` + `--include-iam-bound`：`[ASSET]` 列出组织内全部 SA；etl 的来源同时有 `asset-sa` 和**数据集级** `iam-binding:roles/bigquery.dataEditor`（legacy WRITER ACL 映射）、reader 的来源有**表级** `tables/orders:iam-binding:roles/bigquery.dataViewer`；Copilot SA 与 API SA 被排除 | ✅ |
 | 11b | `test_list_project_sas_from_project_list` | 白名单候选（宽松） | **项目列表**（同一个项目同时出现在 `--projects` 和 `--projects-file` 里）：合并去重；etl、reader、late 都建议加入写白名单，而且每个来源只出现一次；cop-hi、cop-lo、cop-none、API SA 被排除（`copilot=True`）；`--include-iam-bound` 列出了服务代理；输出直接交给 `whitelist_groups.py --scan-csv`，计划里有 etl、没有 Copilot SA | ✅ |
 | 12 | `test_t8_requires_bypass_policy` | T8 | 表上没有白名单策略时退出码 2，**没有建策略** | ✅ |
 | 13 | `test_t8_apply_from_mapping_and_idempotent` | T8 | 按映射表生成：orders 包含 3 个维度，sensitive 只有 region；**再跑一次两张表都是 `[NOOP]`**（验证规范化比较） | ✅ |
@@ -157,6 +161,7 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | 14 | 用例 1 | reader 做 `sens*` 通配符查询报 403，用例失败 | 通配符表查询需要**数据集级**权限，reader 只有表级 dataViewer | 测试改由 ETL（数据集 WRITER）发起；文档补充这一限制。另外失败的尝试同样会计入作业历史，`wildcard_jobs` 的断言不再假设 reader 为 0 | 用例 1 |
 | 15 | 用例 16b | 只给 sensitive 加 `--case-insensitive`，再带同样参数巡检 3 张表时报另外两张表不一致 | `--case-insensitive` 是**全局开关**，巡检按同一模式核对所有表 | 测试改为三张表统一切换再统一恢复；RUNBOOK 阶段 7 注明"所有表统一加" | 用例 16b |
 | 16 | 8 张表复核 | 白名单名册表 `acl_group_sa` 完全没被程序使用；`group` / `grant_tb` / `user_bind` 只能靠人工导出 CSV；`setup_copilot_sas.py` 不校验"一 SA 一 Group" | 实现时只对照了条件表和映射表 | `setup_copilot_sas.py --auth-dataset` 直接读表并校验一 SA 一 Group；`whitelist_groups.py --acl-table/--acl-out`；`inspect_rls.py --acl-table` 双向比对 | 单元测试 `TestAuthTables` / `TestSaRows` / `TestAclRoster`；用例 4b、11a、11c、15b |
+| 17 | 复盘 | 方式 B（项目列表）的完备性取决于人工列出的项目是否齐全，而且 `--include-iam-bound` 只看项目级 IAM，看不到数据集 / 表级的外部授权 | 盘点的起点是"项目"而不是"组织" | `list_project_sas.py --organization/--folder` 用 Cloud Asset Inventory 做组织级盘点（SA 全量 + 任何层级的 BigQuery 读授权，含 Folder / Org 层）；`scan_bq_access.py --sa-projects-out` 用扫描结果反推项目列表 | 单元测试 `TestSaHomeProject` / `TestAssetRows`；用例 1、11d |
 | 8 | 早期版本 | `DROP ROW ACCESS POLICY` 删最后一条策略时失败 | BigQuery 要求最后一条策略必须用 DROP ALL 删除 | 回退计划在"要删除全部策略"时改用 DROP ALL | `TestPlanRollback.test_last_policy_uses_drop_all`；用例 25 |
 
 ---

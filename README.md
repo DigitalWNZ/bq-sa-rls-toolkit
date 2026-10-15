@@ -99,7 +99,7 @@ flowchart LR
 | [gcp_auth.py](gcp_auth.py) | 公共模块 | 认证：ADC 或指定的 gcloud 账号 |
 | [bq_sa_audit.py](bq_sa_audit.py) | 程序（v1） | 按项目审计 SA 的 BQ 权限和作业记录；它的 `RoleResolver` 被扫描脚本复用 |
 | [setup_group_rls.py](setup_group_rls.py) | 程序（v1） | 单表、单 Group 的原型，已被 2 和 3 取代 |
-| [tests/](tests) | 测试 | 126 个单元测试，33 个集成测试，见 [TESTING.md](TESTING.md) |
+| [tests/](tests) | 测试 | 133 个单元测试，34 个集成测试，见 [TESTING.md](TESTING.md) |
 | [requirements.txt](requirements.txt) | 依赖 | Python 依赖 |
 
 ---
@@ -127,7 +127,7 @@ flowchart LR
 
 ```bash
 gcloud services enable bigquery.googleapis.com iam.googleapis.com cloudresourcemanager.googleapis.com \
-    cloudidentity.googleapis.com iamcredentials.googleapis.com --project=<QUOTA_PROJECT>
+    cloudidentity.googleapis.com iamcredentials.googleapis.com cloudasset.googleapis.com --project=<QUOTA_PROJECT>
 ```
 
 | API | 用到它的程序 |
@@ -136,6 +136,7 @@ gcloud services enable bigquery.googleapis.com iam.googleapis.com cloudresourcem
 | iam | scan、setup_copilot_sas |
 | cloudresourcemanager | scan、setup_copilot_sas，以及自动获取 customer ID |
 | cloudidentity | whitelist_groups、setup_copilot_sas、inspect、rollback（`--delete-group`） |
+| cloudasset | list_project_sas（`--organization` / `--folder`） |
 | iamcredentials | 探针、挂载后验证（扮演 SA） |
 
 ---
@@ -172,6 +173,7 @@ gcloud services enable bigquery.googleapis.com iam.googleapis.com cloudresourcem
 | `--copilot-members` | | — | Copilot API SA / 权限 SA 的邮箱，会被排除 |
 | `--copilot-patterns` | | — | Copilot SA 邮箱的通配符，例如 `copilot-*@*` |
 | `-o` / `--output` | | `scan_bq_access.csv` | 输出的 CSV |
+| `--sa-projects-out` | | — | 把扫描到的 SA **所属项目**写成项目列表文件，直接喂给 `list_project_sas.py --projects-file`（项目列表不再靠人列） |
 | `--project` | | 第一张表所在项目 | quota project，也是运行查询的项目 |
 
 #### 处理逻辑
@@ -207,7 +209,7 @@ CSV 的列：
 | `copilot` | 是否命中 Copilot SA 规则 |
 | `note` | 提示信息（服务代理、仅出现在作业历史、非具体账号等） |
 
-终端还会逐行打印，并在最后汇总写候选、读候选和排除的 Copilot SA 数量。
+终端还会逐行打印，并在最后汇总写候选、读候选和排除的 Copilot SA 数量，以及 `[PROJECTS] 涉及的 SA 所属项目`（从 SA 邮箱反推：`x@<project>.iam.gserviceaccount.com`、`<project>@appspot...`、`<项目号>-compute@developer...`；Google 托管服务代理不计）。
 
 #### 示例
 
@@ -234,6 +236,7 @@ write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [dataset:dw:WRIT
 write user:admin@domain  [project:roles/bigquery.admin; dataset:dw:OWNER] jobs(r/w)=141/149
 
 共 6 个主体：写白名单候选 2，读白名单候选 2，Copilot 排除 1，使用过通配符查询 1。结果已写入 scan.csv（请客户审核后再加组）
+[PROJECTS] 涉及的 SA 所属项目 2 个（可作为 list_project_sas.py 的项目列表）: bi-proj, etl-proj
 ```
 `scan.csv`（节选）：
 ```
@@ -258,19 +261,21 @@ serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com,serviceAccount
 
 | 参数 | 必填 | 默认 | 说明 |
 |---|:-:|---|---|
-| `--projects` / `--projects-file` | 二选一（可以同时用） | — | **项目列表**：空格或逗号分隔，或文件每行一个；重复的项目会去重 |
+| `--projects` / `--projects-file` | 与下一行至少一个 | — | **项目列表**：空格或逗号分隔，或文件每行一个；重复的项目会去重。可以用 `scan_bq_access.py --sa-projects-out` 生成 |
+| `--organization` / `--folder` | 与上一行至少一个 | — | **组织 / 文件夹范围**（ID 或 `organizations/<id>`）：用 Cloud Asset Inventory 盘点范围内**全部** SA，不需要项目列表。需要范围上的 `roles/cloudasset.viewer`（`cloudasset.assets.searchAllResources` / `searchAllIamPolicies`）和 `--quota-project`（已启用 `cloudasset.googleapis.com`） |
+| `--iam-permission` | | `bigquery.tables.getData` | 组织 / 文件夹范围下 `--include-iam-bound` 匹配的权限 |
 | `--group` | | `write` | 这些 SA 建议加入哪个白名单：`write` / `read` |
-| `--include-iam-bound` | | 关闭 | 同时列出各项目 IAM Policy 里出现的 SA（跨项目 SA、Google 托管服务代理等） |
+| `--include-iam-bound` | | 关闭 | 项目范围：同时列出各项目**项目级** IAM Policy 里出现的 SA（跨项目 SA、Google 托管服务代理等）。组织 / 文件夹范围：列出**任何层级**（组织 / 文件夹 / 项目 / 数据集 / 表）授予了 `--iam-permission` 的 SA |
 | `--include-disabled` | | 关闭 | 已禁用的 SA 也建议加入 |
 | `--copilot-members` / `--copilot-patterns` | 强烈建议 | — | 排除 Copilot SA |
 | `-o` / `--output` | | `project_sas.csv` | 输出的 CSV |
-| `--quota-project` | | 第一个项目 | |
+| `--quota-project` | | 第一个项目 | 组织 / 文件夹范围且没有项目列表时必填 |
 
 #### 处理逻辑
 
-1. 对列表里的每个项目，用 IAM API 列出项目内的全部 SA，包括邮箱、显示名、是否禁用（默认计算 SA、App Engine SA 等也在内）。
-2. 加了 `--include-iam-bound` 时，再读取每个项目的 IAM Policy，把其中所有 `serviceAccount:` 成员加进来（来源记为 `iam-binding`）。
-3. 同一个 SA 在多个项目、多个来源中出现时合并成一行，`sources` 记录 `项目:project-sa` / `项目:iam-binding`。
+1. **项目范围**：对列表里的每个项目，用 IAM API 列出项目内的全部 SA，包括邮箱、显示名、是否禁用（默认计算 SA、App Engine SA 等也在内）；加了 `--include-iam-bound` 时，再读取每个项目的**项目级** IAM Policy，把其中所有 `serviceAccount:` 成员加进来（来源记为 `iam-binding`）。
+2. **组织 / 文件夹范围**（Cloud Asset Inventory）：`searchAllResources(assetTypes=iam.googleapis.com/ServiceAccount)` 列出范围内全部 SA（来源 `asset-sa`）；加了 `--include-iam-bound` 时，`searchAllIamPolicies(query="policy.role.permissions:bigquery.tables.getData")` 找出**任何层级**授予了读数据权限的 SA（来源 `资源简名:iam-binding:<角色>`，例如 `folders/42:iam-binding:roles/bigquery.dataViewer`、`projects/p/datasets/d/tables/t:iam-binding:roles/bigquery.dataViewer`）。数据集的 legacy ACL（READER/WRITER/OWNER）会以 `roles/bigquery.dataViewer/dataEditor/dataOwner` 的形式出现。
+3. 同一个 SA 在多个范围、多个来源中出现时合并成一行，`sources` 记录全部来源。
 4. 决定是否建议加入：
    - 命中 Copilot 规则的 SA：不建议，`copilot=True`；
    - 已禁用的 SA：默认不建议（加 `--include-disabled` 时建议加入）；
@@ -310,13 +315,40 @@ write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:projec
 
 3 个项目，共 94 个 SA：建议加入 write 白名单 93 个，排除 Copilot SA 1 个，其他排除 0 个。结果已写入 project_sas.csv（请客户审核后再加组）
 ```
+组织范围（不需要项目列表）：
+```bash
+python list_project_sas.py --organization 123456789012 --include-iam-bound --quota-project ops-proj \
+    --copilot-patterns 'copilot-*@*' --copilot-members copilot-api@proj.iam.gserviceaccount.com -o org_sas.csv
+```
+```
+[ASSET] organizations/123456789012: 范围内 1842 个 SA（Cloud Asset Inventory）
+[ASSET-IAM] organizations/123456789012: 授予了 bigquery.tables.getData 的绑定中出现 211 个 SA（356 条，含组织 / 文件夹 / 项目 / 数据集 / 表级）
+write serviceAccount:iba-reader@bi-proj.iam.gserviceaccount.com  [bi-proj:asset-sa; projects/prod-proj/datasets/dw/tables/fact_orders:iam-binding:roles/bigquery.dataViewer; projects/prod-proj/datasets/dw/tables/fact_booking:iam-binding:roles/bigquery.dataViewer]
+write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:asset-sa; projects/prod-proj/datasets/dw:iam-binding:roles/bigquery.dataEditor]
+write serviceAccount:legacy-report@old-proj.iam.gserviceaccount.com  [old-proj:asset-sa; folders/4201:iam-binding:roles/bigquery.dataViewer]
+-     serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com  [copilot-proj:asset-sa] Copilot SA，已排除出白名单
+...
+
+organizations/123456789012 + 0 个项目，共 1850 个 SA：建议加入 write 白名单 1847 个，排除 Copilot SA 3 个，其他排除 0 个。结果已写入 org_sas.csv（请客户审核后再加组）
+```
+上面 `legacy-report` 的权限来自 Folder 层——这是按表扫描看不到、项目范围也看不到的典型例子。
 
 #### 什么时候用哪个
+
+两种方式回答的问题不同，盲区也不同：
+
+| | `scan_bq_access.py`（从表出发） | `list_project_sas.py` 项目范围 | `list_project_sas.py` 组织范围 |
+|---|---|---|---|
+| 回答的问题 | 谁能访问 / 访问过**这些表** | **这些项目**里有哪些 SA | **整个组织**里有哪些 SA、谁在任何层级被授了 BigQuery 读权限 |
+| 能找到 | 目标表所在项目 / 数据集 / 表三层 IAM 里的任何主体（不管 SA 属于哪个项目）；作业历史里真实读写过的账号 | 列出项目拥有的全部 SA；`--include-iam-bound` 时这些项目**项目级** IAM 里的外部 SA | 范围内全部 SA；`--include-iam-bound` 时组织 / 文件夹 / 项目 / 数据集 / 表**任何层级**的授权 |
+| 找不到 | 权限来自 Folder / Org 层且窗口期内没跑过作业的账号；跨项目提交的作业（要 `--job-projects` 或 `--jobs-scope organization`） | 不在列表里的项目拥有的 SA；只在数据集 / 表级被授权的外部 SA；不判断是否访问过 BQ | 范围之外的 SA（跨组织）；不判断是否访问过 BQ |
+| 需要的权限 | 目标项目的 IAM / BigQuery 读权限 | 各项目 `iam.serviceAccounts.list` | 范围上的 `roles/cloudasset.viewer` |
 
 | 场景 | 推荐 |
 |---|---|
 | 想要精确、最小化的白名单 | `scan_bq_access.py` |
-| 担心漏掉账号、希望"零中断"更稳妥 | `list_project_sas.py`（可以加上 `--include-iam-bound`） |
+| 担心漏掉账号、希望"零中断"更稳妥，且有组织级权限 | `list_project_sas.py --organization <ORG_ID> --include-iam-bound`：不依赖人工项目列表，也补上了 Folder / Org 层授权 |
+| 没有组织级权限 | 先 `scan_bq_access.py --sa-projects-out projects.txt` 得到数据驱动的项目列表，再 `list_project_sas.py --projects-file projects.txt --include-iam-bound` |
 | 两者结合 | 分别生成后合并审核；把两个 CSV 依次传给 `whitelist_groups.py`（分两次执行即可，已经加入的账号会显示为已存在） |
 
 > [!NOTE]
@@ -852,10 +884,12 @@ python rollback_group_rls.py --tables prod-proj.dw.fact_orders \
 | | `AUTH_TABLES` / `auth_table` / `bind_sa_group_sql` / `grant_scope_sql` | 客户权限表的默认表名、`--auth-dataset` 推导、读 `user_bind` / `grant_tb` 的 SQL |
 | | `parse_sa_rows` / `parse_grant_rows` / `sa_group_conflicts` | 权限 SA / 授权范围输入解析（表和 CSV 两种形状），"一 SA 一 Group"校验 |
 | | `resolve_acl_group` / `acl_roster` / `inspect_acl_roster` | 白名单名册解析与名册 vs. Group 成员比对 |
+| | `sa_home_project(s)` / `asset_scope` / `asset_sa_rows` / `asset_iam_sa_rows` | SA 所属项目反推；Cloud Asset Inventory 范围与结果解析 |
 | `gcp_ops.py` | `list_policies` / `run_ddl` / `run_query` | BigQuery 操作 |
 | | `table_add_role` / `dataset_add_reader` / `project_add_role` / `sa_add_role` | IAM 授权（遇到传播或并发冲突会重试） |
 | | `ensure_group` / `group_members` / `add_group_member` / `lookup_group` | Cloud Identity 操作 |
 | | `probe_group` / `verify_full_access` / `impersonate` / `condition_sas` / `RoleResolver` | 探针、挂载后验证、扮演、条件表 SA、角色展开 |
+| | `asset_search_service_accounts` / `asset_search_iam_policies` | Cloud Asset Inventory 搜索（分页） |
 | `gcp_auth.py` | `get_credentials` / `GcloudCredentials` | ADC，或指定 gcloud 账号；gcloud 账号的 token 到期会自动重新获取 |
 
 ---
@@ -867,7 +901,7 @@ python rollback_group_rls.py --tables prod-proj.dw.fact_orders \
 | 程序 | GCP IAM（目标 / 相关项目） | Cloud Identity（Admin Console） |
 |---|---|---|
 | scan_bq_access | `resourcemanager.projects.getIamPolicy`、`iam.roles.get`、`bigquery.datasets.get`、`bigquery.tables.getIamPolicy`、`bigquery.jobs.listAll`（`--job-projects` 的每个项目也需要；`--jobs-scope organization` 需要**组织级**）、`bigquery.jobs.create`（推荐：`roles/iam.securityReviewer` + `roles/bigquery.resourceViewer` + `roles/bigquery.metadataViewer` + `roles/bigquery.jobUser`） | — |
-| list_project_sas | 每个项目 `iam.serviceAccounts.list`；`--include-iam-bound` 时需要 `resourcemanager.projects.getIamPolicy`（推荐：`roles/iam.securityReviewer`） | — |
+| list_project_sas | 项目范围：每个项目 `iam.serviceAccounts.list`；`--include-iam-bound` 时需要 `resourcemanager.projects.getIamPolicy`（推荐：`roles/iam.securityReviewer`）。组织 / 文件夹范围：范围上的 `cloudasset.assets.searchAllResources` / `searchAllIamPolicies`（推荐：`roles/cloudasset.viewer`），quota 项目启用 `cloudasset.googleapis.com` | — |
 | whitelist_groups | 探针：`bigquery.tables.create`、`bigquery.rowAccessPolicies.*`、`bigquery.tables.setIamPolicy`（探针数据集）；对探针 SA 有 `iam.serviceAccounts.getAccessToken`；自动获取 customer ID 时需要 `resourcemanager.projects.get` 和 `organizations.get`；`--acl-table` 时需要名册表的 `bigquery.tables.getData` | **Groups Admin**（建 Group、加成员） |
 | apply_bypass_rls | `bigquery.rowAccessPolicies.list/getIamPolicy/create/update/setIamPolicy`、`bigquery.tables.get/getData`、`bigquery.jobs.create`；验证时对验证 SA 有 getAccessToken（推荐：目标数据集 `roles/bigquery.dataOwner` + `roles/bigquery.jobUser`） | — |
 | setup_copilot_sas | `iam.serviceAccounts.list/create/getIamPolicy/setIamPolicy`、`resourcemanager.projects.getIamPolicy/setIamPolicy`、`iam.roles.get`、`bigquery.tables.getIamPolicy/setIamPolicy`、`bigquery.datasets.get/update`；`--auth-dataset` 时还需要 `user_bind` / `group` / `grant_tb` / `condition` 四张表的 `bigquery.tables.getData` 和 `bigquery.jobs.create`（推荐：`roles/iam.serviceAccountAdmin` + `roles/resourcemanager.projectIamAdmin` + `roles/bigquery.dataOwner`） | **Groups Admin** |

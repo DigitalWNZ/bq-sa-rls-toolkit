@@ -39,7 +39,7 @@
 |---|---|---|---|
 | P1 | Reservation 名称、Admin Project、Location，以及关联的业务项目 | `admin-proj` / `US` / `std_res` | 阶段 1 |
 | P2 | 本批目标表清单 | `batch_N.txt`，每行一个 `project.dataset.table` | 阶段 2、4、7、8 |
-| P2-b | 项目列表（宽松版白名单用）：ETL、BI、调度、业务数据所在的全部项目 | `projects.txt`，每行一个项目 ID | 阶段 2 方式 B |
+| P2-b | 组织 ID（宽松版白名单用，推荐）；没有组织级权限时改为项目列表 | `123456789012`；或 `projects.txt`（可由阶段 2 方式 A 自动生成） | 阶段 2 方式 B / B' |
 | P3 | 权限表所在的数据集（8 张表，见下表），至少要有条件表、映射表、group、grant_tb、user_bind、acl_group_sa | `auth-proj.auth` | 阶段 3、5、6、7、8 |
 | P4 | 过滤字段映射表里本批表的配置已填好 | `adm_user_mem_copilot_tb_col_mapping` | 阶段 7、8 |
 | P5-a | 白名单 Group 邮箱（写、读） | `group_full_write@domain`、`group_full_read@domain` | 阶段 3、4、8 |
@@ -104,12 +104,13 @@ mkdir -p logs backup
 
 **目的**：找出所有会读、写目标表的存量账号，作为白名单候选。有两种方式，可以只用一种，也可以都用：
 
-| 方式 | 程序 | 特点 | 什么时候选 |
-|---|---|---|---|
-| A. 按表精确扫描 | `scan_bq_access.py` | 只列出对目标表有权限或真实访问过的账号，并分读写 | 希望白名单尽量小 |
-| B. 项目列表全量 SA（宽松） | `list_project_sas.py` | 列出给定项目列表中的**全部 SA**，宁多勿漏 | 担心漏掉账号（权限来自 Folder/Org、最近没跑作业、通过 View 间接访问等），希望"零中断"更稳 |
+| 方式 | 程序 | 特点 | 盲区 | 什么时候选 |
+|---|---|---|---|---|
+| A. 按表精确扫描 | `scan_bq_access.py` | 只列出对目标表有权限或真实访问过的账号（不管 SA 属于哪个项目），并分读写 | Folder / Org 层授权且窗口期内没跑过作业的账号 | 希望白名单尽量小 |
+| B. 组织范围全量 SA（宽松，推荐） | `list_project_sas.py --organization` | 用 Cloud Asset Inventory 列出**整个组织**的 SA，以及任何层级（含 Folder / Org、数据集、表）授了 BigQuery 读权限的 SA，不需要项目列表 | 不判断是否访问过 BQ（所以叫宽松） | 担心漏掉账号，希望"零中断"更稳，且有组织级 `roles/cloudasset.viewer` |
+| B'. 项目列表全量 SA | `list_project_sas.py --projects-file` | 列出给定项目列表中的全部 SA | 列表之外项目的 SA；只在数据集 / 表级被授权的外部 SA | 没有组织级权限时的替代；项目列表用方式 A 的 `--sa-projects-out` 生成，不要靠人列 |
 
-**输入**：P2（`batch_N.txt`）、P5-c、P5-f；方式 B 还需要**项目列表**（`projects.txt`，每行一个项目 ID，包括 ETL、BI、调度等所在的项目）
+**输入**：P2（`batch_N.txt`）、P5-c、P5-f；方式 B 还需要组织 ID 和一个启用了 `cloudasset.googleapis.com` 的 quota 项目；方式 B' 需要项目列表 `projects.txt`
 
 #### 方式 A：按表精确扫描
 
@@ -126,7 +127,7 @@ prod-proj.dw.fact_booking
 python scan_bq_access.py --tables-file batch_N.txt --jobs-days 90 \
     --job-projects etl-proj,bi-proj \
     --copilot-patterns 'copilot-*@*' --copilot-members copilot-api@proj.iam.gserviceaccount.com \
-    -o scan_batch_N.csv $A | tee logs/02_scan.log
+    -o scan_batch_N.csv --sa-projects-out projects.txt $A | tee logs/02_scan.log
 ```
 
 **处理逻辑（简述）**：读取每张目标表所在项目、数据集、表的 IAM，把角色展开成具体权限，按读（`tables.getData`）和写（`tables.updateData`）分类；再查最近 90 天作业历史里真实读写过这些表的账号（含 `--job-projects` 指定的提交项目），两者合并后输出 CSV；同时检测近期对目标数据集的通配符表查询。
@@ -150,8 +151,10 @@ write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [dataset:dw:WRIT
 write user:admin@domain  [project:roles/bigquery.admin; dataset:dw:OWNER] jobs(r/w)=141/149
 
 共 7 个主体：写白名单候选 3，读白名单候选 2，Copilot 排除 1，使用过通配符查询 1。结果已写入 scan_batch_N.csv（请客户审核后再加组）
+[PROJECTS] 涉及的 SA 所属项目 2 个（可作为 list_project_sas.py 的项目列表）: bi-proj, etl-proj
+[PROJECTS] 已写入 projects.txt
 ```
-`scan_batch_N.csv` 的内容见[附录 A](#附录-a输入文件模板)。
+`scan_batch_N.csv` 的内容见[附录 A](#附录-a输入文件模板)；`projects.txt` 就是方式 B' 的项目列表（数据驱动，而不是人工猜）。
 
 **校验**
 - [ ] 末尾汇总行显示"写白名单候选 X，读白名单候选 Y，Copilot 排除 Z"；
@@ -165,16 +168,39 @@ write user:admin@domain  [project:roles/bigquery.admin; dataset:dw:OWNER] jobs(r
 - [ ] 风险 R1：确认下游通过 View 访问这些表的系统账号也在 CSV 里；不在的话手工补充。
 - [ ] 确认 `--job-projects` 覆盖了所有会提交作业访问这些表的项目（Zeus、IBA、Dataflow 等所在项目）。
 
-#### 方式 B：项目列表全量 SA（宽松）
+#### 方式 B：组织范围全量 SA（宽松，推荐）
 
-**示例输入** `projects.txt`
+```bash
+# 组织 ID 用 gcloud organizations list 查看；--quota-project 是任意一个启用了 cloudasset API 的项目
+python list_project_sas.py --organization 123456789012 --include-iam-bound --quota-project ops-proj \
+    --group write --copilot-patterns 'copilot-*@*' --copilot-members copilot-api@proj.iam.gserviceaccount.com \
+    -o org_sas_batch_N.csv $A | tee logs/02_list_sas.log
 ```
-# ETL、BI、调度、业务数据所在的全部项目
-prod-proj
-etl-proj
+
+**处理逻辑（简述）**：用 Cloud Asset Inventory 列出组织内全部 SA；`--include-iam-bound` 再搜出任何层级（组织 / 文件夹 / 项目 / 数据集 / 表）授予了 `bigquery.tables.getData` 的 SA；同一 SA 合并为一行，`sources` 记录每个来源；排除 Copilot SA 和已禁用的 SA；其余建议加入 `--group` 指定的白名单。
+
+**示例输出**（节选；`legacy-report` 的权限来自 Folder 层，是方式 A 和 B' 都看不到的典型例子）
+```
+[ASSET] organizations/123456789012: 范围内 1842 个 SA（Cloud Asset Inventory）
+[ASSET-IAM] organizations/123456789012: 授予了 bigquery.tables.getData 的绑定中出现 211 个 SA（356 条，含组织 / 文件夹 / 项目 / 数据集 / 表级）
+write serviceAccount:iba-reader@bi-proj.iam.gserviceaccount.com  [bi-proj:asset-sa; projects/prod-proj/datasets/dw/tables/fact_orders:iam-binding:roles/bigquery.dataViewer; projects/prod-proj/datasets/dw/tables/fact_booking:iam-binding:roles/bigquery.dataViewer]
+write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:asset-sa; projects/prod-proj/datasets/dw:iam-binding:roles/bigquery.dataEditor]
+write serviceAccount:legacy-report@old-proj.iam.gserviceaccount.com  [old-proj:asset-sa; folders/4201:iam-binding:roles/bigquery.dataViewer]
+-     serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com  [copilot-proj:asset-sa] Copilot SA，已排除出白名单
+...
+
+organizations/123456789012 + 0 个项目，共 1850 个 SA：建议加入 write 白名单 1847 个，排除 Copilot SA 3 个，其他排除 0 个。结果已写入 org_sas_batch_N.csv（请客户审核后再加组）
+```
+
+#### 方式 B'：项目列表全量 SA（没有组织级权限时）
+
+**示例输入** `projects.txt`（建议直接用方式 A 的 `--sa-projects-out` 生成；手工补充时只支持整行注释）
+```
+# scan_bq_access.py 发现的 SA 所属项目（数字为项目号）
 bi-proj
-# 即使把 Copilot 项目列进来，Copilot SA 也会被排除（只支持整行注释，不要写行尾注释）
-copilot-proj
+etl-proj
+# 手工补充：调度平台所在项目
+sched-proj
 ```
 
 ```bash
@@ -183,33 +209,28 @@ python list_project_sas.py --projects-file projects.txt --group write --include-
     -o project_sas_batch_N.csv $A | tee logs/02_list_sas.log
 ```
 
-**处理逻辑（简述）**：列出列表中每个项目的全部 SA；加了 `--include-iam-bound` 时，各项目 IAM 中出现的跨项目 SA 和服务代理也会列出；多个项目里的同一个 SA 合并为一行；排除 Copilot SA 和已禁用的 SA；其余 SA 都建议加入 `--group` 指定的白名单。
+**处理逻辑（简述）**：列出列表中每个项目的全部 SA；加了 `--include-iam-bound` 时，各项目**项目级** IAM 中出现的跨项目 SA 和服务代理也会列出；多个项目里的同一个 SA 合并为一行；排除 Copilot SA 和已禁用的 SA；其余 SA 都建议加入 `--group` 指定的白名单。
 
 **示例输出**（节选）
 ```
-[SA] prod-proj: 项目内 18 个 SA
-[IAM] prod-proj: IAM 绑定中出现 82 个 SA
-[SA] etl-proj: 项目内 6 个 SA
-[IAM] etl-proj: IAM 绑定中出现 31 个 SA
 [SA] bi-proj: 项目内 4 个 SA
 [IAM] bi-proj: IAM 绑定中出现 27 个 SA
-[SA] copilot-proj: 项目内 3 个 SA
-[IAM] copilot-proj: IAM 绑定中出现 20 个 SA
-write serviceAccount:123456789012-compute@developer.gserviceaccount.com  [prod-proj:project-sa; prod-proj:iam-binding]
-write serviceAccount:123456789012@cloudservices.gserviceaccount.com  [prod-proj:iam-binding] Google 托管服务代理
--     serviceAccount:copilot-api@proj.iam.gserviceaccount.com  [copilot-proj:project-sa] Copilot SA，已排除出白名单
--     serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com  [copilot-proj:project-sa] Copilot SA，已排除出白名单
--     serviceAccount:copilot-u-002@copilot-proj.iam.gserviceaccount.com  [copilot-proj:project-sa] Copilot SA，已排除出白名单
-write serviceAccount:iba-reader@bi-proj.iam.gserviceaccount.com  [bi-proj:project-sa; prod-proj:iam-binding]
-write serviceAccount:service-123456789012@gcp-sa-pubsub.iam.gserviceaccount.com  [prod-proj:iam-binding] Google 托管服务代理
-write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:project-sa; prod-proj:iam-binding]
+[SA] etl-proj: 项目内 6 个 SA
+[IAM] etl-proj: IAM 绑定中出现 31 个 SA
+[SA] sched-proj: 项目内 3 个 SA
+[IAM] sched-proj: IAM 绑定中出现 20 个 SA
+write serviceAccount:123456789012-compute@developer.gserviceaccount.com  [bi-proj:project-sa; bi-proj:iam-binding]
+write serviceAccount:123456789012@cloudservices.gserviceaccount.com  [bi-proj:iam-binding] Google 托管服务代理
+write serviceAccount:iba-reader@bi-proj.iam.gserviceaccount.com  [bi-proj:project-sa; bi-proj:iam-binding]
+write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:project-sa; sched-proj:iam-binding]
 ...
 
-4 个项目，共 97 个 SA：建议加入 write 白名单 94 个，排除 Copilot SA 3 个，其他排除 0 个。结果已写入 project_sas_batch_N.csv（请客户审核后再加组）
+3 个项目，共 61 个 SA：建议加入 write 白名单 61 个，排除 Copilot SA 0 个，其他排除 0 个。结果已写入 project_sas_batch_N.csv（请客户审核后再加组）
 ```
 
 **校验**
-- [ ] 退出码为 0（为 1 时说明有项目读取失败，看 `[ERROR]` 行，补上权限后重跑）；
+- [ ] 退出码为 0（为 1 时说明有范围 / 项目读取失败，看 `[ERROR]` 行，补上权限后重跑）；
+- [ ] 方式 B：`[ASSET]` 的 SA 数量和客户预期的组织规模相符，`[ASSET-IAM]` 里出现了 `folders/` 或 `organizations/` 来源时逐个确认这些 Folder / Org 层授权；
 - [ ] 汇总行里"排除 Copilot SA"的数量和权限 SA 数量加 API SA（1 个）一致；
 - [ ] **客户审核**：
   - 确认 `copilot=True` 的行包含所有权限 SA 和 API SA；
@@ -836,12 +857,13 @@ prod-proj.dw.fact_orders
 prod-proj.dw.fact_booking
 ```
 
-**projects.txt**（P2-b，宽松版白名单用；每行一个项目 ID）
+**projects.txt**（P2-b，方式 B' 用；每行一个项目 ID。推荐由 `scan_bq_access.py --sa-projects-out projects.txt` 生成，再手工补充）
 ```
-# ETL、BI、调度、业务数据所在的全部项目
-prod-proj
-etl-proj
+# scan_bq_access.py 发现的 SA 所属项目（数字为项目号）
 bi-proj
+etl-proj
+# 手工补充：调度平台所在项目
+sched-proj
 ```
 
 **scan_batch_N.csv**（阶段 2 的输出、阶段 3 的输入；两种扫描方式列相同，`list_project_sas.py` 多 `display_name`、`disabled` 两列）

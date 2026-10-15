@@ -80,6 +80,10 @@ class Ctx:
     def ci(self):
         return self._build("cloudidentity", "v1")
 
+    @cached_property
+    def asset(self):
+        return self._build("cloudasset", "v1")
+
     def location(self, project, dataset):
         key = f"{project}.{dataset}"
         if key not in self._loc:
@@ -477,3 +481,28 @@ def probe_group(ctx, group_email, probe_sa, dataset, timeout=600, interval=15):
         if time.time() >= deadline:
             return False
         time.sleep(interval)
+
+
+# --------------------------------------------------------------------------- #
+# Cloud Asset Inventory：组织 / 文件夹范围的 SA 与 IAM 绑定盘点（不依赖项目列表）
+# --------------------------------------------------------------------------- #
+def asset_search_service_accounts(ctx, scope):
+    """scope 内全部 SA（searchAllResources，assetType=iam.googleapis.com/ServiceAccount）。"""
+    api, out = ctx.asset.v1(), []
+    req = api.searchAllResources(scope=scope, assetTypes=["iam.googleapis.com/ServiceAccount"], pageSize=500)
+    while req is not None:
+        resp = req.execute()
+        out.extend(resp.get("results", []))
+        req = api.searchAllResources_next(req, resp)
+    return out
+
+
+def asset_search_iam_policies(ctx, scope, query):
+    """scope 内命中 query 的 IAM 策略（组织 / 文件夹 / 项目 / 数据集 / 表 等任何层级）。"""
+    api, out = ctx.asset.v1(), []
+    req = api.searchAllIamPolicies(scope=scope, query=query, pageSize=500)
+    while req is not None:
+        resp = req.execute()
+        out.extend(resp.get("results", []))
+        req = api.searchAllIamPolicies_next(req, resp)
+    return out

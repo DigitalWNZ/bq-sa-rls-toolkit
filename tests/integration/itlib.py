@@ -7,6 +7,7 @@
   RLS_IT_ACCOUNT           已 gcloud auth login 的执行账号（需 Owner + Cloud Identity Groups Admin）
   RLS_IT_DOMAIN            Cloud Identity 域名（group 邮箱后缀）
   RLS_IT_DATASET           可选，默认 rls_it（US）
+  RLS_IT_ORG               可选，组织 ID；设置后运行组织级 SA 盘点用例（需 cloudasset API 与组织级查看权限）
 """
 
 import os
@@ -29,6 +30,7 @@ PROJECT = os.environ.get("RLS_IT_PROJECT", "")
 ACCOUNT = os.environ.get("RLS_IT_ACCOUNT", "")
 DOMAIN = os.environ.get("RLS_IT_DOMAIN", "")
 DATASET = os.environ.get("RLS_IT_DATASET", "rls_it")
+ORG = os.environ.get("RLS_IT_ORG", "")            # 可选：组织 ID，用于 Cloud Asset Inventory 的组织级用例
 LOCATION = "US"
 
 PREFIX = "rlsit"

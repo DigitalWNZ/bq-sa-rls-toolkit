@@ -790,3 +790,70 @@ class TestAclRoster:
         assert any("stranger@x.com" in i and "不在白名单名册" in i for i in issues)
         assert any("late@p.iam.gserviceaccount.com" in i and "还没有加入" in i for i in issues)
         assert core.inspect_acl_roster(roster, roster) == []
+
+
+# --------------------------------------------------------------------------- #
+# SA 所属项目反推 / Cloud Asset Inventory 结果解析（组织级 SA 盘点）
+# --------------------------------------------------------------------------- #
+class TestSaHomeProject:
+    def test_user_managed_app_engine_and_default_compute(self):
+        assert core.sa_home_project("serviceAccount:etl@etl-proj.iam.gserviceaccount.com") == "etl-proj"
+        assert core.sa_home_project("prod-proj@appspot.gserviceaccount.com") == "prod-proj"
+        assert core.sa_home_project("123456789012-compute@developer.gserviceaccount.com") == "123456789012"
+
+    def test_non_sa_and_google_managed_return_none(self):
+        assert core.sa_home_project("user:admin@x.com") is None
+        assert core.sa_home_project("service-123@gcp-sa-pubsub.iam.gserviceaccount.com") is None
+        assert core.sa_home_project("123456789012@cloudservices.gserviceaccount.com") is None   # 服务代理
+        assert core.sa_home_project("specialGroup:projectReaders") is None
+
+    def test_home_projects_dedup_sorted(self):
+        ps = ["serviceAccount:a@p2.iam.gserviceaccount.com", "serviceAccount:b@p1.iam.gserviceaccount.com",
+              "serviceAccount:c@p1.iam.gserviceaccount.com", "user:x@y.com"]
+        assert core.sa_home_projects(ps) == ["p1", "p2"]
+
+
+class TestAssetRows:
+    SA = {"name": "//iam.googleapis.com/projects/my-proj/serviceAccounts/etl@my-proj.iam.gserviceaccount.com",
+          "assetType": "iam.googleapis.com/ServiceAccount", "project": "projects/123",
+          "displayName": "ETL", "state": "ENABLED",
+          "additionalAttributes": {"email": "ETL@my-proj.iam.gserviceaccount.com"},
+          "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/my-proj"}
+
+    def test_sa_resource_rows(self):
+        rows = core.asset_sa_rows([self.SA, {**self.SA, "state": "DISABLED", "additionalAttributes": {},
+                                             "name": "//iam.googleapis.com/projects/my-proj/serviceAccounts/old@my-proj.iam.gserviceaccount.com"}])
+        assert rows[0] == {"email": "etl@my-proj.iam.gserviceaccount.com", "project": "my-proj",
+                           "display_name": "ETL", "disabled": False, "source": "asset-sa"}
+        assert rows[1]["email"] == "old@my-proj.iam.gserviceaccount.com" and rows[1]["disabled"] is True
+
+    def test_iam_policy_rows_keep_only_sa_members_with_resource_and_role(self):
+        results = [{"resource": "//bigquery.googleapis.com/projects/p/datasets/d/tables/t",
+                    "policy": {"bindings": [
+                        {"role": "roles/bigquery.dataViewer",
+                         "members": ["serviceAccount:r@p.iam.gserviceaccount.com", "user:u@x.com"]}]}},
+                   {"resource": "//cloudresourcemanager.googleapis.com/folders/42",
+                    "policy": {"bindings": [{"role": "roles/bigquery.dataEditor",
+                                             "members": ["serviceAccount:e@q.iam.gserviceaccount.com"]}]}}]
+        rows = core.asset_iam_sa_rows(results)
+        assert rows == [
+            {"email": "r@p.iam.gserviceaccount.com", "project": "projects/p/datasets/d/tables/t",
+             "display_name": "", "disabled": False, "source": "iam-binding:roles/bigquery.dataViewer"},
+            {"email": "e@q.iam.gserviceaccount.com", "project": "folders/42",
+             "display_name": "", "disabled": False, "source": "iam-binding:roles/bigquery.dataEditor"}]
+
+    def test_rows_feed_whitelist_builder(self):
+        rows = core.build_sa_whitelist_rows(core.asset_sa_rows([self.SA]) + core.asset_iam_sa_rows([
+            {"resource": "//cloudresourcemanager.googleapis.com/organizations/1",
+             "policy": {"bindings": [{"role": "roles/bigquery.admin",
+                                      "members": ["serviceAccount:etl@my-proj.iam.gserviceaccount.com"]}]}}]),
+            "write")
+        assert len(rows) == 1
+        assert rows[0]["sources"] == "my-proj:asset-sa; organizations/1:iam-binding:roles/bigquery.admin"
+
+    def test_asset_scope(self):
+        assert core.asset_scope(organization="123") == "organizations/123"
+        assert core.asset_scope(organization="organizations/123") == "organizations/123"
+        assert core.asset_scope(folder="folders/9") == "folders/9"
+        with pytest.raises(ValueError):
+            core.asset_scope()

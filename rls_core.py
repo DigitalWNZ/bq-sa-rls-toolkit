@@ -782,3 +782,85 @@ def inspect_acl_roster(actual, roster, ignore=()):
         for m in sorted(r - a):
             issues.append(f"白名单名册中的 {m} 还没有加入 {g}（存量任务可能查不到数据，请热修补）")
     return issues
+
+
+# --------------------------------------------------------------------------- #
+# SA 所属项目反推 / Cloud Asset Inventory（组织级 SA 盘点，不依赖项目列表）
+# --------------------------------------------------------------------------- #
+_SA_HOME_RES = [
+    re.compile(r"^[^@]+@([a-z0-9][a-z0-9\-]*)\.iam\.gserviceaccount\.com$"),   # 用户自建 SA
+    re.compile(r"^([a-z0-9][a-z0-9\-]*)@appspot\.gserviceaccount\.com$"),       # App Engine 默认 SA
+    re.compile(r"^(\d+)-compute@developer\.gserviceaccount\.com$"),             # 默认计算 SA（项目号）
+]   # Google 托管服务代理（含 <项目号>@cloudservices）不算：它们不是客户需要盘点的 SA
+
+
+def sa_home_project(principal):
+    """SA 邮箱（可带前缀）-> 所属项目 ID 或项目号；非 SA / Google 托管服务代理返回 None。"""
+    e = principal.strip().lower()
+    if ":" in e:
+        prefix, _, e = e.partition(":")
+        if prefix != "serviceaccount":
+            return None
+    if is_service_agent(f"serviceAccount:{e}"):
+        return None
+    for rx in _SA_HOME_RES:
+        m = rx.match(e)
+        if m:
+            return m.group(1)
+    return None
+
+
+def sa_home_projects(principals):
+    """去重排序后的 SA 所属项目列表（可作为 list_project_sas.py 的项目列表）。"""
+    return sorted({p for p in (sa_home_project(x) for x in principals) if p})
+
+
+def asset_scope(organization=None, folder=None):
+    """Cloud Asset Inventory 搜索范围：organizations/<id> 或 folders/<id>。"""
+    if organization:
+        o = str(organization).strip()
+        return o if o.startswith("organizations/") else f"organizations/{o}"
+    if folder:
+        f = str(folder).strip()
+        return f if f.startswith("folders/") else f"folders/{f}"
+    raise ValueError("需要 --organization 或 --folder")
+
+
+def asset_resource_short(full_name):
+    """'//bigquery.googleapis.com/projects/p/datasets/d/tables/t' -> 'projects/p/datasets/d/tables/t'。"""
+    name = full_name or ""
+    if name.startswith("//"):
+        name = name[2:].split("/", 1)[1] if "/" in name[2:] else name[2:]
+    return name
+
+
+def asset_sa_rows(results):
+    """
+    Cloud Asset searchAllResources(assetTypes=iam.googleapis.com/ServiceAccount) 的结果
+    -> [{"email","project","display_name","disabled","source"}]，可直接交给 build_sa_whitelist_rows。
+    """
+    rows = []
+    for r in results:
+        attrs = r.get("additionalAttributes") or {}
+        email = (attrs.get("email") or r.get("name", "").rsplit("/serviceAccounts/", 1)[-1]).lower()
+        parent = r.get("parentFullResourceName", "")
+        project = parent.rsplit("/", 1)[-1] if "/projects/" in parent else (r.get("project") or "").split("/")[-1]
+        rows.append({"email": email, "project": project, "display_name": r.get("displayName", ""),
+                     "disabled": str(r.get("state", "")).upper() == "DISABLED", "source": "asset-sa"})
+    return rows
+
+
+def asset_iam_sa_rows(results):
+    """
+    Cloud Asset searchAllIamPolicies 的结果 -> 其中的 SA 成员行（任何层级：组织 / 文件夹 / 项目 / 数据集 / 表）。
+    project 字段放资源简名，source 放 iam-binding:<role>。
+    """
+    rows = []
+    for r in results:
+        res = asset_resource_short(r.get("resource", ""))
+        for b in (r.get("policy") or {}).get("bindings", []):
+            for m in b.get("members", []):
+                if m.startswith("serviceAccount:"):
+                    rows.append({"email": member_email(m), "project": res, "display_name": "",
+                                 "disabled": False, "source": f"iam-binding:{b.get('role', '')}"})
+    return rows
