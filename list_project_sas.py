@@ -14,9 +14,10 @@
   B. 组织 / 文件夹 --organization / --folder：用 Cloud Asset Inventory 在整个范围内盘点，
      不需要知道项目列表：
        - searchAllResources(iam.googleapis.com/ServiceAccount)：范围内【全部】SA；
-       - --include-iam-bound：searchAllIamPolicies(policy.role.permissions:bigquery.tables.getData)，
-         任何层级（组织 / 文件夹 / 项目 / 数据集 / 表）授予了 BigQuery 读数据权限的 SA，
-         这也覆盖了 scan_bq_access.py 看不到的 Folder / Org 层授权。
+       - --include-iam-bound：searchAllIamPolicies（getData OR updateData），任何层级
+         （组织 / 文件夹 / 项目 / 数据集 / 表）授予了 BigQuery 读 / 写数据权限的 SA，
+         这也覆盖了 scan_bq_access.py 看不到的 Folder / Org 层授权；绑定里的 Group 用 Cloud Identity
+         递归展开成 SA（--no-expand-groups 关闭）；不在范围内盘点结果里的 SA 标为"范围外"。
      需要范围上的 cloudasset.assets.searchAllResources / searchAllIamPolicies（如 roles/cloudasset.viewer），
      以及 quota 项目启用 cloudasset.googleapis.com。
 
@@ -57,8 +58,12 @@ def main():
     p.add_argument("--organization", default=None,
                    help="组织 ID（或 organizations/<id>）：用 Cloud Asset Inventory 盘点全组织 SA，不需要项目列表")
     p.add_argument("--folder", default=None, help="文件夹 ID（或 folders/<id>），同上")
-    p.add_argument("--iam-permission", default="bigquery.tables.getData",
-                   help="组织 / 文件夹范围下 --include-iam-bound 匹配的权限（默认 bigquery.tables.getData）")
+    p.add_argument("--iam-permission", nargs="+",
+                   default=["bigquery.tables.getData", "bigquery.tables.updateData"],
+                   help="组织 / 文件夹范围下 --include-iam-bound 匹配的权限，任一命中即可"
+                        "（默认 bigquery.tables.getData bigquery.tables.updateData）")
+    p.add_argument("--no-expand-groups", action="store_true",
+                   help="组织 / 文件夹范围下不展开绑定里的 Group（默认用 Cloud Identity 递归展开成 SA）")
     p.add_argument("--group", choices=["write", "read"], default="write",
                    help="SA 建议加入的白名单（默认 write）")
     p.add_argument("--include-iam-bound", action="store_true",
@@ -82,22 +87,48 @@ def main():
         p.error("组织 / 文件夹范围需要 --quota-project（已启用 cloudasset.googleapis.com 的项目）")
     ctx = ops.Ctx(get_credentials(args.gcloud_account, quota), quota)
 
-    sas, failed = [], False
+    sas, failed, scope_emails = [], False, None
     if scope:
         try:
             found = core.asset_sa_rows(ops.asset_search_service_accounts(ctx, scope))
             ops.log(f"[ASSET] {scope}: 范围内 {len(found)} 个 SA（Cloud Asset Inventory）")
             sas += found
+            scope_emails = {f["email"] for f in found}
         except Exception as e:  # noqa: BLE001
             failed = True
             ops.log(f"[ERROR] 盘点 {scope} 的 SA 失败: {e}")
         if args.include_iam_bound:
             try:
-                query = f"policy.role.permissions:{args.iam_permission}"
-                bound = core.asset_iam_sa_rows(ops.asset_search_iam_policies(ctx, scope, query))
-                ops.log(f"[ASSET-IAM] {scope}: 授予了 {args.iam_permission} 的绑定中出现 "
+                perms = core.split_items(args.iam_permission)
+                results = ops.asset_search_iam_policies(ctx, scope, core.iam_permission_query(perms))
+                bound = core.asset_iam_sa_rows(results)
+                ops.log(f"[ASSET-IAM] {scope}: 授予了 {' / '.join(perms)} 的绑定中出现 "
                         f"{len({b['email'] for b in bound})} 个 SA（{len(bound)} 条，含组织 / 文件夹 / 项目 / 数据集 / 表级）")
                 sas += bound
+                # 通过 Group 获得权限的 SA：绑定里只有组邮箱，要用 Cloud Identity 递归展开
+                refs = core.asset_iam_group_refs(results)
+                if refs and not args.no_expand_groups:
+                    expanded, n_sa = {}, 0
+                    for g, res, role in refs:
+                        if g not in expanded:
+                            expanded[g] = (ops.expand_group(ctx, g)
+                                           if ops.group_members_typed(ctx, g) is not None else None)
+                        if expanded[g] is None:
+                            ops.log(f"  [WARN] 无法展开 group:{g}（{res} 上的 {role}；外部域或无权限），其中的 SA 未列出")
+                            continue
+                        members, unresolved = expanded[g]
+                        for email, info in members.items():
+                            if info["type"] == "SERVICE_ACCOUNT":
+                                n_sa += 1
+                                path = " > ".join(f"group:{x}" for x in info["via"])
+                                sas.append({"email": email, "project": res, "display_name": "", "disabled": False,
+                                            "source": f"iam-binding:{role} via {path}"})
+                        for ug, via in unresolved:
+                            ops.log(f"  [WARN] group:{g} 中的嵌套组 {ug} 无法展开（外部域或无权限），其中的 SA 未列出")
+                    ops.log(f"[ASSET-GROUP] {scope}: 绑定中出现 {len(expanded)} 个 Group，"
+                            f"递归展开得到 {n_sa} 条 SA 授权")
+                elif refs:
+                    ops.log(f"[ASSET-GROUP] {scope}: 绑定中出现 {len({r[0] for r in refs})} 个 Group（--no-expand-groups，未展开）")
             except Exception as e:  # noqa: BLE001
                 failed = True
                 ops.log(f"[ERROR] 搜索 {scope} 的 IAM 策略失败: {e}")
@@ -123,7 +154,7 @@ def main():
 
     rows = core.build_sa_whitelist_rows(
         sas, args.group, core.split_items(args.copilot_members),
-        core.split_items(args.copilot_patterns), args.include_disabled)
+        core.split_items(args.copilot_patterns), args.include_disabled, scope_emails=scope_emails)
     with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         w.writeheader()

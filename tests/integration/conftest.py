@@ -84,6 +84,22 @@ def _create_tables():
                               STRUCT('{L.SA_READER}', 'full_read')])""", location=L.LOCATION).result()
 
 
+def _create_authorized_view():
+    from google.cloud import bigquery
+    client = L.bq()
+    ds = bigquery.Dataset(f"{L.PROJECT}.{L.VIEW_DATASET}")
+    ds.location = L.LOCATION
+    client.create_dataset(ds, exists_ok=True)
+    client.query(f"CREATE OR REPLACE VIEW `{L.T_VIEW}` AS SELECT * FROM `{L.T_ORDERS}`",
+                 location=L.LOCATION).result()
+    src = client.get_dataset(f"{L.PROJECT}.{L.DATASET}")
+    ref = {"projectId": L.PROJECT, "datasetId": L.VIEW_DATASET, "tableId": "v_orders"}
+    if not any(e.entity_type == "view" and e.entity_id == ref for e in src.access_entries):
+        src.access_entries = list(src.access_entries) + [bigquery.AccessEntry(None, "view", ref)]
+        L.eventually(lambda: client.update_dataset(src, ["access_entries"]),
+                     timeout=300, interval=10, desc="authorize view")
+
+
 def _ensure_sa(email):
     iam = L.api("iam", "v1")
     account_id = email.split("@")[0]
@@ -169,5 +185,12 @@ def world():
                  desc="etl ready")
     L.eventually(lambda: L.query(L.impersonate(L.SA_READER), f"SELECT 1 FROM `{L.T_ORDERS}` LIMIT 1"),
                  desc="reader ready")
+    # 授权视图：另一个数据集里的视图读 orders，被 rls_it 授权；late 只有视图的读权限（R1）
+    _create_authorized_view()
+    _table_viewer(L.T_VIEW, f"serviceAccount:{L.SA_LATE}")
+    # 嵌套组：业务组里有 Copilot SA，验证白名单的嵌套组防护（P0）
+    L.ensure_group(L.G_NESTED)
+    L.eventually(lambda: L.set_group_member(L.G_NESTED, L.SA_COP_HI, True), timeout=300, interval=15,
+                 desc="nested group member")
     _log("环境就绪")
     return {}

@@ -6,8 +6,8 @@
 
 | 层级 | 用例数 | 结果 | 耗时 |
 |---|---|---|---|
-| 单元测试（`tests/unit`，不访问 GCP） | 133 | ✅ 全部通过 | < 1 秒 |
-| 集成测试（`tests/integration`，在真实 GCP 项目上运行） | 34（含 1 个需要组织 ID 的用例） | ✅ 全部通过 | 约 17 分钟 |
+| 单元测试（`tests/unit`，不访问 GCP） | 148 | ✅ 全部通过 | < 1 秒 |
+| 集成测试（`tests/integration`，在真实 GCP 项目上运行） | 38（含 1 个需要组织 ID 的用例） | ✅ 全部通过 | 约 20 分钟 |
 
 最后一次完整运行：2026-10-16，在一个独立的测试项目上执行（Cloud Identity 测试域、项目 Owner + Groups Admin 的执行账号；具体标识不写入公开仓库）。
 
@@ -31,14 +31,14 @@ export RLS_IT_PROJECT=<测试项目>
 export RLS_IT_ACCOUNT=<执行账号：项目 Owner + Groups Admin，已 gcloud auth login>
 export RLS_IT_DOMAIN=<Cloud Identity 域名>
 export RLS_IT_ORG=<组织 ID>              # 可选；不设置时跳过组织级 SA 盘点用例
-python -m pytest tests/integration -v   # 用例按顺序执行，后面的用例依赖前面的结果（34 个，约 17 分钟）
+python -m pytest tests/integration -v   # 用例按顺序执行，后面的用例依赖前面的结果（38 个，约 20 分钟）
 ```
 
 ---
 
-## 一、单元测试（133 个）
+## 一、单元测试（148 个）
 
-文件：[tests/unit/test_rls_core.py](tests/unit/test_rls_core.py)、[tests/unit/test_gcp_auth.py](tests/unit/test_gcp_auth.py)
+文件：[tests/unit/test_rls_core.py](tests/unit/test_rls_core.py)、[tests/unit/test_gcp_auth.py](tests/unit/test_gcp_auth.py)、[tests/unit/test_gcp_ops.py](tests/unit/test_gcp_ops.py)
 
 | 测试类 | 数量 | 覆盖内容 |
 |---|:-:|---|
@@ -71,11 +71,16 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | `TestAclRoster`（8 张表） | 5 | 名册 `acl_group` 按 Group 邮箱或 `write` / `read` 后缀解析；未知值、邮箱不在白名单组、缺 `--write-group` 时报错；名册 → 建组计划；多行错误一次汇总；名册 vs. 组成员**双向比对**（忽略探针 SA） |
 | `TestSaHomeProject` | 3 | 从 SA 邮箱反推所属项目：自建 SA、App Engine 默认 SA、默认计算 SA（项目号）；用户 / 服务代理 / specialGroup 返回 None；去重排序 |
 | `TestAssetRows` | 4 | Cloud Asset Inventory 结果解析：SA 资源（邮箱、所属项目、显示名、DISABLED）；IAM 策略结果只保留 SA 成员并带资源简名与角色；两类行可直接进入白名单候选并合并来源；组织 / 文件夹 scope 推导与校验 |
+| `TestExpandGroup` | 4 | 递归展开 Group：直接成员与嵌套成员都带路径；环只访问一次；读不到的嵌套组单独报告；成员缺 `type` 时按邮箱推断（`*.gserviceaccount.com` → SA） |
+| `TestNestedCopilot` | 2 | 只报告**经由嵌套组**混入的 Copilot SA（直接成员由原检查负责）并给出路径；干净时无问题、无提醒 |
+| `TestAnalysisPrincipals` | 2 | analyzeIamPolicy 结果解析：直接授权、经由嵌套 Group（`groupEdges` 还原路径）、Folder 继承；读写由 `accessControlLists` 的权限判断；来源标签 `analyze:<资源>:<角色> via group:a > group:b` |
+| `TestCaiExtras` | 4 | CAI 权限查询用 `OR` 拼接并拒绝非法权限名；绑定里的 Group 引用提取；不在范围盘点结果里的 SA 标"范围外"；数据集 ACL 里的授权视图 / 授权数据集提取 |
+| `test_gcp_ops.py` | 3 | Cloud Asset 请求退避：429 / 5xx 按 2、4… 秒指数退避后成功；非临时错误（如 403）立即抛出；超过次数后放弃 |
 | `test_gcp_auth.py`（E6） | 3 | gcloud 凭证 refresh 调用 gcloud 并设置过期时间；过期后再次 refresh 拿到新 token；`get_credentials` 返回可刷新凭证；`with_quota_project` 保留账号 |
 
 ---
 
-## 二、集成测试（34 个）
+## 二、集成测试（38 个）
 
 文件：[tests/integration/test_e2e.py](tests/integration/test_e2e.py)；测试环境准备：[conftest.py](tests/integration/conftest.py)；独立的核对工具：[itlib.py](tests/integration/itlib.py)
 
@@ -92,6 +97,8 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | `adm_user_mem_copilot_group` / `_grant_tb` / `_user_bind` | 文档 8 张表中的表级权限组字典（g1=高权限组、g2=低权限组）、Group 授权范围（与 CSV 版 grants 相同的 5 条）、用户绑定（c1→g1、c2→g2，即 cop-hi→高、cop-lo→低） |
 | `adm_user_mem_copilot_acl_group_sa` | 白名单名册：etl→写白名单（写 Group 邮箱）、reader→`full_read`（写标识） |
 | 测试准备时创建的 SA | `rlsit-api`（API SA）、`rlsit-etl`（存量写，数据集 WRITER）、`rlsit-reader`（存量读，表级 dataViewer）、`rlsit-probe`（探针）、`rlsit-late`（补加遗漏账号用）；均有 jobUser，执行账号可以扮演 |
+| 数据集 `rls_it_views` | 授权视图 `v_orders`（`SELECT * FROM rls_it.orders`），在 `rls_it` 的 ACL 里登记为授权视图；`rlsit-late` 只有这个视图的 dataViewer（对底表没有任何权限） |
+| 嵌套测试组 `rlsit-nested` | 成员是 `rlsit-cop-hi`（Copilot SA），用来验证"业务组里藏了 Copilot SA" |
 | 被测脚本创建的资源 | Group：`rlsit-full-write/read`、`rlsit-copilot-high/low/all`；SA：`rlsit-cop-hi/lo/none` |
 
 测试数据（region, prd_type, refername, amount）：
@@ -102,8 +109,10 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | # | 用例 | 对应任务 | 验证内容 | 结果 |
 |---|---|---|---|:-:|
 | 1 | `test_t2_scan_classifies_read_write_and_jobs` | T2 | ETL 先执行 INSERT、DELETE 和一次 `sens*` 通配符查询，reader 执行查询，然后扫描（`--job-projects` 传入同一项目验证去重）：ETL 判为**可写**、来源是数据集、建议进写白名单、作业历史里写次数 ≥ 1、**`wildcard_jobs` ≥ 1 并有 R5 提醒**；reader 判为**只读**、来源是表级、读次数 ≥ 1；同一项目的作业历史只扫一次；`[PROJECTS]` 汇总和 `--sa-projects-out` 文件都包含测试项目 | ✅ |
+| 1a | `test_t2_scan_authorized_view_and_analyze` | T2 / R1 | 扫描 orders：输出 `[AUTH-VIEW]` 和 `[ANALYZE]`；**只能读授权视图的 late** 被列为读候选，来源 `authorized-view:…/table:roles/bigquery.dataViewer`，备注"授权视图"；`--analyze-scope` 展开 Group：cop-hi 的来源带 `via group:<copilot-high>` 且 `copilot=True`；`--no-authorized` 时不再追踪视图 | ✅ |
 | 1b | `test_t2_scan_org_scope_and_dataset_range` | T2 | `--datasets` 展开整个数据集；`--jobs-scope organization` 用组织级视图仍能找到 reader 的读作业和 ETL 的写作业 | ✅ |
 | 2 | `test_t3_whitelist_rejects_copilot_sa` | T3 | 名单里混入 API SA 时退出码 2，**Group 成员没有任何变化** | ✅ |
+| 2b | `test_t3_whitelist_rejects_copilot_sa_in_nested_group` | T3 / P0 | 把内含 Copilot SA 的 `rlsit-nested` 组加入读白名单：退出码 2，输出 `group:rlsit-nested 的嵌套成员 rlsit-cop-hi（路径 …）`，**读白名单组成员不变** | ✅ |
 | 3 | `test_t3_whitelist_plan_from_scan_csv` | T3 | 从扫描 CSV 生成计划：ETL 进写白名单、reader 进读白名单 | ✅ |
 | 4 | `test_t3_whitelist_apply_with_probe` | T3 | 用 `EMPTY` 方式建两个 Group 并加入成员；**两条探针都输出"已生效"**；核对成员 | ✅ |
 | 4b | `test_t3_whitelist_from_acl_table_and_acl_out` | T3 / 表 8 | **直接用白名单名册表建组**：计划里 etl 进写组、reader 进读组；`--acl-out` 导出的 CSV 恰好是两行 `sa,acl_group`（Group 邮箱）；再 `--apply` 幂等；名册里出现 `acl_group='vip'` 时退出码 1、**组成员与执行前完全一致** | ✅ |
@@ -116,17 +125,19 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | 11 | `test_t7_setup_copilot_sas` | T7 | API SA 数据权限检查通过；项目级扮演风险主体全部被报告；3 个 SA 都存在；**每个 SA 上 TokenCreator 只授予 API SA**；Group 成员正确；orders 授权给高低两组、sensitive 只授权给高权限组；条件表授权给公共组；项目 jobUser 授权给公共组；**重复执行成功** | ✅ |
 | 11a | `test_t7_setup_from_auth_tables` | T7 / 表 3·4·5 | `--auth-dataset` 直接读 `user_bind ⋈ condition ⋈ group`（2 行）和 `grant_tb ⋈ group`（5 行）：计划与 CSV 方式完全一致（cop-hi→高组、cop-lo→低组，6 条 dataViewer 计划，低组没有 sensitive）；`--apply` 后全部 `[EXISTS]`、没有 `[OK]` / `[ERROR]` | ✅ |
 | 11c | `test_t7_rejects_sa_in_two_groups` | T7 | `sas.csv` 里 cop-hi 同时映射到高、低两组：退出码 1、输出"一 SA 一 Group"，**cop-hi 没有被加进低权限组** | ✅ |
-| 11d | `test_list_project_sas_org_scope`（需 `RLS_IT_ORG`） | 白名单候选（组织范围） | `--organization` + `--include-iam-bound`：`[ASSET]` 列出组织内全部 SA；etl 的来源同时有 `asset-sa` 和**数据集级** `iam-binding:roles/bigquery.dataEditor`（legacy WRITER ACL 映射）、reader 的来源有**表级** `tables/orders:iam-binding:roles/bigquery.dataViewer`；Copilot SA 与 API SA 被排除 | ✅ |
+| 11d | `test_list_project_sas_org_scope`（需 `RLS_IT_ORG`） | 白名单候选（组织范围） | `--organization` + `--include-iam-bound`：`[ASSET]` 列出组织内全部 SA；etl 的来源同时有 `asset-sa` 和**数据集级** `iam-binding:roles/bigquery.dataEditor`（legacy WRITER ACL 映射）、reader 的来源有**表级** `tables/orders:iam-binding:roles/bigquery.dataViewer`；Copilot SA 与 API SA 被排除；**经由 Group 获得权限的 SA 被展开**：输出 `[ASSET-GROUP]`，cop-lo（只通过 copilot-low 组拿到 orders 读权限）的来源是 `iam-binding:roles/bigquery.dataViewer via group:<copilot-low>` | ✅ |
 | 11b | `test_list_project_sas_from_project_list` | 白名单候选（宽松） | **项目列表**（同一个项目同时出现在 `--projects` 和 `--projects-file` 里）：合并去重；etl、reader、late 都建议加入写白名单，而且每个来源只出现一次；cop-hi、cop-lo、cop-none、API SA 被排除（`copilot=True`）；`--include-iam-bound` 列出了服务代理；输出直接交给 `whitelist_groups.py --scan-csv`，计划里有 etl、没有 Copilot SA | ✅ |
 | 12 | `test_t8_requires_bypass_policy` | T8 | 表上没有白名单策略时退出码 2，**没有建策略** | ✅ |
 | 13 | `test_t8_apply_from_mapping_and_idempotent` | T8 | 按映射表生成：orders 包含 3 个维度，sensitive 只有 region；**再跑一次两张表都是 `[NOOP]`**（验证规范化比较） | ✅ |
 | 14 | `test_t8_heterogeneous_columns_per_table` | T8 | **字段不同的表**：orders_alt 的条件里是 `area`、`ptype`、`meta.ref`，没有 `region`；bad_mapping_t 因为列不存在被跳过（退出码 1），**其他表不受影响**，它自己只保留白名单策略 | ✅ |
 | 15 | `test_inspect_clean` | 巡检 | 3 张表都是 `[OK]`，退出码 0 | ✅ |
+| 15a | `test_inspect_detects_copilot_sa_in_nested_group` | 巡检 / P0 | 把 `rlsit-nested` 临时加进读白名单组：巡检报 `白名单组 <read> 经由嵌套组 <read> > rlsit-nested 混入 Copilot SA: rlsit-cop-hi`、退出码 1；移除后恢复 0 | ✅ |
 | 15b | `test_inspect_acl_roster_reconciliation` | 巡检 / 表 8 | `--acl-table --probe-sa`：名册与组一致时 0 问题（探针 SA 被忽略）；名册多一行 late → `[ISSUE] 还没有加入`；名册删掉 reader → `[ISSUE] 不在白名单名册中`；恢复后 0 问题 | ✅ |
+| 15c | `test_r1_rls_applies_through_authorized_view` | R1 实测 | 两条策略都在、late 不在白名单时，late **经由授权视图**查询 orders 得到 0 行——授权视图不绕过底表 RLS | ✅ |
 | 16 | `test_inspect_detects_filter_drift_and_fix` | 巡检 | 手工把 sensitive 的 Copilot 策略改成 `region="HK"`，巡检报"过滤条件"问题；重跑 T8 后显示 `[REPLACE]`；再巡检恢复正常 | ✅ |
 | 16b | `test_e1_case_insensitive_round_trip` | E1 | `--case-insensitive` 重建 sensitive 的策略，过滤条件含 `UPPER(`；不带参数巡检报不一致，带参数巡检正常；cop-hi 的过滤结果不变；再不带参数重建恢复 | ✅ |
 | 16c | `test_e2_inspect_copilot_membership` | E2 | 带 `--api-sa` 巡检：cop-none 没有条件行只给 `[WARN]`、退出码 0、条件表聚簇正常；把 cop-hi 临时加进低权限组后巡检报"同时属于多个 Copilot 组"、退出码 1；移除后恢复 | ✅ |
-| 17 | `test_t5_hot_patch_whitelist_and_inspect_membership` | T5 / 巡检 | 只把遗漏账号补进读白名单（不加 `--project`，验证 quota project 回退逻辑）；巡检能发现白名单组里混入"Copilot SA" | ✅ |
+| 17 | `test_t5_hot_patch_whitelist_and_inspect_membership` | T5 / 巡检 | 只把遗漏账号补进读白名单（不加 `--project`，验证 quota project 回退逻辑）；**late 进白名单后经由授权视图看到全量 6 行**（R1）；巡检能发现白名单组里混入"Copilot SA" | ✅ |
 | 18 | `test_e2e_1_3_rows_filtered_and_job_identity_is_permission_sa` | Gate 2 ①③ | 通过扮演链：cop-hi 在 orders 看到 [1,3]，在 sensitive 看到 [1,2,3,6]，在 **orders_alt 看到 [1,3]**；cop-lo 在 orders 看到 [1,4,6]，在 **orders_alt 看到 [1,4,6]**；**作业身份是权限 SA** | ✅ |
 | 19 | `test_e2e_1_low_group_cannot_read_high_table` | Gate 2 ① | cop-lo 查询 sensitive 报 Access Denied | ✅ |
 | 20 | `test_e2e_2_no_condition_returns_nothing` | Gate 2 ② | 没有条件行的 cop-none 查到 0 行 | ✅ |
@@ -162,6 +173,9 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | 15 | 用例 16b | 只给 sensitive 加 `--case-insensitive`，再带同样参数巡检 3 张表时报另外两张表不一致 | `--case-insensitive` 是**全局开关**，巡检按同一模式核对所有表 | 测试改为三张表统一切换再统一恢复；RUNBOOK 阶段 7 注明"所有表统一加" | 用例 16b |
 | 16 | 8 张表复核 | 白名单名册表 `acl_group_sa` 完全没被程序使用；`group` / `grant_tb` / `user_bind` 只能靠人工导出 CSV；`setup_copilot_sas.py` 不校验"一 SA 一 Group" | 实现时只对照了条件表和映射表 | `setup_copilot_sas.py --auth-dataset` 直接读表并校验一 SA 一 Group；`whitelist_groups.py --acl-table/--acl-out`；`inspect_rls.py --acl-table` 双向比对 | 单元测试 `TestAuthTables` / `TestSaRows` / `TestAclRoster`；用例 4b、11a、11c、15b |
 | 17 | 复盘 | 方式 B（项目列表）的完备性取决于人工列出的项目是否齐全，而且 `--include-iam-bound` 只看项目级 IAM，看不到数据集 / 表级的外部授权 | 盘点的起点是"项目"而不是"组织" | `list_project_sas.py --organization/--folder` 用 Cloud Asset Inventory 做组织级盘点（SA 全量 + 任何层级的 BigQuery 读授权，含 Folder / Org 层）；`scan_bq_access.py --sa-projects-out` 用扫描结果反推项目列表 | 单元测试 `TestSaHomeProject` / `TestAssetRows`；用例 1、11d |
+| 18 | 外部评审（CAI 逻辑） | 组织级盘点丢掉了 `group:` 绑定：SA 先进业务组、组被授权的情况全部漏掉；白名单组里**嵌套**的组若含 Copilot SA，`whitelist_groups.py` / `inspect_rls.py` 都发现不了（Copilot SA 会命中 `FILTER TRUE`） | `searchAllIamPolicies` 不展开 Group；原检查只看直接成员 | `list_project_sas.py` 用 Cloud Identity 递归展开绑定里的 Group；`whitelist_groups.py` 加组前递归检查（命中拒绝、读不到默认中止，`--allow-unverified-groups` 放行）；`inspect_rls.py` 巡检递归检查；`scan_bq_access.py` 组内含 Copilot SA 的组不给建议，`--analyze-scope` 用 analyzeIamPolicy 展开 Group 与 Folder / Org 继承 | `TestExpandGroup` / `TestNestedCopilot` / `TestAnalysisPrincipals`；用例 1a、2b、11d、15a |
+| 19 | 外部评审 | 只匹配 `getData`：只有 `updateData` 的自定义角色漏掉；外部组织的 SA 与本组织 SA 混在一起不易审核；大组织 CAI 调用容易 429 | — | `--iam-permission` 默认 `getData OR updateData`；不在范围盘点结果里的 SA 标"范围外"；CAI 请求指数退避重试 | `TestCaiExtras`、`test_gcp_ops.py`；手工在测试组织运行时确有 1 个外部 SA 被标"范围外" |
+| 20 | 外部评审（R1） | 授权视图的读者不在扫描结果里，但启用 RLS 后他们经由视图查询会得到 0 行 | 扫描跳过了数据集 ACL 里的授权视图条目 | `scan_bq_access.py` 默认追踪授权视图 / 数据集一层（`--no-authorized` 关闭） | `TestCaiExtras.test_authorized_entries`；用例 1a、15c、17 |
 | 8 | 早期版本 | `DROP ROW ACCESS POLICY` 删最后一条策略时失败 | BigQuery 要求最后一条策略必须用 DROP ALL 删除 | 回退计划在"要删除全部策略"时改用 DROP ALL | `TestPlanRollback.test_last_policy_uses_drop_all`；用例 25 |
 
 ---
@@ -177,7 +191,9 @@ python -m pytest tests/integration -v   # 用例按顺序执行，后面的用�
 | gcloud 凭证跨过 1 小时的真实刷新 | 刷新逻辑有单元测试（模拟过期）；没有做真实的 1 小时以上运行 |
 | 当前版本回退脚本的 `--strip-only`、`--revoke-table-viewer`、`--delete-group` | 决策逻辑有单元测试；旧版本在测试环境实测过，重构后的版本没有重新跑集成测试 |
 | 多区域、跨项目的目标表 | 测试环境只有一个项目、一个区域（US） |
-| Folder/Org 层继承的权限 | 扫描脚本不直接扫描，靠作业历史兜底 |
+| Folder/Org 层继承的权限 | `--analyze-scope` 用组织 / 项目范围调用；测试组织里没有在 Folder 层授 BigQuery 权限，Folder 继承路径只有单元测试 |
+| 外部域 / 无权限读取的 Group（`[UNVERIFIED]` 路径） | 逻辑有单元测试（`test_unreadable_nested_group_reported`）；测试域里没有外部组 |
+| 多层授权视图链 | 只追一层，有意为之；文档已注明 |
 | 大规模（上百张表、上百个 SA） | 没有做性能测试；SA 数量受单项目 100 个的上限约束 |
 | Reservation 切换（Step 1） | 不在本工具集范围内（文档附带的 shell 脚本已有单独的实测报告） |
 | Copilot 后端（S8）真实调用 | 用 SDK 和 gcloud 的扮演链模拟，和后端的调用方式等价 |

@@ -106,8 +106,8 @@ mkdir -p logs backup
 
 | 方式 | 程序 | 特点 | 盲区 | 什么时候选 |
 |---|---|---|---|---|
-| A. 按表精确扫描 | `scan_bq_access.py` | 只列出对目标表有权限或真实访问过的账号（不管 SA 属于哪个项目），并分读写 | Folder / Org 层授权且窗口期内没跑过作业的账号 | 希望白名单尽量小 |
-| B. 组织范围全量 SA（宽松，推荐） | `list_project_sas.py --organization` | 用 Cloud Asset Inventory 列出**整个组织**的 SA，以及任何层级（含 Folder / Org、数据集、表）授了 BigQuery 读权限的 SA，不需要项目列表 | 不判断是否访问过 BQ（所以叫宽松） | 担心漏掉账号，希望"零中断"更稳，且有组织级 `roles/cloudasset.viewer` |
+| A. 按表精确扫描 | `scan_bq_access.py` | 只列出对目标表有权限或真实访问过的账号（不管 SA 属于哪个项目），并分读写；默认追踪授权视图 / 数据集的读者 | 不加 `--analyze-scope` 时：Folder / Org 层授权且窗口期内没跑过作业的账号、只经由 Group 获得权限的账号 | 希望白名单尽量小 |
+| B. 组织范围全量 SA（宽松，推荐） | `list_project_sas.py --organization` | 用 Cloud Asset Inventory 列出**整个组织**的 SA，以及任何层级（含 Folder / Org、数据集、表）授了 BigQuery 读 / 写数据权限的 SA（含经由 Group 的授权），不需要项目列表 | 不判断是否访问过 BQ（所以叫宽松） | 担心漏掉账号，希望"零中断"更稳，且有组织级 `roles/cloudasset.viewer` |
 | B'. 项目列表全量 SA | `list_project_sas.py --projects-file` | 列出给定项目列表中的全部 SA | 列表之外项目的 SA；只在数据集 / 表级被授权的外部 SA | 没有组织级权限时的替代；项目列表用方式 A 的 `--sa-projects-out` 生成，不要靠人列 |
 
 **输入**：P2（`batch_N.txt`）、P5-c、P5-f；方式 B 还需要组织 ID 和一个启用了 `cloudasset.googleapis.com` 的 quota 项目；方式 B' 需要项目列表 `projects.txt`
@@ -128,9 +128,15 @@ python scan_bq_access.py --tables-file batch_N.txt --jobs-days 90 \
     --job-projects etl-proj,bi-proj \
     --copilot-patterns 'copilot-*@*' --copilot-members copilot-api@proj.iam.gserviceaccount.com \
     -o scan_batch_N.csv --sa-projects-out projects.txt $A | tee logs/02_scan.log
+
+# 有组织级 roles/cloudasset.viewer 时建议再加 --analyze-scope：展开 Group（含嵌套）、补上 Folder / Org 继承的授权
+python scan_bq_access.py --tables-file batch_N.txt --jobs-days 90 --job-projects etl-proj,bi-proj \
+    --analyze-scope organizations/123456789012 \
+    --copilot-patterns 'copilot-*@*' --copilot-members copilot-api@proj.iam.gserviceaccount.com \
+    -o scan_batch_N.csv --sa-projects-out projects.txt $A | tee logs/02_scan.log
 ```
 
-**处理逻辑（简述）**：读取每张目标表所在项目、数据集、表的 IAM，把角色展开成具体权限，按读（`tables.getData`）和写（`tables.updateData`）分类；再查最近 90 天作业历史里真实读写过这些表的账号（含 `--job-projects` 指定的提交项目），两者合并后输出 CSV；同时检测近期对目标数据集的通配符表查询。
+**处理逻辑（简述）**：读取每张目标表所在项目、数据集、表的 IAM，把角色展开成具体权限，按读（`tables.getData`）和写（`tables.updateData`）分类；再查最近 90 天作业历史里真实读写过这些表的账号（含 `--job-projects` 指定的提交项目），两者合并后输出 CSV；同时检测近期对目标数据集的通配符表查询。目标数据集 ACL 里的**授权视图 / 授权数据集**会被追踪，它们的读者记为可读（经由视图查询时底表 RLS 同样生效）。加了 `--analyze-scope` 时再用 Cloud Asset `analyzeIamPolicy` 展开 Group 和 Folder / Org 继承。候选里的 Group 会递归展开，组内有 Copilot SA 的组不给建议。
 
 **示例输出**（终端；每行格式 `建议组 主体 [权限来源] jobs(读/写次数) 备注`）
 ```
@@ -154,6 +160,16 @@ write user:admin@domain  [project:roles/bigquery.admin; dataset:dw:OWNER] jobs(r
 [PROJECTS] 涉及的 SA 所属项目 2 个（可作为 list_project_sas.py 的项目列表）: bi-proj, etl-proj
 [PROJECTS] 已写入 projects.txt
 ```
+加了 `--analyze-scope`、且目标数据集授权了视图时，还会看到（节选）：
+```
+[AUTH-VIEW] 授权视图 prod-proj.mart.v_orders
+[ANALYZE] prod-proj.dw.fact_orders（organizations/123456789012）
+[ANALYZE] prod-proj.mart.v_orders（organizations/123456789012）
+read  serviceAccount:report@bi-proj.iam.gserviceaccount.com  [authorized-view:prod-proj.mart.v_orders/table:roles/bigquery.dataViewer] jobs(r/w)=0/0 只通过授权视图 / 授权数据集访问目标数据（经由视图查询时底表 RLS 同样生效）
+read  serviceAccount:etl-b@etl-proj.iam.gserviceaccount.com  [analyze:projects/prod-proj/datasets/dw:roles/bigquery.dataViewer via group:bi-readers@domain] jobs(r/w)=0/0 经由 Group 获得权限：可以把该账号单独加白名单，或把整个 Group 加入白名单（需确认组内没有 Copilot SA）
+-     group:mixed@domain  [dataset:dw:roles/bigquery.dataViewer] jobs(r/w)=0/0 组内含 Copilot SA（copilot-u-001@copilot-proj.iam.gserviceaccount.com 路径 mixed@domain > inner@domain），不能整组加入白名单；请把组内的存量账号单独加入
+```
+
 `scan_batch_N.csv` 的内容见[附录 A](#附录-a输入文件模板)；`projects.txt` 就是方式 B' 的项目列表（数据驱动，而不是人工猜）。
 
 **校验**
@@ -165,7 +181,9 @@ write user:admin@domain  [project:roles/bigquery.admin; dataset:dw:OWNER] jobs(r
   - `note` 列写着"非具体账号"的行（如 `specialGroup:projectReaders`）：没法加入 Group，要确认对应的人和系统已有其他账号在白名单里；
   - `copilot=True` 的行不会进入白名单（这是正确的）；
   - `wildcard_jobs` 不为 0 的账号：近期用过 `table_*` 通配符查询，**表启用 RLS 后这类查询会失败**，要提前通知对应团队改写 SQL（R5）。
-- [ ] 风险 R1：确认下游通过 View 访问这些表的系统账号也在 CSV 里；不在的话手工补充。
+  - `note` 列写着"只通过授权视图"的账号：它们经由视图读数据，不进白名单就会查到 0 行，通常要保留；
+  - `note` 列写着"组内含 Copilot SA"的 Group：不能整组加入，把组里的存量账号单独加进名单；
+- [ ] 风险 R1：授权视图 / 数据集已自动追踪（只追一层）；多层视图链或普通视图的下游系统账号，确认在 CSV 里，不在的话手工补充。
 - [ ] 确认 `--job-projects` 覆盖了所有会提交作业访问这些表的项目（Zeus、IBA、Dataflow 等所在项目）。
 
 #### 方式 B：组织范围全量 SA（宽松，推荐）
@@ -177,15 +195,18 @@ python list_project_sas.py --organization 123456789012 --include-iam-bound --quo
     -o org_sas_batch_N.csv $A | tee logs/02_list_sas.log
 ```
 
-**处理逻辑（简述）**：用 Cloud Asset Inventory 列出组织内全部 SA；`--include-iam-bound` 再搜出任何层级（组织 / 文件夹 / 项目 / 数据集 / 表）授予了 `bigquery.tables.getData` 的 SA；同一 SA 合并为一行，`sources` 记录每个来源；排除 Copilot SA 和已禁用的 SA；其余建议加入 `--group` 指定的白名单。
+**处理逻辑（简述）**：用 Cloud Asset Inventory 列出组织内全部 SA；`--include-iam-bound` 再搜出任何层级（组织 / 文件夹 / 项目 / 数据集 / 表）授予了 `bigquery.tables.getData` 或 `updateData` 的 SA，绑定里的 Group 用 Cloud Identity 递归展开成 SA，不在组织盘点结果里的 SA（其他组织 / 已删除）标"范围外"；同一 SA 合并为一行，`sources` 记录每个来源；排除 Copilot SA 和已禁用的 SA；其余建议加入 `--group` 指定的白名单。
 
 **示例输出**（节选；`legacy-report` 的权限来自 Folder 层，是方式 A 和 B' 都看不到的典型例子）
 ```
 [ASSET] organizations/123456789012: 范围内 1842 个 SA（Cloud Asset Inventory）
-[ASSET-IAM] organizations/123456789012: 授予了 bigquery.tables.getData 的绑定中出现 211 个 SA（356 条，含组织 / 文件夹 / 项目 / 数据集 / 表级）
+[ASSET-IAM] organizations/123456789012: 授予了 bigquery.tables.getData / bigquery.tables.updateData 的绑定中出现 211 个 SA（356 条，含组织 / 文件夹 / 项目 / 数据集 / 表级）
+[ASSET-GROUP] organizations/123456789012: 绑定中出现 14 个 Group，递归展开得到 63 条 SA 授权
 write serviceAccount:iba-reader@bi-proj.iam.gserviceaccount.com  [bi-proj:asset-sa; projects/prod-proj/datasets/dw/tables/fact_orders:iam-binding:roles/bigquery.dataViewer; projects/prod-proj/datasets/dw/tables/fact_booking:iam-binding:roles/bigquery.dataViewer]
 write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:asset-sa; projects/prod-proj/datasets/dw:iam-binding:roles/bigquery.dataEditor]
 write serviceAccount:legacy-report@old-proj.iam.gserviceaccount.com  [old-proj:asset-sa; folders/4201:iam-binding:roles/bigquery.dataViewer]
+write serviceAccount:sched@etl-proj.iam.gserviceaccount.com  [etl-proj:asset-sa; projects/prod-proj/datasets/dw:iam-binding:roles/bigquery.dataViewer via group:bi-readers@domain]
+write serviceAccount:partner-sync@partner-proj.iam.gserviceaccount.com  [projects/prod-proj:iam-binding:roles/bigquery.dataViewer] 范围外 SA（其他组织的 SA 或已删除的 SA），拿不到禁用状态，请重点审核
 -     serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com  [copilot-proj:asset-sa] Copilot SA，已排除出白名单
 ...
 
@@ -230,7 +251,8 @@ write serviceAccount:zeus-etl@etl-proj.iam.gserviceaccount.com  [etl-proj:projec
 
 **校验**
 - [ ] 退出码为 0（为 1 时说明有范围 / 项目读取失败，看 `[ERROR]` 行，补上权限后重跑）；
-- [ ] 方式 B：`[ASSET]` 的 SA 数量和客户预期的组织规模相符，`[ASSET-IAM]` 里出现了 `folders/` 或 `organizations/` 来源时逐个确认这些 Folder / Org 层授权；
+- [ ] 方式 B：`[ASSET]` 的 SA 数量和客户预期的组织规模相符，`[ASSET-IAM]` 里出现了 `folders/` 或 `organizations/` 来源时逐个确认这些 Folder / Org 层授权；`[WARN] 无法展开 group:...` 的组要另外确认其中的 SA；
+- [ ] `note` 标"范围外 SA"的账号（其他组织或已删除）：确认是合作方 / 真实在用的账号再保留；
 - [ ] 汇总行里"排除 Copilot SA"的数量和权限 SA 数量加 API SA（1 个）一致；
 - [ ] **客户审核**：
   - 确认 `copilot=True` 的行包含所有权限 SA 和 API SA；
@@ -328,8 +350,15 @@ python whitelist_groups.py --write-group group_full_write@domain --read-group gr
 已中止，未做任何变更。请从名单中移除上述账号后重试。
 ```
 
+**示例输出** 名单里有 Group，且它的嵌套组里藏了 Copilot SA 时（退出码 2，什么都没做；名单里的 Group 会被递归展开检查）
+```
+[REJECT] group:bi-readers@domain 的嵌套成员 copilot-u-001@copilot-proj.iam.gserviceaccount.com（路径 bi-readers@domain > bi-inner@domain）命中 Copilot SA 名单/规则，禁止把该组加入白名单 group_full_read@domain
+已中止，未做任何变更。请把上述 Copilot SA 移出这些组，或不要把这些组加入白名单。
+```
+组没问题时打印 `[NESTED] group:bi-readers@domain: 递归展开 12 个成员，未发现 Copilot SA`。有读不到的嵌套组（外部域 / 无权限）时打印 `[UNVERIFIED] ...` 并以退出码 2 中止；确认里面没有 Copilot SA 后可加 `--allow-unverified-groups`。
+
 **校验**
-- [ ] 退出码为 0。**退出码 2** 表示名单里混入了 Copilot SA（脚本没有做任何变更），把输出里 `[REJECT]` 的账号从名册表（或 CSV）里删掉后重跑；**退出码 1** 且有 `[ERROR] 白名单名册有误` 说明名册表里有无法识别的 `acl_group` 值或空 `sa`，按提示修正；
+- [ ] 退出码为 0。**退出码 2** 表示名单里混入了 Copilot SA（直接或经由嵌套组），或有读不到的嵌套组（脚本没有做任何变更），把输出里 `[REJECT]` 的账号从名册表（或 CSV）里删掉后重跑；**退出码 1** 且有 `[ERROR] 白名单名册有误` 说明名册表里有无法识别的 `acl_group` 值或空 `sa`，按提示修正；
 - [ ] 输出里有 `[PROBE] group_full_write@domain 已生效` 和 `[PROBE] group_full_read@domain 已生效` 两行；
 - [ ] 抽查：`gcloud identity groups memberships list --group-email=group_full_read@domain` 的结果和名册一致（会多一个探针 SA）。
 - [ ] 说明：探针会在探针数据集里留下每个 Group 一张 1 行的表 `_rls_probe_<group>`（带一条只授予该 Group 的 TRUE 策略），下次探针会复用；不再需要时可以手工删除。
@@ -685,17 +714,18 @@ python inspect_rls.py --tables-file batch_N.txt \
 [OK] prod-proj.dw.fact_orders
 [ISSUE] prod-proj.dw.fact_booking: `rls_copilot_subquery_policy` 过滤条件与映射表不一致: region = "HK"
 [ISSUE] 白名单组 group_full_read@domain 中混入 Copilot SA: copilot-u-003@copilot-proj.iam.gserviceaccount.com
+[ISSUE] 白名单组 group_full_read@domain 经由嵌套组 group_full_read@domain > bi-inner@domain 混入 Copilot SA: copilot-u-005@copilot-proj.iam.gserviceaccount.com
 [ISSUE] 白名单组 group_full_read@domain 的成员 someone@domain 不在白名单名册中（来历不明的全量权限，请补录名册或移出组）
 [ISSUE] 白名单名册中的 zeus-etl2@etl-proj.iam.gserviceaccount.com 还没有加入 group_full_write@domain（存量任务可能查不到数据，请热修补）
 [ACL] 名册 auth-proj.auth.adm_user_mem_copilot_acl_group_sa: 5 行，已与 2 个白名单 Group 比对
 [ISSUE] copilot-u-001@copilot-proj.iam.gserviceaccount.com 同时属于多个 Copilot 组: ['group_copilot_high@domain', 'group_copilot_low@domain']
 [WARN] copilot-u-009@copilot-proj.iam.gserviceaccount.com 在 Copilot 组中但条件表没有条件行（该 SA 将查不到任何数据）
 
-巡检完成：2 张表，2 个白名单 Group，发现 5 个问题，1 个提醒
+巡检完成：2 张表，2 个白名单 Group，发现 6 个问题，1 个提醒
 ```
 
 - [ ] 退出码为 0，每张表一行 `[OK]`，最后显示"发现 0 个问题"；
-- [ ] 没有 `[ISSUE]`：过滤条件和映射表不一致（映射改了没重跑阶段 7，或策略被手工改过）、白名单组混入 Copilot SA、组成员与名册不一致、条件表未按 `sa` 聚簇、某个 SA 同时在高低两个组、API SA 在 Copilot 组里，都属于问题；
+- [ ] 没有 `[ISSUE]`：过滤条件和映射表不一致（映射改了没重跑阶段 7，或策略被手工改过）、白名单组（含嵌套组）混入 Copilot SA、组成员与名册不一致、条件表未按 `sa` 聚簇、某个 SA 同时在高低两个组、API SA 在 Copilot 组里，都属于问题；
 - [ ] 逐条看 `[WARN]`：Copilot 组里没有条件行的 SA 会查不到任何数据，确认是否符合预期；条件表里不在任何组的 SA 没有表级权限。
 
 ### 8.2 端到端五项验收
@@ -943,7 +973,7 @@ prod-proj.dw.fact_booking,ext.ref_name,refername
 |---|---|---|---|---|---|
 | scan_bq_access.py | 成功 | — | （参数错误） | — | — |
 | list_project_sas.py | 成功 | 部分范围 / 项目读取失败（其余结果已写入 CSV） | （参数错误） | — | — |
-| whitelist_groups.py | 成功 | 名册表有误（未做任何变更）、部分失败或探针未通过 | 名单中混入 Copilot SA（未做任何变更） | — | — |
+| whitelist_groups.py | 成功 | 名册表有误（未做任何变更）、部分失败或探针未通过 | 名单中混入 Copilot SA（直接或经由嵌套组），或有读不到的嵌套组且没加 `--allow-unverified-groups`（都未做任何变更） | — | — |
 | apply_bypass_rls.py | 成功 | 有冲突、执行失败或验证失败 | 首条策略没加 `--force-first-policy`（未做任何变更） | — | — （5：最近有作业运行在 STANDARD 版本，未做任何变更） |
 | setup_copilot_sas.py | 成功 | 输入有误 / 一 SA 多 Group（未做任何变更）、部分失败 | 超出 SA 配额 | API SA 有数据读权限 | 存在扮演风险（仅 `--strict-impersonation`） |
 | apply_copilot_rls.py | 成功 | 有表被跳过或执行失败 | 缺少白名单策略（未做任何变更） | — | — |

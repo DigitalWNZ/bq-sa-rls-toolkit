@@ -6,6 +6,8 @@ T3 全局白名单 Group：创建读/写白名单 Group，批量加入存量账�
 安全防呆:
   任何命中 --copilot-members / --copilot-patterns 的主体（Copilot API SA、权限 SA）出现在待加入名单中时，
   直接中止（exit 2），不做任何变更——它们一旦进入白名单，行级权限会被 FILTER TRUE 旁路。
+  名单里的 Group（group:xxx）会被递归展开（含嵌套组），嵌套成员命中 Copilot 规则同样中止；
+  有读不到的嵌套组（外部域 / 无权限）时也中止，除非加 --allow-unverified-groups。
 
 探针验证（--probe-sa + --probe-dataset）:
   把探针 SA 加入每个白名单 Group，在探针数据集下建一张只授予该 Group 的 FILTER TRUE 探针表，
@@ -73,6 +75,8 @@ def main():
                    help="把本次最终名单按 sa,acl_group 导出为 CSV，供客户回填白名单名册表")
     p.add_argument("--copilot-members", nargs="*", default=[], help="Copilot API SA / 权限 SA 邮箱")
     p.add_argument("--copilot-patterns", nargs="*", default=[], help="Copilot SA 邮箱通配符，如 copilot-*@*")
+    p.add_argument("--allow-unverified-groups", action="store_true",
+                   help="名单中的 Group 含有无法展开的嵌套组（外部域 / 无权限）时仍继续（默认中止）")
     p.add_argument("--customer-id", default=None)
     p.add_argument("--project", default=None, help="quota 项目；建 group 时也用于获取 customer ID")
     p.add_argument("--initial-config", choices=["WITH_INITIAL_OWNER", "EMPTY"], default="EMPTY",
@@ -130,6 +134,37 @@ def main():
             ops.log(f"[REJECT] {m} 命中 Copilot SA 名单/规则，禁止加入白名单 {group}")
         ops.log("已中止，未做任何变更。请从名单中移除上述账号后重试。")
         return 2
+
+    # P0：名单里的 Group 要递归展开检查——Copilot SA 藏在嵌套组里同样会命中 FILTER TRUE
+    nested = [(wl, m) for wl in plan for m in plan[wl] if m.startswith("group:")]
+    if nested:
+        ctx = ctx or ops.Ctx(get_credentials(args.gcloud_account, project), project)
+        unverified = []
+        for wl, m in nested:
+            g = core.member_email(m)
+            if ops.group_members_typed(ctx, g) is None:
+                unverified.append((wl, g, [g]))
+                continue
+            members, unresolved = ops.expand_group(ctx, g)
+            bad = [(e, i["via"]) for e, i in sorted(members.items())
+                   if core.is_copilot_member(e, copilot_members, copilot_patterns)]
+            for e, via in bad:
+                rejected.append((wl, e))
+                ops.log(f"[REJECT] {m} 的嵌套成员 {e}（路径 {' > '.join(via)}）命中 Copilot SA 名单/规则，"
+                        f"禁止把该组加入白名单 {wl}")
+            unverified += [(wl, ug, via + [ug]) for ug, via in unresolved]
+            if not bad:
+                ops.log(f"[NESTED] {m}: 递归展开 {len(members)} 个成员，未发现 Copilot SA")
+        if rejected:
+            ops.log("已中止，未做任何变更。请把上述 Copilot SA 移出这些组，或不要把这些组加入白名单。")
+            return 2
+        for wl, ug, path in unverified:
+            ops.log(f"[UNVERIFIED] 加入 {wl} 的组里有无法展开的组 {ug}（路径 {' > '.join(path)}，外部域或无权限），"
+                    f"无法确认其中没有 Copilot SA")
+        if unverified and not args.allow_unverified_groups:
+            ops.log("已中止，未做任何变更。确认这些组里没有 Copilot SA 后加 --allow-unverified-groups，"
+                    "或改为直接加入具体账号。")
+            return 2
 
     mode = "APPLY" if args.apply else "DRY-RUN"
     ops.log(f"===== 模式: {mode} =====")

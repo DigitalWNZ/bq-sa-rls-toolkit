@@ -65,6 +65,7 @@ G_READ = grp("full-read")
 G_HIGH = grp("copilot-high")
 G_LOW = grp("copilot-low")
 G_ALL = grp("copilot-all")
+G_NESTED = grp("nested")           # 业务组：内含 Copilot SA，用于验证嵌套组防护
 
 T_ORDERS = tbl("orders")
 T_SENSITIVE = tbl("sensitive")
@@ -79,6 +80,8 @@ T_GROUP = tbl("adm_user_mem_copilot_group")          # 表级权限组字典：i
 T_GRANT = tbl("adm_user_mem_copilot_grant_tb")       # Group -> 表范围：group_id, table_name
 T_BIND = tbl("adm_user_mem_copilot_user_bind")       # 用户绑定：id, role_id, condition_id, group_id
 T_ACL = tbl("adm_user_mem_copilot_acl_group_sa")     # 全量白名单名册：sa, acl_group
+VIEW_DATASET = f"{DATASET}_views"
+T_VIEW = f"{PROJECT}.{VIEW_DATASET}.v_orders"        # 授权视图：读 orders，late 只有这张视图的读权限
 
 # region, prd_type, refername, amount
 ROWS = [("HK", "P1", "REF_A", 1), ("HK", "P2", "REF_B", 2), ("SG", "P2", "REF_A", 3),
@@ -214,6 +217,24 @@ def group_members(group_email):
         raise
     resp = ci.groups().memberships().list(parent=name, pageSize=200).execute()
     return {m["preferredMemberKey"]["id"].lower() for m in resp.get("memberships", [])}
+
+
+def ensure_group(group_email):
+    """测试准备：创建 Group（已存在则跳过），独立于被测代码。"""
+    ci = api("cloudidentity", "v1")
+    try:
+        ci.groups().lookup(groupKey_id=group_email).execute()
+        return
+    except HttpError as e:
+        if e.resp.status not in (403, 404):
+            raise
+    crm = api("cloudresourcemanager", "v1")
+    org = [a for a in crm.projects().getAncestry(projectId=PROJECT, body={}).execute()["ancestor"]
+           if a["resourceId"]["type"] == "organization"][0]["resourceId"]["id"]
+    customer = crm.organizations().get(name=f"organizations/{org}").execute()["owner"]["directoryCustomerId"]
+    ci.groups().create(initialGroupConfig="EMPTY", body={
+        "groupKey": {"id": group_email}, "parent": f"customers/{customer}",
+        "labels": {"cloudidentity.googleapis.com/groups.discussion_forum": ""}}).execute()
 
 
 def set_group_member(group_email, member_email, present):

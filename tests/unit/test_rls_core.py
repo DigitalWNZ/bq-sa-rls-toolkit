@@ -857,3 +857,129 @@ class TestAssetRows:
         assert core.asset_scope(folder="folders/9") == "folders/9"
         with pytest.raises(ValueError):
             core.asset_scope()
+
+
+# --------------------------------------------------------------------------- #
+# 嵌套 Group 展开（P0：Copilot SA 不能藏在白名单的嵌套组里）
+# --------------------------------------------------------------------------- #
+SA = "SERVICE_ACCOUNT"
+
+
+def _fetcher(tree):
+    """tree: {group: [(member, type)] 或 None（无法读取）}"""
+    calls = []
+
+    def fetch(g):
+        calls.append(g)
+        return tree.get(g, None) if g in tree else None
+    fetch.calls = calls
+    return fetch
+
+
+class TestExpandGroup:
+    def test_direct_and_nested_with_path(self):
+        tree = {"wl@x.com": [("etl@p.iam.gserviceaccount.com", SA), ("team@x.com", "GROUP")],
+                "team@x.com": [("bi@p.iam.gserviceaccount.com", SA), ("sub@x.com", "GROUP")],
+                "sub@x.com": [("copilot-u-1@c.iam.gserviceaccount.com", SA), ("alice@x.com", "USER")]}
+        members, unresolved = core.expand_group("wl@x.com", _fetcher(tree))
+        assert members["etl@p.iam.gserviceaccount.com"] == {"type": SA, "via": ["wl@x.com"]}
+        assert members["copilot-u-1@c.iam.gserviceaccount.com"]["via"] == ["wl@x.com", "team@x.com", "sub@x.com"]
+        assert members["team@x.com"]["type"] == "GROUP"
+        assert unresolved == []
+
+    def test_cycle_is_visited_once(self):
+        tree = {"a@x.com": [("b@x.com", "GROUP")], "b@x.com": [("a@x.com", "GROUP"), ("s@p.iam.gserviceaccount.com", SA)]}
+        f = _fetcher(tree)
+        members, _ = core.expand_group("a@x.com", f)
+        assert "s@p.iam.gserviceaccount.com" in members and f.calls.count("a@x.com") == 1
+
+    def test_unreadable_nested_group_reported(self):
+        tree = {"wl@x.com": [("ext@partner.com", "GROUP")]}          # 外部域的组读不到
+        members, unresolved = core.expand_group("wl@x.com", _fetcher(tree))
+        assert unresolved == [("ext@partner.com", ["wl@x.com"])]
+
+    def test_missing_type_inferred_from_email(self):
+        tree = {"wl@x.com": [("s@p.iam.gserviceaccount.com", None)]}
+        members, _ = core.expand_group("wl@x.com", _fetcher(tree))
+        assert members["s@p.iam.gserviceaccount.com"]["type"] == SA
+
+
+class TestNestedCopilot:
+    def test_only_indirect_members_reported_with_path(self):
+        expanded = {"wl@x.com": ({"copilot-u-1@c.iam.gserviceaccount.com": {"type": SA, "via": ["wl@x.com", "team@x.com"]},
+                                  "copilot-u-2@c.iam.gserviceaccount.com": {"type": SA, "via": ["wl@x.com"]},
+                                  "etl@p.iam.gserviceaccount.com": {"type": SA, "via": ["wl@x.com", "team@x.com"]}},
+                                 [("ext@partner.com", ["wl@x.com"])])}
+        issues, warns = core.inspect_nested_copilot(expanded, copilot_patterns=["copilot-*@*"])
+        assert issues == ["白名单组 wl@x.com 经由嵌套组 wl@x.com > team@x.com 混入 Copilot SA: "
+                          "copilot-u-1@c.iam.gserviceaccount.com"]          # 直接成员由原有检查负责，不重复报
+        assert len(warns) == 1 and "ext@partner.com" in warns[0]
+
+    def test_clean(self):
+        assert core.inspect_nested_copilot({"wl@x.com": ({}, [])}, copilot_patterns=["copilot-*@*"]) == ([], [])
+
+
+# --------------------------------------------------------------------------- #
+# analyzeIamPolicy 结果解析（展开 Group + 继承层级）
+# --------------------------------------------------------------------------- #
+class TestAnalysisPrincipals:
+    RESULTS = [
+        {"attachedResourceFullName": "//bigquery.googleapis.com/projects/p/datasets/d/tables/t",
+         "iamBinding": {"role": "roles/bigquery.dataViewer", "members": ["group:team@x.com", "serviceAccount:r@p.iam.gserviceaccount.com"]},
+         "accessControlLists": [{"accesses": [{"permission": "bigquery.tables.getData"}]}],
+         "identityList": {"identities": [{"name": "group:team@x.com"}, {"name": "serviceAccount:r@p.iam.gserviceaccount.com"},
+                                         {"name": "group:sub@x.com"}, {"name": "serviceAccount:n@p.iam.gserviceaccount.com"}],
+                          "groupEdges": [{"sourceNode": "group:team@x.com", "targetNode": "group:sub@x.com"},
+                                         {"sourceNode": "group:sub@x.com", "targetNode": "serviceAccount:n@p.iam.gserviceaccount.com"}]}},
+        {"attachedResourceFullName": "//cloudresourcemanager.googleapis.com/folders/42",
+         "iamBinding": {"role": "roles/bigquery.dataEditor", "members": ["serviceAccount:w@q.iam.gserviceaccount.com"]},
+         "accessControlLists": [{"accesses": [{"permission": "bigquery.tables.getData"},
+                                              {"permission": "bigquery.tables.updateData"}]}],
+         "identityList": {"identities": [{"name": "serviceAccount:w@q.iam.gserviceaccount.com"}]}}]
+
+    def test_direct_nested_and_inherited(self):
+        rows = {r["principal"]: r for r in core.analysis_principals(self.RESULTS)}
+        assert rows["serviceAccount:r@p.iam.gserviceaccount.com"]["via"] == []
+        assert rows["serviceAccount:n@p.iam.gserviceaccount.com"]["via"] == ["group:team@x.com", "group:sub@x.com"]
+        assert rows["serviceAccount:n@p.iam.gserviceaccount.com"]["read"] and not rows["serviceAccount:n@p.iam.gserviceaccount.com"]["write"]
+        w = rows["serviceAccount:w@q.iam.gserviceaccount.com"]
+        assert w["resource"] == "folders/42" and w["read"] and w["write"] and w["role"] == "roles/bigquery.dataEditor"
+
+    def test_source_label(self):
+        r = [x for x in core.analysis_principals(self.RESULTS) if x["principal"].startswith("serviceAccount:n@")][0]
+        assert core.analysis_source(r) == ("analyze:projects/p/datasets/d/tables/t:roles/bigquery.dataViewer"
+                                           " via group:team@x.com > group:sub@x.com")
+
+
+# --------------------------------------------------------------------------- #
+# CAI 查询、Group 引用、范围外 SA、授权视图
+# --------------------------------------------------------------------------- #
+class TestCaiExtras:
+    def test_permission_query_or(self):
+        assert core.iam_permission_query(["bigquery.tables.getData", "bigquery.tables.updateData"]) == (
+            "policy.role.permissions:bigquery.tables.getData OR policy.role.permissions:bigquery.tables.updateData")
+        with pytest.raises(ValueError):
+            core.iam_permission_query(["bad perm"])
+
+    def test_group_refs(self):
+        results = [{"resource": "//bigquery.googleapis.com/projects/p/datasets/d",
+                    "policy": {"bindings": [{"role": "roles/bigquery.dataViewer",
+                                             "members": ["group:Team@x.com", "serviceAccount:s@p.iam.gserviceaccount.com"]}]}}]
+        assert core.asset_iam_group_refs(results) == [("team@x.com", "projects/p/datasets/d", "roles/bigquery.dataViewer")]
+
+    def test_out_of_scope_sa_flagged(self):
+        sas = [{"email": "in@p.iam.gserviceaccount.com", "project": "p", "source": "asset-sa"},
+               {"email": "partner@vendor.iam.gserviceaccount.com", "project": "projects/p/datasets/d",
+                "source": "iam-binding:roles/bigquery.dataViewer"}]
+        rows = {r["principal"]: r for r in core.build_sa_whitelist_rows(
+            sas, "write", scope_emails={"in@p.iam.gserviceaccount.com"})}
+        assert "范围外" in rows["serviceAccount:partner@vendor.iam.gserviceaccount.com"]["note"]
+        assert "范围外" not in rows["serviceAccount:in@p.iam.gserviceaccount.com"]["note"]
+        assert rows["serviceAccount:partner@vendor.iam.gserviceaccount.com"]["suggested_group"] == "write"
+
+    def test_authorized_entries(self):
+        entries = [("view", {"projectId": "p2", "datasetId": "views", "tableId": "v_orders"}),
+                   ("dataset", {"dataset": {"projectId": "p3", "datasetId": "shared"}, "targetTypes": ["VIEWS"]}),
+                   ("routine", {"projectId": "p", "datasetId": "d", "routineId": "f"}),
+                   ("userByEmail", "a@x.com")]
+        assert core.authorized_entries(entries) == (["p2.views.v_orders"], ["p3.shared"])

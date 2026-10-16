@@ -156,11 +156,13 @@ def impersonation_risks(bindings, role_permissions, allowed=()):
 
 
 def build_sa_whitelist_rows(sas, group, copilot_members=(), copilot_patterns=(),
-                            include_disabled=False):
+                            include_disabled=False, scope_emails=None):
     """
     把项目内（及 IAM 绑定中出现的）全部 SA 生成白名单候选行，列与 scan_bq_access.py 的 CSV 兼容。
     sas: [{"email","project","display_name","disabled","source"}]；同一 SA 多次出现会合并来源。
     排除：Copilot SA；已禁用 SA（除非 include_disabled）。
+    scope_emails: 组织 / 文件夹范围内盘点到的 SA 集合；给出时，不在其中的 SA（其他组织的 SA，
+    或已删除的 SA）在 note 里标为"范围外"，照常建议加入但需要重点审核。
     """
     if group not in ("write", "read"):
         raise ValueError(f"group 只能是 write 或 read: {group}")
@@ -185,6 +187,8 @@ def build_sa_whitelist_rows(sas, group, copilot_members=(), copilot_patterns=(),
             notes.append("SA 已禁用，默认不加入（--include-disabled 可加入）")
         if is_service_agent(principal):
             notes.append("Google 托管服务代理")
+        elif scope_emails is not None and email not in scope_emails:
+            notes.append("范围外 SA（其他组织的 SA 或已删除的 SA），拿不到禁用状态，请重点审核")
         rows.append({
             "principal": principal, "principal_type": "serviceAccount",
             "can_read": "", "can_write": "", "suggested_group": suggested,
@@ -864,3 +868,149 @@ def asset_iam_sa_rows(results):
                     rows.append({"email": member_email(m), "project": res, "display_name": "",
                                  "disabled": False, "source": f"iam-binding:{b.get('role', '')}"})
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# 嵌套 Group 展开（白名单组里的嵌套组也要检查 Copilot SA）
+# --------------------------------------------------------------------------- #
+def _member_type(email, mtype):
+    if mtype:
+        return mtype
+    return "SERVICE_ACCOUNT" if email.endswith("gserviceaccount.com") else "UNKNOWN"
+
+
+def expand_group(root, fetch, max_depth=10):
+    """
+    递归展开 Group 成员。fetch(group_email) -> [(member_email, type)]，读不到时返回 None。
+    type 取 Cloud Identity membership.type（USER / SERVICE_ACCOUNT / GROUP / ...）。
+    返回 (members, unresolved)：
+      members    {email: {"type", "via": [root, ..., 直接所在的组]}}，同一成员只记最短路径
+      unresolved [(group_email, via)]：读不到成员的嵌套组（外部域、无权限）
+    """
+    root = root.lower()
+    members, unresolved, visited = {}, [], set()
+    queue = [(root, [root])]
+    while queue:
+        group, path = queue.pop(0)
+        if group in visited:
+            continue
+        visited.add(group)
+        items = fetch(group)
+        if items is None:
+            if group != root:
+                unresolved.append((group, path[:-1]))
+            continue
+        for email, mtype in items:
+            email = email.lower()
+            t = _member_type(email, mtype)
+            if email not in members:
+                members[email] = {"type": t, "via": list(path)}
+            if t == "GROUP" and email not in visited and len(path) < max_depth:
+                queue.append((email, path + [email]))
+    return members, unresolved
+
+
+def inspect_nested_copilot(expanded, copilot_members=(), copilot_patterns=()):
+    """
+    expanded: {白名单组: (members, unresolved)}（expand_group 的结果）。
+    只报经由嵌套组混入的 Copilot SA（直接成员由 inspect_whitelist_membership 报）；
+    读不到的嵌套组给提醒。返回 (issues, warns)。
+    """
+    issues, warns = [], []
+    for group, (members, unresolved) in expanded.items():
+        for email, info in sorted(members.items()):
+            if len(info["via"]) > 1 and is_copilot_member(email, copilot_members, copilot_patterns):
+                issues.append(f"白名单组 {group} 经由嵌套组 {' > '.join(info['via'])} 混入 Copilot SA: {email}")
+        for g, via in unresolved:
+            warns.append(f"白名单组 {group} 中的嵌套组 {g}（路径 {' > '.join(via + [g])}）无法展开"
+                         f"（外部域或无权限），其中的成员没有做 Copilot SA 检查")
+    return issues, warns
+
+
+# --------------------------------------------------------------------------- #
+# analyzeIamPolicy（按资源展开 Group 与继承层级）
+# --------------------------------------------------------------------------- #
+READ_PERMISSION = "bigquery.tables.getData"
+WRITE_PERMISSION = "bigquery.tables.updateData"
+
+
+def analysis_principals(results):
+    """
+    analyzeIamPolicy 的 analysisResults -> [{"principal","role","resource","read","write","via"}]。
+    via: 经由的 Group 链（从绑定里的组到成员直接所在的组）；直接绑定为 []。
+    read / write 取自 accessControlLists 里匹配到的权限（getData / updateData）。
+    """
+    out = []
+    for ar in results:
+        role = (ar.get("iamBinding") or {}).get("role", "")
+        resource = asset_resource_short(ar.get("attachedResourceFullName", ""))
+        perms = {a.get("permission") for acl in ar.get("accessControlLists", [])
+                 for a in acl.get("accesses", [])}
+        read = READ_PERMISSION in perms or not perms
+        write = WRITE_PERMISSION in perms
+        ident = ar.get("identityList") or {}
+        parent = {}
+        for e in ident.get("groupEdges", []):
+            parent.setdefault(e["targetNode"].lower(), e["sourceNode"].lower())
+        for i in ident.get("identities", []):
+            name = i.get("name", "")
+            key = name.lower()
+            via, cur, seen = [], key, set()
+            while cur in parent and cur not in seen:
+                seen.add(cur)
+                cur = parent[cur]
+                via.insert(0, cur)
+            principal = normalize_member(name) if ":" in name else name
+            out.append({"principal": principal, "role": role, "resource": resource,
+                        "read": read, "write": write, "via": via})
+    return out
+
+
+def analysis_source(row):
+    """analysis_principals 的一行 -> scan CSV 的 sources 片段。"""
+    s = f"analyze:{row['resource']}:{row['role']}"
+    return s + (f" via {' > '.join(row['via'])}" if row["via"] else "")
+
+
+# --------------------------------------------------------------------------- #
+# Cloud Asset：权限查询、Group 引用；授权视图 / 授权数据集
+# --------------------------------------------------------------------------- #
+_PERMISSION_RE = re.compile(r"^[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9]+)+$")
+
+
+def iam_permission_query(permissions):
+    """searchAllIamPolicies 的 query：任一权限命中即可（OR）。"""
+    perms = [p.strip() for p in permissions if p.strip()]
+    if not perms or not all(_PERMISSION_RE.match(p) for p in perms):
+        raise ValueError(f"非法的权限名: {permissions}")
+    return " OR ".join(f"policy.role.permissions:{p}" for p in perms)
+
+
+def asset_iam_group_refs(results):
+    """searchAllIamPolicies 结果中作为成员出现的 Group -> [(group_email, 资源简名, role)]，去重。"""
+    out, seen = [], set()
+    for r in results:
+        res = asset_resource_short(r.get("resource", ""))
+        for b in (r.get("policy") or {}).get("bindings", []):
+            for m in b.get("members", []):
+                if m.startswith("group:"):
+                    item = (member_email(m), res, b.get("role", ""))
+                    if item not in seen:
+                        seen.add(item)
+                        out.append(item)
+    return out
+
+
+def authorized_entries(entries):
+    """
+    数据集 ACL 条目 [(entity_type, entity_id)] -> (授权视图 [p.d.t], 授权数据集 [p.d])。
+    这些视图 / 数据集里的对象在读目标数据集的数据：它们的读者也会受目标表 RLS 影响。
+    """
+    views, datasets = [], []
+    for etype, eid in entries:
+        if etype == "view" and isinstance(eid, dict):
+            views.append(f"{eid['projectId']}.{eid['datasetId']}.{eid['tableId']}")
+        elif etype == "dataset" and isinstance(eid, dict):
+            d = eid.get("dataset", eid)
+            datasets.append(f"{d['projectId']}.{d['datasetId']}")
+    return sorted(set(views)), sorted(set(datasets))

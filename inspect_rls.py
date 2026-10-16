@@ -6,7 +6,8 @@ RLS 巡检：逐表核对白名单 policy 与 Copilot policy 是否符合预期�
   1. 白名单 policy（rls_bypass_full_access）存在、过滤条件为 TRUE、包含所有 --bypass-groups
   2. 对映射表中有配置的表：Copilot policy 存在、包含所有 --copilot-groups、
      过滤条件与"按当前映射表 + 表 schema 生成的条件"一致（检测映射变更或被手工改动）
-  3. 白名单 Group（默认 = --bypass-groups）成员中不得出现 Copilot SA
+  3. 白名单 Group（默认 = --bypass-groups）成员中不得出现 Copilot SA——递归展开嵌套组检查，
+     读不到的嵌套组（外部域 / 无权限）给提醒
   4. 条件表按 sa 聚簇（R4）
   5. Copilot 组成员：一 SA 只在一个组（问题）、API SA 不在组中（问题）、
      成员没有条件行 / 条件行不在任何组（提醒，不影响退出码）
@@ -114,6 +115,17 @@ def main():
                                                core.split_items(args.copilot_patterns)):
         print(f"[ISSUE] {i}")
         n_issues += 1
+    # P0：递归展开白名单组里的嵌套组，Copilot SA 藏在嵌套组里同样会命中 FILTER TRUE
+    n_warns = 0
+    expanded = {g: ops.expand_group(ctx, g) for g in members}
+    issues, warns = core.inspect_nested_copilot(expanded, core.split_items(args.copilot_members),
+                                                core.split_items(args.copilot_patterns))
+    for i in issues:
+        print(f"[ISSUE] {i}")
+    for w in warns:
+        print(f"[WARN] {w}")
+    n_issues += len(issues)
+    n_warns += len(warns)
 
     # 白名单名册（adm_user_mem_copilot_acl_group_sa）是事实来源：与 Group 实际成员双向比对
     if args.acl_table:
@@ -137,7 +149,6 @@ def main():
         print(f"[ACL] 名册 {acl}: {len(rows)} 行，已与 {len(members)} 个白名单 Group 比对")
 
     # E2：条件表聚簇、Copilot SA 归属 / 条件行 / API SA
-    n_warns = 0
     if cond:
         for i in core.inspect_condition_clustering(ctx.bq.get_table(cond).clustering_fields):
             print(f"[ISSUE] {i}")

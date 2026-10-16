@@ -48,6 +48,27 @@ def retry(fn, desc="", timeout=300, interval=10, retry_if=is_propagation_error):
             time.sleep(interval)
 
 
+_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+
+def execute_with_backoff(req, desc="", attempts=6, base=2.0):
+    """执行 googleapiclient 请求；429 / 5xx / 网络错误按指数退避重试（2, 4, 8, ... 秒）。"""
+    for i in range(attempts):
+        try:
+            return req.execute()
+        except HttpError as e:
+            if e.resp.status not in _TRANSIENT_STATUS or i == attempts - 1:
+                raise
+            err = f"HTTP {e.resp.status}"
+        except (ConnectionError, TimeoutError, OSError) as e:
+            if i == attempts - 1:
+                raise
+            err = type(e).__name__
+        wait = base ** (i + 1)
+        log(f"    [retry] {desc}: {err}，{wait:.0f}s 后重试（{i + 1}/{attempts - 1}）")
+        time.sleep(wait)
+
+
 # --------------------------------------------------------------------------- #
 # 上下文
 # --------------------------------------------------------------------------- #
@@ -215,6 +236,11 @@ def dataset_member_roles(ds):
     return out
 
 
+def dataset_authorized(ds):
+    """数据集 ACL 里的授权视图 / 授权数据集 -> core.authorized_entries 的 (views, datasets)。"""
+    return core.authorized_entries([(e.entity_type, e.entity_id) for e in ds.access_entries])
+
+
 def project_policy(ctx, project):
     return ctx.crm.projects().getIamPolicy(
         resource=project, body={"options": {"requestedPolicyVersion": 3}}).execute()
@@ -341,6 +367,40 @@ def group_members(ctx, group_name):
         out.update(m["preferredMemberKey"]["id"].lower() for m in resp.get("memberships", []))
         req = api.list_next(req, resp)
     return out
+
+
+def group_members_typed(ctx, group_email):
+    """Group 直接成员 [(email, type)]；type 为 USER / SERVICE_ACCOUNT / GROUP / ...。读不到时返回 None。"""
+    try:
+        name = lookup_group(ctx, group_email)
+    except Exception:  # noqa: BLE001
+        return None
+    if not name:
+        return None
+    out, api = [], ctx.ci.groups().memberships()
+    req = api.list(parent=name, pageSize=200, view="FULL")
+    try:
+        while req is not None:
+            resp = execute_with_backoff(req, desc=f"list members {group_email}")
+            out.extend((m["preferredMemberKey"]["id"].lower(), m.get("type"))
+                       for m in resp.get("memberships", []))
+            req = api.list_next(req, resp)
+    except HttpError as e:
+        if e.resp.status in (403, 404):
+            return None
+        raise
+    return out
+
+
+def expand_group(ctx, group_email, max_depth=10):
+    """递归展开 Group（含嵌套组），返回 core.expand_group 的 (members, unresolved)。"""
+    cache = {}
+
+    def fetch(g):
+        if g not in cache:
+            cache[g] = group_members_typed(ctx, g)
+        return cache[g]
+    return core.expand_group(group_email, fetch, max_depth=max_depth)
 
 
 def add_group_member(ctx, group_name, email):
@@ -491,7 +551,7 @@ def asset_search_service_accounts(ctx, scope):
     api, out = ctx.asset.v1(), []
     req = api.searchAllResources(scope=scope, assetTypes=["iam.googleapis.com/ServiceAccount"], pageSize=500)
     while req is not None:
-        resp = req.execute()
+        resp = execute_with_backoff(req, desc=f"searchAllResources {scope}")
         out.extend(resp.get("results", []))
         req = api.searchAllResources_next(req, resp)
     return out
@@ -502,7 +562,30 @@ def asset_search_iam_policies(ctx, scope, query):
     api, out = ctx.asset.v1(), []
     req = api.searchAllIamPolicies(scope=scope, query=query, pageSize=500)
     while req is not None:
-        resp = req.execute()
+        resp = execute_with_backoff(req, desc=f"searchAllIamPolicies {scope}")
         out.extend(resp.get("results", []))
         req = api.searchAllIamPolicies_next(req, resp)
     return out
+
+
+def bq_full_resource_name(ref):
+    """'p.d.t' -> //bigquery.googleapis.com/projects/p/datasets/d/tables/t；'p.d' -> 数据集。"""
+    parts = ref.replace(":", ".").split(".")
+    base = f"//bigquery.googleapis.com/projects/{parts[0]}/datasets/{parts[1]}"
+    return base + (f"/tables/{parts[2]}" if len(parts) == 3 else "")
+
+
+def analyze_access(ctx, scope, full_resource_name, permissions):
+    """
+    analyzeIamPolicy：谁在 full_resource_name 上拥有 permissions 中任一权限。
+    展开 Group（含嵌套）并包含资源层级上的继承绑定（组织 / 文件夹 / 项目 / 数据集）。
+    返回 (analysisResults, fully_explored)。
+    """
+    req = ctx.asset.v1().analyzeIamPolicy(
+        scope=scope,
+        analysisQuery_resourceSelector_fullResourceName=full_resource_name,
+        analysisQuery_accessSelector_permissions=list(permissions),
+        analysisQuery_options_expandGroups=True,
+        analysisQuery_options_outputGroupEdges=True)
+    main = execute_with_backoff(req, desc=f"analyzeIamPolicy {full_resource_name}").get("mainAnalysis", {})
+    return main.get("analysisResults", []), bool(main.get("fullyExplored"))

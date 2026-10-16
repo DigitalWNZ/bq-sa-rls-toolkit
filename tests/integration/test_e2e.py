@@ -59,6 +59,25 @@ def test_t2_scan_classifies_read_write_and_jobs(world, tmp_path_factory):
     L.eventually(scan_ok, timeout=600, interval=30, desc="scan")
 
 
+def test_t2_scan_authorized_view_and_analyze(world, tmp_path):
+    """R1 授权视图的读者被列出；--analyze-scope 展开 Group（cop-hi 经由 copilot-high 组获得 orders 读权限）。"""
+    out = str(tmp_path / "scan_av.csv")
+    code, log = L.run_cli("scan_bq_access.py", "--tables", L.T_ORDERS, "--jobs-days", "0",
+                          "--analyze-scope", f"projects/{L.PROJECT}",
+                          "--copilot-patterns", L.COPILOT_PATTERN, "--copilot-members", L.SA_API, "-o", out)
+    assert code == 0, log
+    assert f"[AUTH-VIEW] 授权视图 {L.T_VIEW}" in log and f"[ANALYZE] {L.T_ORDERS}" in log
+    rows = _csv(out)
+    late = rows[f"serviceAccount:{L.SA_LATE}"]
+    assert f"authorized-view:{L.T_VIEW}/table:roles/bigquery.dataViewer" in late["sources"], late
+    assert late["suggested_group"] == "read" and "授权视图" in late["note"], late
+    hi = rows[f"serviceAccount:{L.SA_COP_HI}"]
+    assert f"via group:{L.G_HIGH}" in hi["sources"] and hi["copilot"] == "True", hi
+    code, log = L.run_cli("scan_bq_access.py", "--tables", L.T_ORDERS, "--jobs-days", "0",
+                          "--no-authorized", "-o", out)
+    assert code == 0 and "[AUTH-VIEW]" not in log, log
+
+
 def test_t2_scan_org_scope_and_dataset_range(world, tmp_path):
     """C2 组织级作业视图 + E4 按数据集范围展开。"""
     out = str(tmp_path / "scan_org.csv")
@@ -87,6 +106,17 @@ def test_t3_whitelist_rejects_copilot_sa(world):
     after = L.group_members(L.G_READ)
     assert after == before                       # 中止，未做任何变更
     assert after is None or L.SA_API not in after
+
+
+def test_t3_whitelist_rejects_copilot_sa_in_nested_group(world):
+    """P0：把一个内含 Copilot SA 的业务组加入白名单 -> 递归展开后拒绝，Group 成员不变。"""
+    before = L.group_members(L.G_READ)
+    code, log = L.run_cli("whitelist_groups.py", "--read-group", L.G_READ,
+                          "--read-members", f"group:{L.G_NESTED}",
+                          "--copilot-patterns", L.COPILOT_PATTERN, "--project", L.PROJECT, "--apply")
+    assert code == 2, log
+    assert f"group:{L.G_NESTED} 的嵌套成员 {L.SA_COP_HI}（路径 {L.G_NESTED}）" in log, log
+    assert L.group_members(L.G_READ) == before
 
 
 def test_t3_whitelist_plan_from_scan_csv(world):
@@ -348,6 +378,9 @@ def test_list_project_sas_org_scope(world, tmp_path):
     assert f"datasets/{L.DATASET}/tables/orders:iam-binding:roles/bigquery.dataViewer" in reader["sources"]   # 表级
     for s in (L.SA_COP_HI, L.SA_API):
         assert rows[f"serviceAccount:{s}"]["copilot"] == "True"
+    # 经由 Group 获得权限的 SA 被递归展开（cop-lo 只通过 copilot-low 组拿到 orders 读权限）
+    assert "[ASSET-GROUP]" in log
+    assert f"iam-binding:roles/bigquery.dataViewer via group:{L.G_LOW}" in rows[f"serviceAccount:{L.SA_COP_LO}"]["sources"]
 
 
 # =========================================================================== #
@@ -410,6 +443,18 @@ def test_inspect_clean(world):
     assert log.count("[OK]") == 3
 
 
+def test_inspect_detects_copilot_sa_in_nested_group(world):
+    """P0：白名单组里嵌套了内含 Copilot SA 的组 -> 巡检报问题并给出路径；移除后恢复。"""
+    L.set_group_member(L.G_READ, L.G_NESTED, True)
+    try:
+        code, log = _inspect()
+        assert code == 1, log
+        assert f"白名单组 {L.G_READ} 经由嵌套组 {L.G_READ} > {L.G_NESTED} 混入 Copilot SA: {L.SA_COP_HI}" in log, log
+    finally:
+        L.set_group_member(L.G_READ, L.G_NESTED, False)
+    L.eventually(lambda: _assert_eq(_inspect()[0], 0), timeout=180, interval=15, desc="nested removed")
+
+
 def test_inspect_acl_roster_reconciliation(world):
     """表 8 名册 vs. 白名单 Group 实际成员：一致 -> 0 问题；名册多出 / 组里多出 都是问题；探针 SA 忽略。"""
     L.set_group_member(L.G_READ, L.SA_LATE, False)             # 上次运行的热修补测试可能把 late 留在组里
@@ -428,6 +473,12 @@ def test_inspect_acl_roster_reconciliation(world):
         L.query(L.admin_creds(), f"DELETE FROM `{L.T_ACL}` WHERE sa IN ('{L.SA_LATE}', '{L.SA_READER}')")
         L.query(L.admin_creds(), f"INSERT INTO `{L.T_ACL}` (sa, acl_group) VALUES ('{L.SA_READER}', 'full_read')")
     assert _inspect(*acl)[0] == 0
+
+
+def test_r1_rls_applies_through_authorized_view(world):
+    """R1 实测：late 只能经由授权视图读 orders；不在白名单时 orders 的 RLS 让它看到 0 行。"""
+    late = L.impersonate(L.SA_LATE)
+    L.eventually(lambda: _assert_eq(L.amounts(late, L.T_VIEW)[1], []), desc="view filtered by RLS")
 
 
 def test_inspect_detects_filter_drift_and_fix(world):
@@ -483,6 +534,9 @@ def test_t5_hot_patch_whitelist_and_inspect_membership(world):
                           "--apply")
     assert code == 0, log
     assert L.SA_LATE in L.group_members(L.G_READ)
+    # R1：late 进白名单后，经由授权视图能看到全量数据
+    L.eventually(lambda: _assert_eq(L.amounts(L.impersonate(L.SA_LATE), L.T_VIEW)[1], L.ALL_AMOUNTS),
+                 desc="view visible after whitelist")
     # 巡检能发现白名单组混入 "Copilot SA"（此处把 late 视为 Copilot SA 验证检测逻辑）
     code, log = _inspect("--copilot-members", L.SA_LATE)
     assert code == 1 and L.SA_LATE in log, log
