@@ -278,7 +278,7 @@ serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com,serviceAccount
 
 ### 1b. list_project_sas.py：项目列表下的全部 SA（宽松版白名单候选）
 
-**目的**：`scan_bq_access.py` 只列出对目标表"有权限或真实访问过"的账号，比较保守，可能漏掉一些账号，例如权限来自 Folder/Org、最近没跑过作业、或通过 View 间接访问的调度 SA。这个程序列出**项目列表中的所有 SA**，宁多勿漏。两者的输出格式相同，可以单独使用，也可以合在一起审核。
+**目的**：`scan_bq_access.py` 只列出对目标表"有权限或真实访问过"的账号，比较保守，可能漏掉一些账号，例如权限来自 Folder/Org 且最近没跑过作业（不加 `--analyze-scope` 时）、或经由多层 View 间接访问的调度 SA。这个程序列出**项目列表中的所有 SA**，宁多勿漏。两者的输出格式相同，可以单独使用，也可以合在一起审核。
 
 #### 输入
 
@@ -301,7 +301,7 @@ serviceAccount:copilot-u-001@copilot-proj.iam.gserviceaccount.com,serviceAccount
 2. **组织 / 文件夹范围**（Cloud Asset Inventory）：`searchAllResources(assetTypes=iam.googleapis.com/ServiceAccount)` 列出范围内全部 SA（来源 `asset-sa`）；加了 `--include-iam-bound` 时，`searchAllIamPolicies(query="policy.role.permissions:bigquery.tables.getData OR policy.role.permissions:bigquery.tables.updateData")` 找出**任何层级**授予了读 / 写数据权限的 SA（来源 `资源简名:iam-binding:<角色>`，例如 `folders/42:iam-binding:roles/bigquery.dataViewer`、`projects/p/datasets/d/tables/t:iam-binding:roles/bigquery.dataViewer`）。数据集的 legacy ACL（READER/WRITER/OWNER）会以 `roles/bigquery.dataViewer/dataEditor/dataOwner` 的形式出现。
    - **Group 展开**：绑定里的 `group:` 成员（企业里常见的"SA 进组、组被授权"）用 Cloud Identity 递归展开（含嵌套组），组内的 SA 记为来源 `资源简名:iam-binding:<角色> via group:a > group:b`，终端打印 `[ASSET-GROUP]`；读不到的组（外部域 / 无权限）打印 `[WARN]`，其中的 SA 不会列出。需要对这些组的成员读取权限。
    - **范围外 SA**：授权里出现、但不在本范围 SA 盘点结果里的 SA（其他组织的 SA，或已删除的 SA）在 `note` 里标"范围外 SA（其他组织的 SA 或已删除的 SA），拿不到禁用状态，请重点审核"，照常建议加入。
-   - Cloud Asset 请求遇到 429 / 5xx / 网络错误时按 2、4、8… 秒退避重试（最多 6 次）。
+   - Cloud Asset 请求遇到 429 / 5xx / 网络错误时按 2、4、8… 秒退避重试（最多尝试 6 次）。
 3. 同一个 SA 在多个范围、多个来源中出现时合并成一行，`sources` 记录全部来源。
 4. 决定是否建议加入：
    - 命中 Copilot 规则的 SA：不建议，`copilot=True`；
@@ -369,7 +369,7 @@ organizations/123456789012 + 0 个项目，共 1850 个 SA：建议加入 write 
 
 | | `scan_bq_access.py`（从表出发） | `list_project_sas.py` 项目范围 | `list_project_sas.py` 组织范围 |
 |---|---|---|---|
-| 回答的问题 | 谁能访问 / 访问过**这些表** | **这些项目**里有哪些 SA | **整个组织**里有哪些 SA、谁在任何层级被授了 BigQuery 读权限 |
+| 回答的问题 | 谁能访问 / 访问过**这些表** | **这些项目**里有哪些 SA | **整个组织**里有哪些 SA、谁在任何层级被授了 BigQuery 读 / 写数据权限 |
 | 能找到 | 目标表所在项目 / 数据集 / 表三层 IAM 里的任何主体（不管 SA 属于哪个项目）；授权视图 / 数据集的读者；作业历史里真实读写过的账号；`--analyze-scope` 时还有 Folder / Org 继承和经由 Group 的授权 | 列出项目拥有的全部 SA；`--include-iam-bound` 时这些项目**项目级** IAM 里的外部 SA | 范围内全部 SA；`--include-iam-bound` 时组织 / 文件夹 / 项目 / 数据集 / 表**任何层级**的授权（含经由 Group 的授权、其他组织的 SA） |
 | 找不到 | 不加 `--analyze-scope` 时：权限来自 Folder / Org 层且窗口期内没跑过作业的账号；跨项目提交的作业（要 `--job-projects` 或 `--jobs-scope organization`） | 不在列表里的项目拥有的 SA；只在数据集 / 表级被授权的外部 SA；不判断是否访问过 BQ | 范围之外、且没有被授 BigQuery 权限的 SA；读不到的 Group 里的 SA；不判断是否访问过 BQ |
 | 需要的权限 | 目标项目的 IAM / BigQuery 读权限（`--analyze-scope` 还要范围上的 `roles/cloudasset.viewer`） | 各项目 `iam.serviceAccounts.list` | 范围上的 `roles/cloudasset.viewer`；Group 展开要能读组成员 |

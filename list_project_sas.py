@@ -5,7 +5,7 @@
 与 scan_bq_access.py（按目标表扫描 IAM + 作业历史，较保守）互补：
   - scan_bq_access.py   只列出对目标表"有权限或真实访问过"的账号
   - list_project_sas.py 列出给定项目列表中"所有"SA，避免遗漏（例如权限来自 Folder/Org、
-                        近期没跑过作业、或通过 View 间接访问的调度 SA）
+                        近期没跑过作业、或经由多层 View 间接访问的调度 SA）
 
 两种范围（可以同时用）:
   A. 项目列表 --projects / --projects-file：对每个项目调用 IAM API 列出项目内全部 SA；
