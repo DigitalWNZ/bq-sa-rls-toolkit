@@ -1,5 +1,7 @@
 """公共认证工具：支持 ADC 或指定 gcloud 账号（token 到期自动刷新）。"""
 
+# Write-access test by harrishe (comment only, no logic change).
+
 import datetime
 import subprocess
 
