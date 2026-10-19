@@ -1,12 +1,19 @@
 """
-RLS 工具集的 GCP 操作封装（BigQuery / IAM / Resource Manager / Cloud Identity）。
-所有写操作都对 IAM/Group 传播延迟做了重试。
+RLS 工具集的 GCP 操作封装（BigQuery / IAM / Resource Manager / Cloud Identity / Admin SDK）。
+DDL 对 IAM / Group 传播延迟做了重试；只读 API 对 429 / 5xx 做指数退避。
 """
 
+import os
+import random
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property
 
+import google_auth_httplib2
+import httplib2
+from google.api_core.exceptions import NotFound
 from google.auth import impersonated_credentials
 from google.cloud import bigquery
 from googleapiclient import discovery
@@ -15,6 +22,7 @@ from googleapiclient.errors import HttpError
 import rls_core as core
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+HTTP_TIMEOUT = int(os.environ.get("RLS_HTTP_TIMEOUT", "120"))   # googleapiclient 默认无超时，死连接会让线程永久挂起
 
 
 def log(msg):
@@ -36,37 +44,87 @@ def is_propagation_error(e):
     return any(h in msg for h in _PROPAGATION_HINTS)
 
 
+_RATE_LIMIT_HINTS = ("rate limit", "ratelimitexceeded", "quota exceeded", "quotaexceeded",
+                     "resource exhausted", "resourceexhausted", "too many", "try again later",
+                     "backenderror", "internalerror",
+                     # BigQuery 在高并发 DDL 下偶发的无具体原因的后端错误（reason=invalid，message 以 ": null" 结尾），
+                     # 实测成簇出现、几秒后自行恢复；按暂时性错误指数退避重试（2026-10-18 性能测试中约 27% 的 DDL 遇到）
+                     "row access policy: null")
+
+
+def is_rate_limit_error(e):
+    msg = str(e).lower()
+    return any(h in msg for h in _RATE_LIMIT_HINTS)
+
+
 def retry(fn, desc="", timeout=300, interval=10, retry_if=is_propagation_error):
+    """
+    传播延迟类错误（retry_if）固定间隔重试；速率限制 / 后端暂时性错误指数退避（2, 4, ... 最长 60s）；
+    两类都在 timeout 内重试，超时抛出最后一次异常。
+    """
     deadline = time.time() + timeout
+    backoff = 2.0
     while True:
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
-            if time.time() >= deadline or not retry_if(e):
+            now = time.time()
+            if now >= deadline:
                 raise
-            log(f"    [retry] {desc}: {str(e)[:150]}")
-            time.sleep(interval)
+            if is_rate_limit_error(e):
+                wait = min(backoff, 60.0, max(0.0, deadline - now))
+                backoff *= 2
+            elif retry_if(e):
+                wait = min(interval, max(0.0, deadline - now))
+            else:
+                raise
+            log(f"    [retry] {desc}: {str(e)[:150]}（{wait:.0f}s 后重试）")
+            time.sleep(wait)
 
 
 _TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 
 
-def execute_with_backoff(req, desc="", attempts=6, base=2.0):
-    """执行 googleapiclient 请求；429 / 5xx / 网络错误按指数退避重试（2, 4, 8, ... 秒）。"""
+def execute_with_backoff(req, desc="", attempts=10, base=2.0, cap=60.0):
+    """执行 googleapiclient 请求；429 / 5xx / 网络错误按指数退避重试（2, 4, 8, ... 最长 60s，带随机抖动）。"""
     for i in range(attempts):
         try:
             return req.execute()
         except HttpError as e:
-            if e.resp.status not in _TRANSIENT_STATUS or i == attempts - 1:
+            transient = e.resp.status in _TRANSIENT_STATUS or (e.resp.status == 403 and is_rate_limit_error(e))
+            if not transient or i == attempts - 1:
                 raise
             err = f"HTTP {e.resp.status}"
         except (ConnectionError, TimeoutError, OSError) as e:
             if i == attempts - 1:
                 raise
             err = type(e).__name__
-        wait = base ** (i + 1)
+        wait = min(cap, base ** (i + 1)) * (0.5 + random.random())
         log(f"    [retry] {desc}: {err}，{wait:.0f}s 后重试（{i + 1}/{attempts - 1}）")
         time.sleep(wait)
+
+
+class RateLimiter:
+    """线程安全的令牌桶：每分钟最多 rpm 次，多线程共享。"""
+
+    def __init__(self, rpm):
+        self.interval = 60.0 / max(1, rpm)
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self.interval
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+# BigQuery 配额「IamPolicy requests per minute per user」= 1500（实测触发 429；1400 时仍偶发）；默认 1200。可用 RLS_IAM_RPM 覆盖
+IAM_POLICY_RPM = int(os.environ.get("RLS_IAM_RPM", "1200"))
+_iam_limiter = RateLimiter(IAM_POLICY_RPM)
 
 
 # --------------------------------------------------------------------------- #
@@ -77,39 +135,40 @@ class Ctx:
         self.creds = creds
         self.project = project
         self._loc = {}
+        self._lock = threading.Lock()
+        self._tls = threading.local()
 
     def _build(self, name, version):
-        return discovery.build(name, version, credentials=self.creds, cache_discovery=False)
+        """googleapiclient 的 Resource（底层 httplib2）不是线程安全的：每个线程各建一份。"""
+        key = f"{name}/{version}"
+        svc = getattr(self._tls, key, None)
+        if svc is None:
+            http = google_auth_httplib2.AuthorizedHttp(self.creds, http=httplib2.Http(timeout=HTTP_TIMEOUT))
+            svc = discovery.build(name, version, http=http, cache_discovery=False)
+            setattr(self._tls, key, svc)
+        return svc
 
     @cached_property
     def bq(self):
         return bigquery.Client(project=self.project, credentials=self.creds)
 
-    @cached_property
+    @property
     def bqapi(self):
         return self._build("bigquery", "v2")
 
-    @cached_property
-    def iam(self):
-        return self._build("iam", "v1")
-
-    @cached_property
-    def crm(self):
-        return self._build("cloudresourcemanager", "v1")
-
-    @cached_property
+    @property
     def ci(self):
         return self._build("cloudidentity", "v1")
 
-    @cached_property
-    def asset(self):
-        return self._build("cloudasset", "v1")
-
     def location(self, project, dataset):
         key = f"{project}.{dataset}"
-        if key not in self._loc:
-            self._loc[key] = self.bq.get_dataset(key).location
-        return self._loc[key]
+        with self._lock:
+            loc = self._loc.get(key)
+        if loc is None:
+            loc = self.bq.get_dataset(key).location
+            with self._lock:
+                self._loc[key] = loc
+        return loc
 
     def table_location(self, table):
         p, d, _ = core.parse_table(table)
@@ -117,7 +176,42 @@ class Ctx:
 
 
 # --------------------------------------------------------------------------- #
-# BigQuery：查询 / DDL / RLS
+# 并行
+# --------------------------------------------------------------------------- #
+def parallel_map(fn, items, workers=8, desc=""):
+    """
+    对每个 item 调用 fn(item)，最多 workers 个并发；返回与 items 同序的 [(item, result, exception)]。
+    单个 item 失败不影响其他 item（异常放在第三项）。
+    """
+    items = list(items)
+    results = [None] * len(items)
+
+    def run_one(i):
+        try:
+            return i, fn(items[i]), None
+        except Exception as e:  # noqa: BLE001
+            return i, None, e
+
+    if workers <= 1 or len(items) <= 1:
+        for i in range(len(items)):
+            _, r, e = run_one(i)
+            results[i] = (items[i], r, e)
+        return results
+    ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=desc or "rls")
+    try:
+        for fut in as_completed([ex.submit(run_one, i) for i in range(len(items))]):
+            i, r, e = fut.result()
+            results[i] = (items[i], r, e)
+    except BaseException:
+        # Ctrl-C 等：取消还没开始的任务（否则 with 退出时会把剩下的表全部跑完），正在执行的那几条等它自然结束
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# BigQuery：查询 / DDL / RLS / 表
 # --------------------------------------------------------------------------- #
 def run_query(ctx, sql, location, params=None):
     cfg = bigquery.QueryJobConfig(query_parameters=params or [])
@@ -128,209 +222,169 @@ def run_ddl(ctx, ddl, location):
     retry(lambda: ctx.bq.query(ddl, location=location).result(), desc="DDL", timeout=300)
 
 
-def list_policies(ctx, table):
-    """[{"id","filter","grantees"}]；grantees 通过 rowAccessPolicies.getIamPolicy 读取。"""
+def list_policies(ctx, table, grantees_for=None, workers=4):
+    """
+    [{"id","filter","grantees"}]。rowAccessPolicies.list 不返回授权对象，要逐条 getIamPolicy：
+      grantees_for=None   -> 全部读取（回退按主体匹配时需要）
+      grantees_for=集合   -> 只读取这些名字的规则，其余 grantees 为 None（apply_* 只关心自己那条）
+    """
     p, d, t = core.parse_table(table)
     api = ctx.bqapi.rowAccessPolicies()
     raw, req = [], api.list(projectId=p, datasetId=d, tableId=t)
     while req is not None:
-        resp = req.execute()
+        resp = execute_with_backoff(req, desc=f"list policies {table}")
         raw.extend(resp.get("rowAccessPolicies", []))
         req = api.list_next(req, resp)
-    out = []
-    for item in raw:
-        pid = item["rowAccessPolicyReference"]["policyId"]
-        res = f"projects/{p}/datasets/{d}/tables/{t}/rowAccessPolicies/{pid}"
-        pol = api.getIamPolicy(resource=res, body={}).execute()
-        grantees = [m for b in pol.get("bindings", []) if b.get("role") == core.RLS_GRANTEE_ROLE
-                    for m in b.get("members", [])]
-        out.append({"id": pid, "filter": item.get("filterPredicate", "TRUE"), "grantees": grantees})
+    out = [{"id": it["rowAccessPolicyReference"]["policyId"], "filter": it.get("filterPredicate", "TRUE"),
+            "grantees": None} for it in raw]
+    want = [x for x in out if grantees_for is None or x["id"] in grantees_for]
+
+    def fetch(x):
+        res = f"projects/{p}/datasets/{d}/tables/{t}/rowAccessPolicies/{x['id']}"
+        _iam_limiter.wait()                                   # 全局限速，避免触发 1500 次/分钟的配额
+        pol = execute_with_backoff(ctx.bqapi.rowAccessPolicies().getIamPolicy(resource=res, body={}),
+                                   desc=f"policy IAM {x['id']}")
+        return [m for b in pol.get("bindings", []) if b.get("role") == core.RLS_GRANTEE_ROLE
+                for m in b.get("members", [])]
+
+    for x, grantees, err in parallel_map(fetch, want, workers=workers, desc="iam"):
+        if err:
+            raise err
+        x["grantees"] = grantees
     return out
 
 
-# --------------------------------------------------------------------------- #
-# IAM：表 / 数据集 / 项目 / SA
-# --------------------------------------------------------------------------- #
-def table_role_members(ctx, table, role):
-    pol = ctx.bq.get_iam_policy(core.fq(table))
-    return {core.normalize_member(m) for b in pol.bindings if b["role"] == role for m in b["members"]}
+def expand_tables(ctx, tables, datasets, projects):
+    """
+    表 / 数据集内全部表 / 项目内全部表 -> 去重后的 project.dataset.table 列表。
+    展开数据集和项目时只取普通表（TABLE），视图等不支持 RLS 的对象跳过；显式列出的表原样保留。
+    """
+    out = [core.fq(t) for t in tables]
+    ds_list = [core.parse_dataset(d) for d in datasets]
+    for project in projects:
+        ds_list += [(project, d.dataset_id) for d in ctx.bq.list_datasets(project=project)]
+    for project, dataset in ds_list:
+        for t in ctx.bq.list_tables(f"{project}.{dataset}"):
+            if t.table_type == "TABLE":
+                out.append(f"{project}.{dataset}.{t.table_id}")
+    return list(dict.fromkeys(out))
 
 
-def table_iam_bindings(ctx, table):
-    return [(b["role"], list(b["members"])) for b in ctx.bq.get_iam_policy(core.fq(table)).bindings]
+def table_fields(ctx, table):
+    """顶层字段 [(name, type, mode)]。"""
+    return [(f.name, f.field_type, f.mode or "NULLABLE") for f in ctx.bq.get_table(core.fq(table)).schema]
 
 
-def table_add_role(ctx, table, role, member):
-    """返回 True 表示新增。"""
-    table = core.fq(table)
-
-    def op():
-        pol = ctx.bq.get_iam_policy(table)
-        for b in pol.bindings:
-            if b["role"] == role and member in b["members"]:
-                return False
-        pol.bindings.append({"role": role, "members": {member}})
-        ctx.bq.set_iam_policy(table, pol)
-        return True
-    return retry(op, desc=f"table IAM {member}")
-
-
-def table_remove_role(ctx, table, role, members):
-    """移除 members（已规范化）在表上的 role；返回实际移除的成员。"""
-    table = core.fq(table)
-    pol = ctx.bq.get_iam_policy(table)
-    removed = set()
-    for b in pol.bindings:
-        if b["role"] == role:
-            hit = {m for m in b["members"] if core.normalize_member(m) in members}
-            if hit:
-                b["members"] = set(b["members"]) - hit
-                removed |= hit
-    if removed:
-        pol.bindings = [b for b in pol.bindings if b["members"]]
-        ctx.bq.set_iam_policy(table, pol)
-    return removed
-
-
-_ENTITY_FOR_PREFIX = {"group": "groupByEmail", "user": "userByEmail",
-                      "serviceAccount": "userByEmail", "domain": "domain"}
-
-
-def dataset_add_reader(ctx, dataset, member):
-    """数据集级授予 READER（等同 dataViewer）。返回 True 表示新增。"""
-    prefix, _, email = member.partition(":")
-    entity = _ENTITY_FOR_PREFIX[prefix]
-
-    def op():
-        ds = ctx.bq.get_dataset(dataset)
-        if any(e.entity_id and e.entity_id.lower() == email and e.role == "READER"
-               for e in ds.access_entries):
-            return False
-        ds.access_entries = list(ds.access_entries) + [
-            bigquery.AccessEntry("READER", entity, email)]
-        ctx.bq.update_dataset(ds, ["access_entries"])
-        return True
-    return retry(op, desc=f"dataset ACL {member}")
-
-
-def dataset_member_roles(ds):
-    """数据集 ACL -> [(member, role)]，跳过授权视图/routine/dataset。"""
-    out = []
-    for e in ds.access_entries:
-        if not e.role or not isinstance(e.entity_id, str):
-            continue
-        t, eid = e.entity_type, e.entity_id
-        if t == "userByEmail":
-            member = core.normalize_member(eid, default_prefix="user")
-        elif t == "groupByEmail":
-            member = f"group:{eid.lower()}"
-        elif t == "domain":
-            member = f"domain:{eid.lower()}"
-        elif t == "specialGroup":
-            member = f"specialGroup:{eid}"
-        elif t == "iamMember":
-            member = core.normalize_member(eid)
-        else:
-            continue
-        out.append((member, e.role))
-    return out
-
-
-def dataset_authorized(ds):
-    """数据集 ACL 里的授权视图 / 授权数据集 -> core.authorized_entries 的 (views, datasets)。"""
-    return core.authorized_entries([(e.entity_type, e.entity_id) for e in ds.access_entries])
-
-
-def project_policy(ctx, project):
-    return ctx.crm.projects().getIamPolicy(
-        resource=project, body={"options": {"requestedPolicyVersion": 3}}).execute()
-
-
-def project_add_role(ctx, project, role, member):
-    def op():
-        pol = project_policy(ctx, project)
-        for b in pol.setdefault("bindings", []):
-            if b["role"] == role and not b.get("condition"):
-                if member in b["members"]:
-                    return False
-                b["members"].append(member)
-                break
-        else:
-            pol["bindings"].append({"role": role, "members": [member]})
-        ctx.crm.projects().setIamPolicy(resource=project, body={"policy": pol}).execute()
-        return True
-    return retry(op, desc=f"project IAM {member}")
-
-
-def list_sas(ctx, project):
-    return [s["email"] for s in list_sa_details(ctx, project)]
-
-
-def list_sa_details(ctx, project):
-    """[{"email","display_name","disabled"}]"""
-    out, api = [], ctx.iam.projects().serviceAccounts()
-    req = api.list(name=f"projects/{project}", pageSize=100)
-    while req is not None:
-        resp = req.execute()
-        out.extend({"email": a["email"].lower(), "display_name": a.get("displayName", ""),
-                    "disabled": bool(a.get("disabled"))} for a in resp.get("accounts", []))
-        req = api.list_next(req, resp)
-    return out
-
-
-def create_sa(ctx, project, account_id, display_name=None):
-    """返回 (email, created)。"""
-    email = core.sa_email(account_id, project)
+def table_exists(ctx, table):
     try:
-        ctx.iam.projects().serviceAccounts().create(
-            name=f"projects/{project}",
-            body={"accountId": account_id,
-                  "serviceAccount": {"displayName": display_name or account_id}}).execute()
-        return email, True
-    except HttpError as e:
-        if e.resp.status == 409:
-            return email, False
-        raise
-
-
-def sa_add_role(ctx, sa_email, role, member):
-    api = ctx.iam.projects().serviceAccounts()
-    res = f"projects/-/serviceAccounts/{sa_email}"
-
-    def op():
-        pol = api.getIamPolicy(resource=res).execute()
-        for b in pol.setdefault("bindings", []):
-            if b["role"] == role:
-                if member in b["members"]:
-                    return False
-                b["members"].append(member)
-                break
-        else:
-            pol["bindings"].append({"role": role, "members": [member]})
-        api.setIamPolicy(resource=res, body={"policy": pol}).execute()
+        ctx.bq.get_table(core.fq(table))
         return True
-    return retry(op, desc=f"SA IAM {sa_email}")
+    except NotFound:
+        return False
 
 
-def impersonate(source_creds, target, delegates=()):
+def table_schema(ctx, table):
+    """{路径: (类型, mode)}，嵌套字段用 a.b。"""
+    return core.flatten_schema(ctx.bq.get_table(core.fq(table)).schema)
+
+
+def read_mapping_rows(ctx, mapping_table):
+    t = core.fq(mapping_table)
+    return [dict(r.items()) for r in run_query(
+        ctx, f"SELECT table_name, col_name, to_name FROM `{t}`", ctx.table_location(t))]
+
+
+def read_registry_rows(ctx, registry_table):
+    """登记表 [{"table_name", "rls_enabled"}]（原值，不规范化）。"""
+    t = core.fq(registry_table)
+    return [dict(r.items()) for r in run_query(
+        ctx, f"SELECT table_name, rls_enabled FROM `{t}`", ctx.table_location(t))]
+
+
+def condition_sa_counts(ctx, condition_table):
+    """条件表 sa 列 {原值: 行数}（不做任何规范化；NULL 和空串除外）。"""
+    t = core.fq(condition_table)
+    rows = run_query(ctx, f"SELECT sa, COUNT(*) AS n FROM `{t}` WHERE sa IS NOT NULL AND TRIM(sa) != '' GROUP BY sa",
+                     ctx.table_location(t))
+    return {r["sa"]: r["n"] for r in rows}
+
+
+# --------------------------------------------------------------------------- #
+# 扮演与挂载后验证
+# --------------------------------------------------------------------------- #
+def impersonate(source_creds, target):
     return impersonated_credentials.Credentials(
         source_credentials=source_creds, target_principal=target,
-        delegates=list(delegates), target_scopes=SCOPES, lifetime=3600)
+        target_scopes=SCOPES, lifetime=3600)
+
+
+def table_partitioning(tbl):
+    """bigquery.Table -> visibility_probe_sql 需要的分区描述（无分区返回 None）。"""
+    if tbl.time_partitioning:
+        return {"require_filter": bool(tbl.require_partition_filter),
+                "field": tbl.time_partitioning.field, "kind": "time"}
+    if tbl.range_partitioning:
+        return {"require_filter": bool(tbl.require_partition_filter),
+                "field": tbl.range_partitioning.field, "kind": "range"}
+    return None
+
+
+def _is_impersonation_error(e):
+    msg = str(e)
+    return "Unable to acquire impersonated credentials" in msg or "iam.serviceAccounts.getAccessToken" in msg
+
+
+def verify_full_access(ctx, table, sa_email, timeout=300, interval=10, mode="sample"):
+    """
+    以 sa_email 身份轮询探测查询，确认其能看到数据。返回 (status, detail)，status ∈ ok / fail / skip。
+      sample（默认）: SELECT 1 ... LIMIT 1，看到任意一行即通过
+      count         : SELECT COUNT(*) 与元数据行数比对
+    表元数据行数为 0 时无法验证，返回 skip。
+    """
+    table = core.fq(table)
+    meta = ctx.bq.get_table(table)
+    expected = meta.num_rows or 0
+    if expected == 0:
+        return "skip", "表元数据行数为 0，无法通过查询验证可见性"
+    sql = core.visibility_probe_sql(table, table_partitioning(meta), mode=mode)
+    client = bigquery.Client(project=ctx.project, credentials=impersonate(ctx.creds, sa_email))
+    loc = ctx.table_location(table)
+    start, last = time.time(), ""
+    while True:
+        try:
+            rows = list(client.query(sql, location=loc).result())
+            if mode == "count":
+                n = rows[0].n
+                if n >= expected:
+                    return "ok", f"{n} 行（{time.time() - start:.0f}s）"
+                last = f"只可见 {n}/{expected} 行"
+            elif rows:
+                return "ok", f"可见数据（{time.time() - start:.0f}s）"
+            else:
+                last = "查询返回 0 行（未命中规则或 Group 尚未生效）"
+        except Exception as e:  # noqa: BLE001
+            if _is_impersonation_error(e):          # 永久性错误：等待也不会好转，立即失败
+                return "fail", f"无法扮演 {sa_email}（需要对它有 roles/iam.serviceAccountTokenCreator，或该 SA 不存在）: {str(e)[:200]}"
+            last = str(e)[:200]
+        if time.time() - start >= timeout:
+            return "fail", f"{timeout}s 内未达到可见: {last}"
+        log(f"    [verify] {table}: {last}")
+        time.sleep(interval)
+
+
+def count_visible(ctx, table, sa_email):
+    """以 sa_email 身份查 COUNT(*)，返回 (可见行数, 表元数据行数)。只报告，不重试。"""
+    table = core.fq(table)
+    meta = ctx.bq.get_table(table)
+    sql = core.visibility_probe_sql(table, table_partitioning(meta), mode="count")
+    client = bigquery.Client(project=ctx.project, credentials=impersonate(ctx.creds, sa_email))
+    rows = list(client.query(sql, location=ctx.table_location(table)).result())
+    return rows[0].n, meta.num_rows or 0
 
 
 # --------------------------------------------------------------------------- #
-# Cloud Identity Groups
+# Cloud Identity Groups（只读：展开成员）
 # --------------------------------------------------------------------------- #
-def resolve_customer_id(ctx, project):
-    anc = ctx.crm.projects().getAncestry(projectId=project, body={}).execute()
-    org = next((a["resourceId"]["id"] for a in anc.get("ancestor", [])
-                if a["resourceId"]["type"] == "organization"), None)
-    if not org:
-        raise RuntimeError(f"项目 {project} 不在 Organization 下，请用 --customer-id 指定")
-    return ctx.crm.organizations().get(name=f"organizations/{org}").execute()["owner"][
-        "directoryCustomerId"]
-
-
 _CONFIG_ERROR_HINTS = ("user_project", "quota project", "service_disabled", "has not been used",
                        "is disabled", "serviceusage")
 
@@ -342,31 +396,6 @@ def lookup_group(ctx, email):
         if e.resp.status in (403, 404) and not any(h in str(e).lower() for h in _CONFIG_ERROR_HINTS):
             return None
         raise
-
-
-def ensure_group(ctx, email, customer_id, display_name=None, initial_config="WITH_INITIAL_OWNER"):
-    """返回 (group_name, created)。"""
-    name = lookup_group(ctx, email)
-    if name:
-        return name, False
-    ctx.ci.groups().create(
-        initialGroupConfig=initial_config,
-        body={"parent": f"customers/{customer_id}", "groupKey": {"id": email},
-              "displayName": display_name or email,
-              "labels": {"cloudidentity.googleapis.com/groups.discussion_forum": ""}}).execute()
-    name = retry(lambda: lookup_group(ctx, email) or (_ for _ in ()).throw(
-        RuntimeError(f"group {email} does not exist yet")), desc="group lookup", timeout=120)
-    return name, True
-
-
-def group_members(ctx, group_name):
-    out, api = set(), ctx.ci.groups().memberships()
-    req = api.list(parent=group_name, pageSize=200)
-    while req is not None:
-        resp = req.execute()
-        out.update(m["preferredMemberKey"]["id"].lower() for m in resp.get("memberships", []))
-        req = api.list_next(req, resp)
-    return out
 
 
 def group_members_typed(ctx, group_email):
@@ -403,189 +432,109 @@ def expand_group(ctx, group_email, max_depth=10):
     return core.expand_group(group_email, fetch, max_depth=max_depth)
 
 
-def add_group_member(ctx, group_name, email):
-    """返回 True 表示新增。"""
+# --------------------------------------------------------------------------- #
+# list_principals：全部使用权威 API（不使用 Cloud Asset，其搜索索引可能漏掉资源）
+# --------------------------------------------------------------------------- #
+DIRECTORY_HINT = ("读取账号目录需要：① 执行账号是 Workspace / Cloud Identity 管理员，且具有「用户 → 读取」权限"
+                  "（如超级管理员、用户管理管理员，或只含该权限的自定义管理员角色）；② quota 项目已启用 Admin SDK API"
+                  "（admin.googleapis.com）")
+
+
+def _paged(api_method, next_method, key, desc, **kwargs):
+    out, req = [], api_method(**kwargs)
+    while req is not None:
+        resp = execute_with_backoff(req, desc=desc)
+        out.extend(resp.get(key, []))
+        req = next_method(req, resp)
+    return out
+
+
+def list_org_descendants(ctx, org_id):
+    """组织下递归的 (文件夹名列表, ACTIVE 项目 ID 列表, 非 ACTIVE 项目 ID 列表)；Resource Manager v3。"""
+    crm = ctx._build("cloudresourcemanager", "v3")
+    folders, active, inactive = [], [], []
+    todo = [f"organizations/{org_id}"]
+    while todo:
+        parent = todo.pop(0)
+        subs = _paged(crm.folders().list, crm.folders().list_next, "folders", f"list folders {parent}", parent=parent)
+        for f in subs:
+            folders.append(f["name"])
+            todo.append(f["name"])
+        for prj in _paged(crm.projects().list, crm.projects().list_next, "projects", f"list projects {parent}",
+                          parent=parent, showDeleted=True):
+            (active if prj.get("state") == "ACTIVE" else inactive).append(prj["projectId"])
+    return folders, active, inactive
+
+
+def org_directory_customer(ctx, org_id):
+    """组织对应的 Cloud Identity / Workspace customer ID（organizations.get 的 directoryCustomerId）。"""
+    crm = ctx._build("cloudresourcemanager", "v3")
+    org = execute_with_backoff(crm.organizations().get(name=f"organizations/{org_id}"), desc=f"get org {org_id}")
+    return org["directoryCustomerId"]
+
+
+def directory_users(ctx, customer):
+    """
+    账号目录里的全部 user（含暂停 / 归档，所有域名）。用执行账号自己的凭证（与其它调用相同）调用 Admin SDK Directory API；
+    能否读取由执行账号在 Admin 控制台中的管理员权限决定（GCP IAM 角色不起作用）。
+    """
+    svc = ctx._build("admin", "directory_v1")
     try:
-        retry(lambda: ctx.ci.groups().memberships().create(
-            parent=group_name,
-            body={"preferredMemberKey": {"id": email}, "roles": [{"name": "MEMBER"}]}).execute(),
-            desc=f"add {email}", retry_if=lambda e: not (isinstance(e, HttpError)
-                                                          and e.resp.status == 409)
-            and is_propagation_error(e))
-        return True
-    except HttpError as e:
-        if e.resp.status == 409:
-            return False
-        raise
+        users = _paged(svc.users().list, svc.users().list_next, "users", f"list users {customer}",
+                       customer=customer, maxResults=500, projection="basic", showDeleted="false")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"读取账号目录失败: {str(e)[:300]}。{DIRECTORY_HINT}") from e
+    return [u["primaryEmail"].lower() for u in users if u.get("primaryEmail")]
 
 
-# --------------------------------------------------------------------------- #
-# 挂载后验证
-# --------------------------------------------------------------------------- #
-def table_partitioning(tbl):
-    """bigquery.Table -> visibility_probe_sql 需要的分区描述（无分区返回 None）。"""
-    if tbl.time_partitioning:
-        return {"require_filter": bool(tbl.require_partition_filter),
-                "field": tbl.time_partitioning.field, "kind": "time"}
-    if tbl.range_partitioning:
-        return {"require_filter": bool(tbl.require_partition_filter),
-                "field": tbl.range_partitioning.field, "kind": "range"}
-    return None
+def resource_iam_bindings(ctx, resource):
+    """organizations/<id> / folders/<id> / projects/<id> 的 IAM 策略 bindings（requestedPolicyVersion 3，含条件绑定）。"""
+    crm = ctx._build("cloudresourcemanager", "v3")
+    kind = resource.split("/", 1)[0]
+    api = {"organizations": crm.organizations(), "folders": crm.folders(), "projects": crm.projects()}[kind]
+    pol = execute_with_backoff(api.getIamPolicy(resource=resource, body={"options": {"requestedPolicyVersion": 3}}),
+                               desc=f"getIamPolicy {resource}")
+    return pol.get("bindings", [])
 
 
-def verify_full_access(ctx, table, sa_email, timeout=300, interval=10, mode="sample"):
-    """
-    以 sa_email 身份轮询探测查询，确认其命中了 FILTER TRUE 策略。返回 (status, detail)，
-    status ∈ ok / fail / skip。
-      sample（默认）: SELECT 1 ... LIMIT 1，看到任意一行即通过（扫描量极小；表要求分区过滤时自动加条件）
-      count         : SELECT COUNT(*) 与元数据行数比对（大表成本高；含流式缓冲时以 >= 判断）
-    表元数据行数为 0 时无法验证，返回 skip。
-    """
-    table = core.fq(table)
-    meta = ctx.bq.get_table(table)
-    expected = meta.num_rows or 0
-    if expected == 0:
-        return "skip", "表元数据行数为 0，无法通过查询验证可见性"
-    sql = core.visibility_probe_sql(table, table_partitioning(meta), mode=mode)
-    client = bigquery.Client(project=ctx.project, credentials=impersonate(ctx.creds, sa_email))
-    loc = ctx.table_location(table)
-    start = time.time()
-    last = ""
-    while True:
-        try:
-            rows = list(client.query(sql, location=loc).result())
-            if mode == "count":
-                n = rows[0].n
-                if n >= expected:
-                    return "ok", f"{n} 行（{time.time() - start:.0f}s）"
-                last = f"只可见 {n}/{expected} 行"
-            else:
-                if rows:
-                    return "ok", f"可见数据（{time.time() - start:.0f}s）"
-                last = "查询返回 0 行（未命中 TRUE 策略或 Group 尚未生效）"
-        except Exception as e:  # noqa: BLE001
-            last = str(e)[:200]
-        if time.time() - start >= timeout:
-            return "fail", f"{timeout}s 内未达到可见: {last}"
-        log(f"    [verify] {table}: {last}")
-        time.sleep(interval)
+def project_service_accounts(ctx, project):
+    """项目自己的全部 SA（IAM serviceAccounts.list；含已禁用、没有任何授权的）。"""
+    iam = ctx._build("iam", "v1")
+    accts = _paged(iam.projects().serviceAccounts().list, iam.projects().serviceAccounts().list_next, "accounts",
+                   f"list SAs {project}", name=f"projects/{project}", pageSize=100)
+    return [a["email"].lower() for a in accts]
 
 
-def condition_sas(ctx, condition_table):
-    """条件表中出现的 sa（小写集合）。"""
-    t = core.fq(condition_table)
-    return {r.sa for r in run_query(ctx, f"SELECT DISTINCT LOWER(sa) AS sa FROM `{t}` WHERE sa IS NOT NULL",
-                                     ctx.table_location(t))}
+def project_datasets(ctx, project):
+    return [f"{project}.{d.dataset_id}" for d in ctx.bq.list_datasets(project=project)]
 
 
-# --------------------------------------------------------------------------- #
-# 角色 -> 权限 展开（带缓存）
-# --------------------------------------------------------------------------- #
-class RoleResolver:
-    def __init__(self, iam):
-        self.iam = iam
-        self.cache = {}
-
-    def permissions(self, role):
-        if role in self.cache:
-            return self.cache[role]
-        perms = []
-        try:
-            if role.startswith("roles/"):
-                r = self.iam.roles().get(name=role).execute()
-            elif role.startswith("projects/"):
-                r = self.iam.projects().roles().get(name=role).execute()
-            elif role.startswith("organizations/"):
-                r = self.iam.organizations().roles().get(name=role).execute()
-            else:
-                r = {}
-            perms = r.get("includedPermissions", [])
-        except HttpError as e:
-            log(f"  [WARN] 无法获取角色 {role} 的权限: {getattr(e, 'reason', e)}")
-            perms = ["bigquery.unknown"] if "bigquery" in role.lower() else []
-        self.cache[role] = perms
-        return perms
-
-    def has_bq(self, role):
-        return any(p.startswith("bigquery.") for p in self.permissions(role))
+def dataset_access(ctx, dataset):
+    """数据集 ACL -> [(role, entity_type, entity_id)]（role 为 READER / WRITER / OWNER 或 roles/...）。"""
+    p, d = core.parse_dataset(dataset)
+    return [(e.role, e.entity_type, e.entity_id) for e in ctx.bq.get_dataset(f"{p}.{d}").access_entries]
 
 
-# --------------------------------------------------------------------------- #
-# Group 生效探针
-# --------------------------------------------------------------------------- #
-def probe_group(ctx, group_email, probe_sa, dataset, timeout=600, interval=15):
-    """
-    在 dataset 下为 group 建一张探针表（1 行），挂 FILTER TRUE policy 只授予该 group，
-    给 probe_sa 表级 dataViewer，然后以 probe_sa 身份查询，直到能看到 1 行
-    （证明 BigQuery 已识别 probe_sa 的 group 成员关系）。
-    前提: probe_sa 已加入 group；执行账号可扮演 probe_sa；probe_sa 有 jobUser。
-    """
-    p, d = dataset.split(".")
-    local = core.sanitize_identifier(group_email.split("@")[0])
-    table = f"{p}.{d}._rls_probe_{local}"
-    loc = ctx.location(p, d)
-    run_ddl(ctx, f"CREATE TABLE IF NOT EXISTS `{table}` AS SELECT 1 AS x", loc)
-    run_ddl(ctx, core.build_policy_ddl(table, "probe", [f"group:{group_email}"], "TRUE"), loc)
-    table_add_role(ctx, table, "roles/bigquery.dataViewer", f"serviceAccount:{probe_sa}")
-    probe_client = bigquery.Client(project=ctx.project, credentials=impersonate(ctx.creds, probe_sa))
-    deadline = time.time() + timeout
-    while True:
-        try:
-            n = list(probe_client.query(f"SELECT COUNT(*) AS n FROM `{table}`",
-                                        location=loc).result())[0].n
-            if n == 1:
-                return True
-            log(f"    [probe] {group_email}: 仍不可见 (rows={n})")
-        except Exception as e:  # noqa: BLE001
-            log(f"    [probe] {group_email}: {str(e)[:150]}")
-        if time.time() >= deadline:
-            return False
-        time.sleep(interval)
+def dataset_tables(ctx, dataset):
+    """数据集内全部表（含视图 / 物化视图 / 外部表；它们都可以单独授权）。"""
+    return [f"{t.project}.{t.dataset_id}.{t.table_id}" for t in ctx.bq.list_tables(dataset)]
 
 
-# --------------------------------------------------------------------------- #
-# Cloud Asset Inventory：组织 / 文件夹范围的 SA 与 IAM 绑定盘点（不依赖项目列表）
-# --------------------------------------------------------------------------- #
-def asset_search_service_accounts(ctx, scope):
-    """scope 内全部 SA（searchAllResources，assetType=iam.googleapis.com/ServiceAccount）。"""
-    api, out = ctx.asset.v1(), []
-    req = api.searchAllResources(scope=scope, assetTypes=["iam.googleapis.com/ServiceAccount"], pageSize=500)
-    while req is not None:
-        resp = execute_with_backoff(req, desc=f"searchAllResources {scope}")
-        out.extend(resp.get("results", []))
-        req = api.searchAllResources_next(req, resp)
-    return out
+def table_iam_bindings(ctx, table):
+    p, d, t = core.parse_table(table)
+    _iam_limiter.wait()                                   # 与 rowAccessPolicies.getIamPolicy 共用 BigQuery IamPolicy 配额
+    pol = execute_with_backoff(ctx.bqapi.tables().getIamPolicy(
+        resource=f"projects/{p}/datasets/{d}/tables/{t}", body={}), desc=f"table getIamPolicy {table}")
+    return pol.get("bindings", [])
 
 
-def asset_search_iam_policies(ctx, scope, query):
-    """scope 内命中 query 的 IAM 策略（组织 / 文件夹 / 项目 / 数据集 / 表 等任何层级）。"""
-    api, out = ctx.asset.v1(), []
-    req = api.searchAllIamPolicies(scope=scope, query=query, pageSize=500)
-    while req is not None:
-        resp = execute_with_backoff(req, desc=f"searchAllIamPolicies {scope}")
-        out.extend(resp.get("results", []))
-        req = api.searchAllIamPolicies_next(req, resp)
-    return out
-
-
-def bq_full_resource_name(ref):
-    """'p.d.t' -> //bigquery.googleapis.com/projects/p/datasets/d/tables/t；'p.d' -> 数据集。"""
-    parts = ref.replace(":", ".").split(".")
-    base = f"//bigquery.googleapis.com/projects/{parts[0]}/datasets/{parts[1]}"
-    return base + (f"/tables/{parts[2]}" if len(parts) == 3 else "")
-
-
-def analyze_access(ctx, scope, full_resource_name, permissions):
-    """
-    analyzeIamPolicy：谁在 full_resource_name 上拥有 permissions 中任一权限。
-    展开 Group（含嵌套）并包含资源层级上的继承绑定（组织 / 文件夹 / 项目 / 数据集）。
-    返回 (analysisResults, fully_explored)。
-    """
-    req = ctx.asset.v1().analyzeIamPolicy(
-        scope=scope,
-        analysisQuery_resourceSelector_fullResourceName=full_resource_name,
-        analysisQuery_accessSelector_permissions=list(permissions),
-        analysisQuery_options_expandGroups=True,
-        analysisQuery_options_outputGroupEdges=True)
-    main = execute_with_backoff(req, desc=f"analyzeIamPolicy {full_resource_name}").get("mainAnalysis", {})
-    return main.get("analysisResults", []), bool(main.get("fullyExplored"))
+def role_permissions(ctx, role):
+    """角色包含的权限（预定义 / 基本角色 roles/...；自定义角色 organizations/x/roles/y、projects/p/roles/y）。"""
+    iam = ctx._build("iam", "v1")
+    if role.startswith("organizations/"):
+        req = iam.organizations().roles().get(name=role)
+    elif role.startswith("projects/"):
+        req = iam.projects().roles().get(name=role)
+    else:
+        req = iam.roles().get(name=role)
+    return set(execute_with_backoff(req, desc=f"get role {role}").get("includedPermissions", []))

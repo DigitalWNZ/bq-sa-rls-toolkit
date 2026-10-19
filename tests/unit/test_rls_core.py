@@ -18,30 +18,67 @@ class TestSplitItems:
         assert core.split_items(["", " , "]) == []
 
 
+class TestReadListFile:
+    def test_single_column_no_header(self, tmp_path):
+        f = tmp_path / "tables.csv"
+        f.write_text("p.d.t1\np.d.t2\n", encoding="utf-8")
+        assert core.read_list_file(str(f)) == ["p.d.t1", "p.d.t2"]
+
+    def test_blank_lines_ignored_and_values_stripped(self, tmp_path):
+        f = tmp_path / "x.csv"
+        f.write_text("\n  a  \n\n b\n", encoding="utf-8")
+        assert core.read_list_file(str(f)) == ["a", "b"]
+
+    def test_utf8_bom_tolerated(self, tmp_path):
+        f = tmp_path / "x.csv"
+        f.write_bytes("\ufeffprod-proj\netl-proj\n".encode("utf-8"))
+        assert core.read_list_file(str(f)) == ["prod-proj", "etl-proj"]
+
+    def test_hash_is_not_a_comment(self, tmp_path):
+        # CSV 不支持注释：以 # 开头的行按普通值读入（后续校验会报错）
+        f = tmp_path / "x.csv"
+        f.write_text("#abc\n", encoding="utf-8")
+        assert core.read_list_file(str(f)) == ["#abc"]
+
+    def test_multiple_columns_rejected(self, tmp_path):
+        f = tmp_path / "x.csv"
+        f.write_text("a,b\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="单列"):
+            core.read_list_file(str(f))
+
+    def test_quoted_value_with_trailing_empty_cell_ok(self, tmp_path):
+        # Excel 另存为 CSV 时可能多出空列
+        f = tmp_path / "x.csv"
+        f.write_text("a,\n\"b\",\n", encoding="utf-8")
+        assert core.read_list_file(str(f)) == ["a", "b"]
+
+
 class TestNormalizeMember:
     def test_bare_email_defaults_to_group(self):
         assert core.normalize_member("G@X.com") == "group:g@x.com"
-
-    def test_bare_email_custom_default(self):
-        assert core.normalize_member("a@x.com", default_prefix="user") == "user:a@x.com"
 
     def test_gserviceaccount_email_detected_as_service_account(self):
         assert (core.normalize_member("sa@p.iam.gserviceaccount.com")
                 == "serviceAccount:sa@p.iam.gserviceaccount.com")
 
     def test_keeps_prefix_and_lowercases_email(self):
-        assert core.normalize_member("serviceAccount:SA@P.iam.gserviceaccount.com") == \
-            "serviceAccount:sa@p.iam.gserviceaccount.com"
-
-    def test_special_members_kept(self):
-        assert core.normalize_member("allAuthenticatedUsers") == "allAuthenticatedUsers"
+        assert core.normalize_member("user:Alice@X.com") == "user:alice@x.com"
 
     def test_deleted_member_kept_as_is(self):
         m = "deleted:serviceAccount:x@p.iam.gserviceaccount.com?uid=1"
         assert core.normalize_member(m) == m
 
 
-class TestQualifiedTable:
+class TestMemberEmail:
+    def test_strips_prefix(self):
+        assert core.member_email("serviceAccount:SA@p.iam.gserviceaccount.com") == \
+            "sa@p.iam.gserviceaccount.com"
+
+    def test_bare(self):
+        assert core.member_email("A@x.com") == "a@x.com"
+
+
+class TestTableAndDataset:
     def test_three_part(self):
         assert core.parse_table("p.d.t") == ("p", "d", "t")
 
@@ -59,927 +96,516 @@ class TestQualifiedTable:
         with pytest.raises(ValueError):
             core.parse_table("p.d")
 
+    def test_dataset(self):
+        assert core.parse_dataset("p.d") == ("p", "d")
+        assert core.parse_dataset("p:d") == ("p", "d")
 
-# --------------------------------------------------------------------------- #
-# 权限分类
-# --------------------------------------------------------------------------- #
-class TestClassifyPermissions:
-    def test_getdata_is_read(self):
-        assert core.classify_permissions(["bigquery.tables.getData"]) == (True, False)
-
-    def test_updatedata_is_write(self):
-        assert core.classify_permissions(["bigquery.tables.updateData"]) == (False, True)
-
-    def test_both(self):
-        assert core.classify_permissions(
-            ["bigquery.tables.getData", "bigquery.tables.updateData"]) == (True, True)
-
-    def test_metadata_only_is_neither(self):
-        assert core.classify_permissions(["bigquery.tables.get", "bigquery.jobs.create"]) == \
-            (False, False)
-
-    def test_legacy_dataset_roles(self):
-        assert core.classify_legacy_dataset_role("READER") == (True, False)
-        assert core.classify_legacy_dataset_role("WRITER") == (True, True)
-        assert core.classify_legacy_dataset_role("OWNER") == (True, True)
-
-
-# --------------------------------------------------------------------------- #
-# Copilot SA 防混入
-# --------------------------------------------------------------------------- #
-class TestCopilotGuard:
-    def test_explicit_member_rejected(self):
-        allowed, rejected = core.filter_whitelist_members(
-            ["serviceAccount:etl@p.iam.gserviceaccount.com",
-             "serviceAccount:copilot-api@p.iam.gserviceaccount.com"],
-            copilot_members=["copilot-api@p.iam.gserviceaccount.com"])
-        assert allowed == ["serviceAccount:etl@p.iam.gserviceaccount.com"]
-        assert rejected == ["serviceAccount:copilot-api@p.iam.gserviceaccount.com"]
-
-    def test_pattern_rejected(self):
-        allowed, rejected = core.filter_whitelist_members(
-            ["serviceAccount:copilot-u-001@p.iam.gserviceaccount.com", "user:alice@x.com"],
-            copilot_patterns=["copilot-*@*"])
-        assert allowed == ["user:alice@x.com"]
-        assert rejected == ["serviceAccount:copilot-u-001@p.iam.gserviceaccount.com"]
-
-    def test_no_guard_allows_all(self):
-        allowed, rejected = core.filter_whitelist_members(["user:a@x.com"])
-        assert allowed == ["user:a@x.com"] and rejected == []
-
-
-# --------------------------------------------------------------------------- #
-# 白名单 FILTER TRUE DDL 与合并计划
-# --------------------------------------------------------------------------- #
-class TestGenericPolicyDdl:
-    def test_build_policy_ddl(self):
-        assert core.build_policy_ddl("p.d.t", "probe", ["group:g@x.com"], "x > 1") == (
-            "CREATE OR REPLACE ROW ACCESS POLICY `probe`\n"
-            "ON `p.d.t`\n"
-            'GRANT TO ("group:g@x.com")\n'
-            "FILTER USING (x > 1)")
-
-    def test_rejects_quote_in_grantee(self):
+    def test_dataset_rejects_table(self):
         with pytest.raises(ValueError):
-            core.build_policy_ddl("p.d.t", "probe", ['group:g@x.com") OR ("'], "TRUE")
-
-    def test_sanitize_identifier(self):
-        assert core.sanitize_identifier("rlsit-full.write") == "rlsit_full_write"
-
-    def test_grantee_role_constant(self):
-        assert core.RLS_GRANTEE_ROLE == "roles/bigquery.filteredDataViewer"
+            core.parse_dataset("p.d.t")
 
 
-class TestBypassPolicy:
-    def test_ddl_grants_all_groups_with_true_filter(self):
-        ddl = core.build_bypass_policy_ddl(
-            "p.d.t", ["group:w@x.com", "group:r@x.com"])
-        assert ddl == (
-            "CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access`\n"
-            "ON `p.d.t`\n"
-            'GRANT TO ("group:w@x.com", "group:r@x.com")\n'
-            "FILTER USING (TRUE)")
+class TestScopeIds:
+    def test_org_id_digits(self):
+        assert core.org_scope("230135420009") == "organizations/230135420009"
+        assert core.org_scope("organizations/230135420009") == "organizations/230135420009"
 
-    def test_ddl_requires_grantees(self):
+    def test_org_id_rejects_non_digits(self):
         with pytest.raises(ValueError):
-            core.build_bypass_policy_ddl("p.d.t", [])
+            core.org_scope("harrishe.altostrat.com")
 
-    def test_plan_create_when_absent(self):
-        plan = core.plan_policy_upsert([], "rls_bypass_full_access", "TRUE", ["group:w@x.com"])
-        assert plan.action == "create"
+    def test_project_id(self):
+        assert core.project_scope("prod-proj") == "projects/prod-proj"
 
-    def test_plan_noop_when_identical(self):
-        existing = [{"id": "rls_bypass_full_access", "filter": "TRUE",
-                     "grantees": ["group:w@x.com", "group:r@x.com"]}]
-        plan = core.plan_policy_upsert(existing, "rls_bypass_full_access", "TRUE",
-                                       ["group:r@x.com", "group:w@x.com"])
-        assert plan.action == "noop"
+    def test_project_number_tolerated(self):
+        assert core.project_scope("123456789012") == "projects/123456789012"
 
-    def test_plan_conflict_when_grantees_differ(self):
-        existing = [{"id": "rls_bypass_full_access", "filter": "TRUE",
-                     "grantees": ["user:someone@x.com"]}]
-        plan = core.plan_policy_upsert(existing, "rls_bypass_full_access", "TRUE",
-                                       ["group:w@x.com"])
-        assert plan.action == "conflict"
-
-    def test_plan_merge_unions_grantees(self):
-        existing = [{"id": "rls_bypass_full_access", "filter": "TRUE",
-                     "grantees": ["user:someone@x.com"]}]
-        plan = core.plan_policy_upsert(existing, "rls_bypass_full_access", "TRUE",
-                                       ["group:w@x.com"], merge=True)
-        assert plan.action == "replace"
-        assert plan.grantees == ["group:w@x.com", "user:someone@x.com"]
-
-    def test_plan_conflict_when_filter_differs_even_with_merge(self):
-        existing = [{"id": "rls_bypass_full_access", "filter": "region = 'HK'",
-                     "grantees": ["group:w@x.com"]}]
-        plan = core.plan_policy_upsert(existing, "rls_bypass_full_access", "TRUE",
-                                       ["group:w@x.com"], merge=True)
-        assert plan.action == "conflict"
-
-    def test_first_policy_flag(self):
-        assert core.plan_policy_upsert([], "p", "TRUE", ["group:a@x.com"]).first_policy
-        assert not core.plan_policy_upsert(
-            [{"id": "other", "filter": "TRUE", "grantees": []}],
-            "p", "TRUE", ["group:a@x.com"]).first_policy
+    def test_project_rejects_bad(self):
+        with pytest.raises(ValueError):
+            core.project_scope("bad proj!")
 
 
 # --------------------------------------------------------------------------- #
-# Copilot Subquery DDL
+# 规则命名
 # --------------------------------------------------------------------------- #
-class TestCopilotPolicy:
-    def test_single_dimension_filter(self):
-        f = core.build_copilot_filter([("prd_type", "prdtype")], COND)
-        assert f == (
-            "(`prd_type` IN (SELECT v FROM `auth-proj.auth_ds.adm_user_mem_copilot_condition` AS c, "
-            "UNNEST(c.prdtype) AS v WHERE c.sa = SESSION_USER()) "
-            "OR EXISTS (SELECT 1 FROM `auth-proj.auth_ds.adm_user_mem_copilot_condition` AS c "
-            "WHERE c.sa = SESSION_USER() AND (c.prdtype IS NULL OR ARRAY_LENGTH(c.prdtype) = 0)))")
+class TestPolicyNames:
+    def test_bypass_name(self):
+        assert (core.bypass_policy_name("group_existingSA_read@domain.com")
+                == "rls_bypass_full_access_group_existingsa_read_domain_com")
 
-    def test_multiple_dimensions_joined_with_and(self):
-        f = core.build_copilot_filter(
-            [("region", "region"), ("prd_type", "prdtype"), ("ref", "refername")], COND)
-        assert f.count(" AND (`") == 2  # 3 个维度之间 2 个 AND（EXISTS 内部是 " AND (c."）
-        assert "UNNEST(c.region)" in f and "UNNEST(c.prdtype)" in f and "UNNEST(c.refername)" in f
-        assert "`ref` IN" in f
+    def test_copilot_name(self):
+        assert core.copilot_policy_name("Alice.W@domain.com") == "rls_copilot_alice_w_domain_com"
 
-    def test_rejects_unknown_dimension(self):
+    def test_copilot_name_for_sa(self):
+        assert (core.copilot_policy_name("copilot-sa-a@p.iam.gserviceaccount.com")
+                == "rls_copilot_copilot_sa_a_p_iam_gserviceaccount_com")
+
+    def test_prefix_strips_group_prefix(self):
+        assert core.bypass_policy_name("group:g@x.com") == "rls_bypass_full_access_g_x_com"
+
+    def test_long_email_truncated_with_hash_and_stays_valid(self):
+        long = ("a" * 240) + "@x.com"
+        name = core.copilot_policy_name(long)
+        assert len(name) <= 256 and name.startswith("rls_copilot_")
+        assert core.copilot_policy_name(long) == name          # 稳定
+        assert core.copilot_policy_name(("a" * 241) + "@x.com") != name
+
+    def test_is_bypass_name(self):
+        assert core.is_bypass_policy("rls_bypass_full_access_g_x_com")
+        assert not core.is_bypass_policy("rls_bypass_full_access")
+        assert not core.is_bypass_policy("rls_copilot_a_x_com")
+
+
+# --------------------------------------------------------------------------- #
+# list_principals：主体抽取
+# --------------------------------------------------------------------------- #
+class TestPrincipalType:
+    def test_types(self):
+        assert core.principal_type("alice@x.com") == "user"
+        assert core.principal_type("etl@p.iam.gserviceaccount.com") == "serviceAccount"
+        assert core.principal_type("123-compute@developer.gserviceaccount.com") == "serviceAccount"
+        assert core.principal_type("service-123@gcp-sa-bigquerydatatransfer.iam.gserviceaccount.com") \
+            == "serviceAgent"
+        assert core.principal_type("123@cloudservices.gserviceaccount.com") == "serviceAgent"
+
+
+class TestSaHomeProject:
+    def test_variants(self):
+        assert core.sa_home_project("etl@prod-proj.iam.gserviceaccount.com") == "prod-proj"
+        assert core.sa_home_project("prod-proj@appspot.gserviceaccount.com") == "prod-proj"
+        assert core.sa_home_project("123-compute@developer.gserviceaccount.com") == "123"
+        assert core.sa_home_project("alice@x.com") == ""
+
+
+class TestIamMembers:
+    def test_splits_users_sas_and_groups(self):
+        principals, groups = core.split_iam_members([
+            "user:Alice@x.com", "serviceAccount:etl@p.iam.gserviceaccount.com",
+            "group:G@x.com", "domain:x.com", "allUsers", "allAuthenticatedUsers",
+            "deleted:user:old@x.com?uid=1", "projectOwner:p", "principal://iam.googleapis.com/x"])
+        assert principals == {"alice@x.com", "etl@p.iam.gserviceaccount.com"}
+        assert groups == {"g@x.com"}
+
+
+class TestBindingMembers:
+    """IAM 策略 bindings -> 账号；只取能读表数据（含 bigquery.tables.getData）的角色。"""
+    OK = {"roles/viewer", "roles/bigquery.dataViewer", "roles/bigquery.dataEditor", "roles/bigquery.dataOwner"}
+
+    def role_ok(self, role):
+        return role in self.OK
+
+    def test_filter_by_role_and_member_types(self):
+        bindings = [
+            {"role": "roles/viewer", "members": ["user:A@x.com", "deleted:user:gone@x.com?uid=1", "domain:x.com"]},
+            {"role": "roles/bigquery.dataViewer", "members": ["serviceAccount:s@p.iam.gserviceaccount.com", "group:G@x.com",
+                                                              "allUsers", "principalSet://iam.googleapis.com/x"]},
+            {"role": "roles/storage.admin", "members": ["user:gcs@x.com"]},
+            {"role": "roles/bigquery.dataViewer", "members": ["user:cond@x.com"],
+             "condition": {"expression": "request.time < timestamp('2030-01-01T00:00:00Z')"}},
+        ]
+        principals, groups = core.binding_members(bindings, self.role_ok)
+        assert principals == {"a@x.com", "s@p.iam.gserviceaccount.com", "cond@x.com"}
+        assert groups == {"g@x.com"}
+
+    def test_missing_role_ignored(self):
+        assert core.binding_members([{"members": ["user:a@x.com"]}], self.role_ok) == (set(), set())
+
+
+class TestDatasetAcl:
+    def role_ok(self, role):
+        return role in TestBindingMembers.OK
+
+    def test_entries_with_roles(self):
+        entries = [
+            ("READER", "userByEmail", "Alice@x.com"),
+            ("WRITER", "userByEmail", "etl@p.iam.gserviceaccount.com"),
+            ("OWNER", "groupByEmail", "G@x.com"),
+            ("roles/bigquery.dataViewer", "iamMember", "user:bob@x.com"),
+            ("roles/bigquery.dataViewer", "iamMember", "serviceAccount:s2@p.iam.gserviceaccount.com"),
+            ("roles/bigquery.dataViewer", "iamMember", "group:g2@x.com"),
+            ("roles/bigquery.metadataViewer", "userByEmail", "meta@x.com"),          # 读不到数据
+            ("READER", "specialGroup", "projectReaders"),
+            ("READER", "domain", "x.com"),
+            (None, "view", {"projectId": "p", "datasetId": "d", "tableId": "v"}),
+            (None, "routine", {"projectId": "p", "datasetId": "d", "routineId": "r"}),
+            (None, "dataset", {"dataset": {"projectId": "p", "datasetId": "d2"}}),
+        ]
+        principals, groups = core.acl_members(entries, self.role_ok)
+        assert principals == {"alice@x.com", "etl@p.iam.gserviceaccount.com", "bob@x.com",
+                              "s2@p.iam.gserviceaccount.com"}
+        assert groups == {"g@x.com", "g2@x.com"}
+
+    def test_legacy_roles_mapped(self):
+        assert core.dataset_role_name("READER") == "roles/bigquery.dataViewer"
+        assert core.dataset_role_name("WRITER") == "roles/bigquery.dataEditor"
+        assert core.dataset_role_name("OWNER") == "roles/bigquery.dataOwner"
+        assert core.dataset_role_name("roles/x") == "roles/x"
+
+
+class TestExpandGroup:
+    def test_recursive_and_unresolved(self):
+        data = {"root@x.com": [("a@x.com", "USER"), ("sub@x.com", "GROUP")],
+                "sub@x.com": [("s@p.iam.gserviceaccount.com", "SERVICE_ACCOUNT"),
+                              ("ext@other.com", "GROUP")],
+                "ext@other.com": None}
+        members, unresolved = core.expand_group("root@x.com", data.get)
+        assert set(members) == {"a@x.com", "sub@x.com", "s@p.iam.gserviceaccount.com", "ext@other.com"}
+        assert members["s@p.iam.gserviceaccount.com"]["via"] == ["root@x.com", "sub@x.com"]
+        assert unresolved == [("ext@other.com", ["root@x.com", "sub@x.com"])]
+
+    def test_cycle_safe(self):
+        data = {"a@x.com": [("b@x.com", "GROUP")], "b@x.com": [("a@x.com", "GROUP")]}
+        members, unresolved = core.expand_group("a@x.com", data.get)
+        assert set(members) == {"a@x.com", "b@x.com"} and unresolved == []
+
+
+class TestPrincipalRows:
+    def test_columns_types_and_sorting(self):
+        rows = core.build_principal_rows(
+            {"zed@x.com", "ETL@prod.iam.gserviceaccount.com",
+             "service-1@gcp-sa-bigquery.iam.gserviceaccount.com"})
+        assert [r["email"] for r in rows] == [
+            "etl@prod.iam.gserviceaccount.com",
+            "service-1@gcp-sa-bigquery.iam.gserviceaccount.com", "zed@x.com"]
+        assert list(rows[0]) == core.PRINCIPAL_COLUMNS
+        assert rows[0] == {"email": "etl@prod.iam.gserviceaccount.com", "principal_type": "serviceAccount",
+                           "home_project": "prod"}
+        assert rows[1] == {"email": "service-1@gcp-sa-bigquery.iam.gserviceaccount.com",
+                           "principal_type": "serviceAgent", "home_project": ""}
+        assert rows[2] == {"email": "zed@x.com", "principal_type": "user", "home_project": ""}
+
+    def test_agents_not_excluded(self):
+        rows = core.build_principal_rows({"d@p.iam.gserviceaccount.com", "service-9@gcp-sa-x.iam.gserviceaccount.com"})
+        assert len(rows) == 2
+
+    def test_exclude_members_and_patterns(self):
+        rows = core.build_principal_rows(
+            {"copilot-api@p.iam.gserviceaccount.com", "copilot-u1@p.iam.gserviceaccount.com",
+             "keep@x.com"},
+            exclude_members=["Copilot-API@p.iam.gserviceaccount.com"],
+            exclude_patterns=["copilot-u*@*"])
+        assert [r["email"] for r in rows] == ["keep@x.com"]
+
+
+class TestPrincipalColumns:
+    def test_three_columns(self):
+        assert core.PRINCIPAL_COLUMNS == ["email", "principal_type", "home_project"]   # 不再输出 display_name / disabled
+
+
+# --------------------------------------------------------------------------- #
+# DDL 生成
+# --------------------------------------------------------------------------- #
+class TestPolicyDdl:
+    def test_basic(self):
+        ddl = core.build_policy_ddl("p.d.t", "pol", ["group:g@x.com"], "TRUE")
+        assert ddl == ("CREATE OR REPLACE ROW ACCESS POLICY `pol`\nON `p.d.t`\n"
+                       'GRANT TO ("group:g@x.com")\nFILTER USING (TRUE)')
+
+    def test_rejects_bad_policy_name(self):
         with pytest.raises(ValueError):
-            core.build_copilot_filter([("x", "city")], COND)
+            core.build_policy_ddl("p.d.t", "bad-name", ["group:g@x.com"], "TRUE")
 
-    def test_rejects_bad_column_name(self):
+    def test_rejects_name_starting_with_digit(self):
         with pytest.raises(ValueError):
-            core.build_copilot_filter([("a b", "region")], COND)
+            core.build_policy_ddl("p.d.t", "1abc", ["group:g@x.com"], "TRUE")
 
-    def test_rejects_empty_mapping(self):
+    def test_rejects_injected_grantee(self):
+        with pytest.raises(ValueError):
+            core.build_policy_ddl("p.d.t", "pol", ['group:g@x.com") FILTER USING (TRUE); --'], "TRUE")
+
+    def test_rejects_empty_grantees(self):
+        with pytest.raises(ValueError):
+            core.build_policy_ddl("p.d.t", "pol", [], "TRUE")
+
+
+class TestConditionDimensions:
+    def test_dimensions_are_columns_except_id_and_sa(self):
+        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
+                  ("region", "STRING", "REPEATED"), ("prdtype", "STRING", "REPEATED"),
+                  ("refername", "STRING", "REPEATED")]
+        dims, warns = core.condition_dimensions(fields)
+        assert dims == ["region", "prdtype", "refername"] and warns == []
+
+    def test_new_dimension_picked_up_automatically(self):
+        fields = [("id", "STRING", "NULLABLE"), ("SA", "STRING", "NULLABLE"),
+                  ("region", "STRING", "REPEATED"), ("channel", "STRING", "REPEATED")]
+        dims, _ = core.condition_dimensions(fields)
+        assert dims == ["region", "channel"]
+
+    def test_non_repeated_string_column_excluded_with_warning(self):
+        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
+                  ("region", "STRING", "REPEATED"), ("updated_at", "TIMESTAMP", "NULLABLE")]
+        dims, warns = core.condition_dimensions(fields)
+        assert dims == ["region"] and len(warns) == 1 and "updated_at" in warns[0]
+
+    def test_requires_sa_column(self):
+        with pytest.raises(ValueError, match="sa"):
+            core.condition_dimensions([("id", "STRING", "NULLABLE"), ("region", "STRING", "REPEATED")])
+
+
+class TestSelectCopilotTables:
+    DIMS = ["region", "prdtype", "refername"]
+
+    def test_selects_by_to_name_only(self):
+        rows = [{"table_name": "p.dw.t1", "col_name": "region", "to_name": "region"},
+                {"table_name": "p.dw.t2", "col_name": "market", "to_name": "region"},
+                {"table_name": "p.dw.t2", "col_name": "prd_type", "to_name": "PRDTYPE"}]
+        mapping, ignored = core.select_copilot_tables(rows, self.DIMS)
+        assert mapping == {"p.dw.t1": [("region", "region")],
+                           "p.dw.t2": [("market", "region"), ("prd_type", "prdtype")]}
+        assert ignored == []
+
+    def test_invalid_to_name_row_ignored_but_table_kept(self):
+        rows = [{"table_name": "p.dw.t1", "col_name": "region", "to_name": "region"},
+                {"table_name": "p.dw.t1", "col_name": "x", "to_name": "regoin"}]
+        mapping, ignored = core.select_copilot_tables(rows, self.DIMS)
+        assert mapping == {"p.dw.t1": [("region", "region")]}
+        assert len(ignored) == 1 and "regoin" in ignored[0]
+
+    def test_table_with_only_invalid_rows_ignored(self):
+        rows = [{"table_name": "p.dw.t3", "col_name": "x", "to_name": "foo"}]
+        mapping, ignored = core.select_copilot_tables(rows, self.DIMS)
+        assert mapping == {} and len(ignored) == 1
+
+    def test_dataset_table_uses_default_project(self):
+        rows = [{"table_name": "dw.t1", "col_name": "region", "to_name": "region"}]
+        mapping, _ = core.select_copilot_tables(rows, self.DIMS, default_project="p")
+        assert list(mapping) == ["p.dw.t1"]
+
+    def test_duplicate_rows_deduplicated(self):
+        rows = [{"table_name": "p.dw.t1", "col_name": "region", "to_name": "region"}] * 2
+        mapping, _ = core.select_copilot_tables(rows, self.DIMS)
+        assert mapping == {"p.dw.t1": [("region", "region")]}
+
+    def test_bad_column_name_reported(self):
+        rows = [{"table_name": "p.dw.t1", "col_name": "region; DROP", "to_name": "region"}]
+        mapping, ignored = core.select_copilot_tables(rows, self.DIMS)
+        assert mapping == {} and len(ignored) == 1
+
+
+class TestCopilotFilter:
+    def test_single_dimension_with_different_column_name(self):
+        flt = core.build_copilot_filter([("market", "region")], COND)
+        assert flt == (
+            f"(`market` IN (SELECT v FROM `{COND}` AS c, UNNEST(c.region) AS v "
+            f"WHERE c.sa = SESSION_USER()) OR EXISTS (SELECT 1 FROM `{COND}` AS c "
+            f"WHERE c.sa = SESSION_USER() AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0)))")
+
+    def test_multiple_dimensions_and(self):
+        flt = core.build_copilot_filter([("region", "region"), ("prd_type", "prdtype")], COND)
+        assert flt.count(")) AND (") == 1 and ")) AND (`prd_type` IN" in flt
+        assert flt.startswith("(`region` IN") and "UNNEST(c.prdtype)" in flt
+
+    def test_new_dimension_allowed(self):
+        flt = core.build_copilot_filter([("ch", "channel")], COND)
+        assert "UNNEST(c.channel)" in flt
+
+    def test_non_string_column_cast(self):
+        flt = core.build_copilot_filter([("region_id", "region")], COND, column_types={"region_id": "INT64"})
+        assert "CAST(`region_id` AS STRING) IN" in flt
+
+    def test_nested_column(self):
+        flt = core.build_copilot_filter([("meta.ref", "refername")], COND)
+        assert "`meta`.`ref` IN" in flt
+
+    def test_rejects_bad_dimension_identifier(self):
+        with pytest.raises(ValueError):
+            core.build_copilot_filter([("region", "region) OR TRUE --")], COND)
+
+    def test_rejects_empty(self):
         with pytest.raises(ValueError):
             core.build_copilot_filter([], COND)
 
-    def test_policy_ddl(self):
-        ddl = core.build_copilot_policy_ddl(
-            "p.d.t", [("region", "region")], COND, ["group:hi@x.com", "group:lo@x.com"])
-        assert ddl.startswith(
-            "CREATE OR REPLACE ROW ACCESS POLICY `rls_copilot_subquery_policy`\n"
-            "ON `p.d.t`\n"
-            'GRANT TO ("group:hi@x.com", "group:lo@x.com")\n'
-            "FILTER USING (")
-        assert ddl.endswith(")")
 
+class TestSchemaValidation:
+    class F:
+        def __init__(self, name, field_type, mode="NULLABLE", fields=()):
+            self.name, self.field_type, self.mode, self.fields = name, field_type, mode, list(fields)
 
-class TestHeterogeneousTables:
-    """多张表、每张表过滤字段的列名/类型/层级都不同。"""
+    def schema(self):
+        F = self.F
+        return core.flatten_schema([
+            F("region", "STRING"), F("region_id", "INTEGER"), F("tags", "STRING", "REPEATED"),
+            F("meta", "RECORD", fields=[F("ref", "STRING")]), F("amount", "FLOAT")])
 
-    def test_bigquery_reformatted_predicate_equals_generated(self):
-        cond = "my-proj.rls_it.adm_user_mem_copilot_condition"
-        generated = core.build_copilot_filter([("region", "region")], cond)
-        # BigQuery rowAccessPolicies.list 实际返回的 filterPredicate（去反引号、重新排版）
-        stored = ("(region IN (\n  SELECT\n    v\n  FROM\n    `" + cond + "` AS c,\n"
-                  "    UNNEST(c.region) AS v\n  WHERE\n    c.sa = SESSION_USER()\n) OR EXISTS(\n"
-                  "  SELECT\n    1\n  FROM\n    `" + cond + "` AS c\n  WHERE\n"
-                  "    c.sa = SESSION_USER() AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0)\n))")
-        assert core.normalize_filter(stored) == core.normalize_filter(generated)
+    def test_ok(self):
+        assert core.validate_mapping_against_schema([("region", "region"), ("meta.ref", "refername"),
+                                                     ("region_id", "region")], self.schema()) == []
 
-    def test_normalize_filter_still_detects_real_change(self):
-        assert core.normalize_filter("region = 'HK'") != core.normalize_filter("region = 'SG'")
-        assert core.normalize_filter("a IN (1)") != core.normalize_filter("b IN (1)")
-
-    def test_same_dimension_different_column_names_per_table(self):
-        rows = [
-            {"table_name": "p.d.a", "col_name": "region", "to_name": "region"},
-            {"table_name": "p.d.b", "col_name": "area", "to_name": "region"},
-            {"table_name": "p.d.b", "col_name": "ptype", "to_name": "prdtype"},
-        ]
-        m = core.parse_mapping_rows(rows)
-        fa = core.build_copilot_filter(m["p.d.a"], COND)
-        fb = core.build_copilot_filter(m["p.d.b"], COND)
-        assert "`region` IN" in fa and "prdtype" not in fa
-        assert "`area` IN" in fb and "`ptype` IN" in fb and "`region` IN" not in fb
-
-    def test_non_string_column_is_cast(self):
-        f = core.build_copilot_filter([("prd_code", "prdtype")], COND,
-                                      column_types={"prd_code": "INT64"})
-        assert f.startswith("(CAST(`prd_code` AS STRING) IN (SELECT v FROM")
-
-    def test_string_column_not_cast(self):
-        f = core.build_copilot_filter([("area", "region")], COND, column_types={"area": "STRING"})
-        assert f.startswith("(`area` IN")
-
-    def test_nested_column_path(self):
-        f = core.build_copilot_filter([("meta.ref", "refername")], COND)
-        assert f.startswith("(`meta`.`ref` IN")
-
-    def test_nested_column_rejects_bad_part(self):
-        with pytest.raises(ValueError):
-            core.build_copilot_filter([("meta.re f", "refername")], COND)
-
-    def test_schema_validation_ok(self):
-        schema = {"area": ("STRING", "NULLABLE"), "meta": ("RECORD", "NULLABLE"),
-                  "meta.ref": ("STRING", "NULLABLE"), "n": ("INT64", "NULLABLE")}
-        assert core.validate_mapping_against_schema(
-            [("area", "region"), ("meta.ref", "refername"), ("n", "prdtype")], schema) == []
-
-    def test_schema_validation_missing_column(self):
-        errs = core.validate_mapping_against_schema([("nope", "region")], {"area": ("STRING", "NULLABLE")})
-        assert len(errs) == 1 and "nope" in errs[0] and "不存在" in errs[0]
-
-    def test_schema_validation_rejects_repeated_and_record(self):
-        schema = {"tags": ("STRING", "REPEATED"), "meta": ("RECORD", "NULLABLE")}
-        errs = core.validate_mapping_against_schema([("tags", "region"), ("meta", "prdtype")], schema)
-        assert len(errs) == 2
-
-    def test_schema_validation_rejects_unsupported_type(self):
+    def test_errors(self):
         errs = core.validate_mapping_against_schema(
-            [("g", "region")], {"g": ("GEOGRAPHY", "NULLABLE")})
-        assert len(errs) == 1 and "GEOGRAPHY" in errs[0]
-
-    def test_flatten_schema(self):
-        class F:  # 模拟 bigquery.SchemaField
-            def __init__(self, name, field_type, mode="NULLABLE", fields=()):
-                self.name, self.field_type, self.mode, self.fields = name, field_type, mode, fields
-        flat = core.flatten_schema([F("a", "STRING"), F("m", "RECORD", fields=[F("x", "INTEGER")])])
-        assert flat == {"a": ("STRING", "NULLABLE"), "m": ("RECORD", "NULLABLE"),
-                        "m.x": ("INT64", "NULLABLE")}
+            [("nope", "region"), ("tags", "region"), ("meta", "region"), ("amount", "region")], self.schema())
+        assert len(errs) == 4
 
 
-class TestParseMappingRows:
-    def test_groups_by_table_and_normalizes(self):
-        rows = [
-            {"table_name": "p.d.t1", "col_name": "region", "to_name": "REGION"},
-            {"table_name": "p.d.t1", "col_name": "prd_type", "to_name": "prdtype"},
-            {"table_name": "d.t2", "col_name": "refername", "to_name": "refername"},
-        ]
-        m = core.parse_mapping_rows(rows, default_project="p")
-        assert m == {
-            "p.d.t1": [("region", "region"), ("prd_type", "prdtype")],
-            "p.d.t2": [("refername", "refername")],
-        }
+class TestNormalizeFilter:
+    def test_bigquery_reformatting_equal(self):
+        a = core.build_copilot_filter([("region", "region")], COND)
+        b = a.replace("`", "").replace("EXISTS (", "EXISTS(").replace(" AS c", "  AS  c\n")
+        assert core.normalize_filter(a) == core.normalize_filter(b)
 
-    def test_dedupes(self):
-        rows = [{"table_name": "p.d.t", "col_name": "region", "to_name": "region"}] * 2
-        assert core.parse_mapping_rows(rows) == {"p.d.t": [("region", "region")]}
+    def test_literals_case_sensitive(self):
+        assert core.normalize_filter("x = 'HK'") != core.normalize_filter("x = 'hk'")
 
-    def test_invalid_dimension_raises(self):
-        with pytest.raises(ValueError):
-            core.parse_mapping_rows([{"table_name": "p.d.t", "col_name": "c", "to_name": "x"}])
+    def test_true(self):
+        assert core.normalize_filter("true") == "TRUE"
+
+
+# --------------------------------------------------------------------------- #
+# 计划：CREATE / NOOP / REPLACE / COLLISION
+# --------------------------------------------------------------------------- #
+class TestPlanUpsert:
+    G = "group:g@x.com"
+
+    def test_create(self):
+        pl = core.plan_upsert([], "pol", "TRUE", [self.G])
+        assert pl.action == "create" and pl.first_policy
+
+    def test_create_not_first_when_other_policies_exist(self):
+        pl = core.plan_upsert([{"id": "other", "filter": "TRUE", "grantees": ["group:o@x.com"]}],
+                              "pol", "TRUE", [self.G])
+        assert pl.action == "create" and not pl.first_policy
+
+    def test_noop_when_same(self):
+        pl = core.plan_upsert([{"id": "pol", "filter": "true", "grantees": ["group:G@x.com"]}],
+                              "pol", "TRUE", [self.G])
+        assert pl.action == "noop"
+
+    def test_replace_when_filter_differs_keeps_old(self):
+        old = {"id": "pol", "filter": "region = 'HK'", "grantees": [self.G]}
+        pl = core.plan_upsert([old], "pol", "TRUE", [self.G])
+        assert pl.action == "replace" and pl.old == old
+
+    def test_replace_when_grantees_differ(self):
+        pl = core.plan_upsert([{"id": "pol", "filter": "TRUE", "grantees": [self.G, "user:x@x.com"]}],
+                              "pol", "TRUE", [self.G])
+        assert pl.action == "replace"
+
+    def test_collision_when_same_name_belongs_to_other_principal(self):
+        pl = core.plan_upsert([{"id": "pol", "filter": "TRUE", "grantees": ["user:a_b@x.com"]}],
+                              "pol", "TRUE", ["user:a.b@x.com"], check_collision=True)
+        assert pl.action == "collision" and "a_b@x.com" in pl.reason
+
+    def test_no_collision_check_means_replace(self):
+        pl = core.plan_upsert([{"id": "pol", "filter": "TRUE", "grantees": ["user:a_b@x.com"]}],
+                              "pol", "TRUE", ["user:a.b@x.com"])
+        assert pl.action == "replace"
+
+
+class TestPolicyLimit:
+    def test_remaining_slots(self):
+        assert core.remaining_policy_slots(398) == 2
+        assert core.remaining_policy_slots(400) == 0
+        assert core.remaining_policy_slots(450) == 0
 
 
 # --------------------------------------------------------------------------- #
 # 回退计划
 # --------------------------------------------------------------------------- #
-G = "group:g@x.com"
-U = "user:u@x.com"
-
-
-def pol(pid, grantees, flt="TRUE"):
-    return {"id": pid, "filter": flt, "grantees": grantees}
+P_BYP_R = {"id": "rls_bypass_full_access_r_x_com", "filter": "TRUE", "grantees": ["group:r@x.com"]}
+P_BYP_W = {"id": "rls_bypass_full_access_w_x_com", "filter": "TRUE", "grantees": ["group:w@x.com"]}
+P_COP_A = {"id": "rls_copilot_a_x_com", "filter": "f", "grantees": ["user:a@x.com"]}
+P_COP_S = {"id": "rls_copilot_s_p_iam_gserviceaccount_com", "filter": "f",
+           "grantees": ["serviceAccount:s@p.iam.gserviceaccount.com"]}
+ALL = [P_BYP_R, P_BYP_W, P_COP_A, P_COP_S]
 
 
 class TestPlanRollback:
-    def test_no_members_drops_all(self):
-        plan = core.plan_rollback([pol("a", [G]), pol("b", [U])], members=set())
-        assert plan.drop_all and [p["id"] for p in plan.to_drop] == ["a", "b"]
-
-    def test_drops_only_related(self):
-        plan = core.plan_rollback([pol("a", [G]), pol("b", [U])], members={G})
+    def test_by_principal_matches_any_type(self):
+        plan = core.plan_rollback(ALL, principals={"R@x.com", "s@p.iam.gserviceaccount.com"})
+        assert [p["id"] for p in plan.to_drop] == [P_BYP_R["id"], P_COP_S["id"]]
         assert not plan.drop_all
-        assert [p["id"] for p in plan.to_drop] == ["a"]
 
-    def test_shared_policy_dropped_by_default(self):
-        plan = core.plan_rollback([pol("a", [G, U]), pol("b", [U])], members={G})
-        assert [p["id"] for p in plan.to_drop] == ["a"] and plan.to_update == []
+    def test_user_principal_only_removes_own_rule(self):
+        plan = core.plan_rollback(ALL, principals={"a@x.com"})
+        assert [p["id"] for p in plan.to_drop] == [P_COP_A["id"]]
 
-    def test_strip_only_updates_shared(self):
-        plan = core.plan_rollback([pol("a", [G, U]), pol("b", [U])], members={G}, strip_only=True)
-        assert plan.to_drop == []
-        assert plan.to_update == [(pol("a", [G, U]), [U])]
+    def test_by_policy_name(self):
+        plan = core.plan_rollback(ALL, policy_names={P_COP_A["id"]})
+        assert [p["id"] for p in plan.to_drop] == [P_COP_A["id"]]
 
-    def test_last_policy_uses_drop_all(self):
-        plan = core.plan_rollback([pol("a", [G])], members={G})
+    def test_intersection(self):
+        plan = core.plan_rollback(ALL, principals={"a@x.com", "r@x.com"}, policy_names={P_BYP_R["id"]})
+        assert [p["id"] for p in plan.to_drop] == [P_BYP_R["id"]]
+
+    def test_all_policies(self):
+        plan = core.plan_rollback(ALL)
+        assert len(plan.to_drop) == 4 and plan.drop_all
+
+    def test_drop_all_when_selection_covers_every_policy(self):
+        plan = core.plan_rollback([P_COP_A], principals={"a@x.com"})
         assert plan.drop_all
 
-    def test_policy_name_filter(self):
-        plan = core.plan_rollback(
-            [pol("rls_bypass_full_access", [G]), pol("rls_copilot_subquery_policy", [U])],
-            members=set(), policy_names={"rls_copilot_subquery_policy"})
-        assert not plan.drop_all
-        assert [p["id"] for p in plan.to_drop] == ["rls_copilot_subquery_policy"]
-
-    def test_member_matching_is_case_insensitive(self):
-        plan = core.plan_rollback([pol("a", ["group:G@X.com"]), pol("b", [U])], members={G})
-        assert [p["id"] for p in plan.to_drop] == ["a"]
+    def test_no_match(self):
+        plan = core.plan_rollback(ALL, principals={"nobody@x.com"})
+        assert plan.to_drop == [] and not plan.drop_all
 
 
 # --------------------------------------------------------------------------- #
-# 巡检
-# --------------------------------------------------------------------------- #
-class TestInspect:
-    BYPASS = ["group:w@x.com", "group:r@x.com"]
-    COP = ["group:hi@x.com"]
-
-    def _ok_policies(self, flt="X = 1"):
-        return [pol("rls_bypass_full_access", self.BYPASS),
-                pol("rls_copilot_subquery_policy", self.COP, flt)]
-
-    def test_all_good(self):
-        assert core.inspect_policies(self._ok_policies(), self.BYPASS, self.COP, "X = 1") == []
-
-    def test_missing_bypass(self):
-        issues = core.inspect_policies(
-            [pol("rls_copilot_subquery_policy", self.COP, "X = 1")], self.BYPASS, self.COP, "X = 1")
-        assert any("rls_bypass_full_access" in i and "缺失" in i for i in issues)
-
-    def test_bypass_missing_group(self):
-        ps = self._ok_policies()
-        ps[0]["grantees"] = ["group:w@x.com"]
-        issues = core.inspect_policies(ps, self.BYPASS, self.COP, "X = 1")
-        assert any("group:r@x.com" in i for i in issues)
-
-    def test_bypass_not_true(self):
-        ps = self._ok_policies()
-        ps[0]["filter"] = "region = 'HK'"
-        assert any("TRUE" in i for i in core.inspect_policies(ps, self.BYPASS, self.COP, "X = 1"))
-
-    def test_filter_drift_detected_ignoring_whitespace(self):
-        assert core.inspect_policies(self._ok_policies("X  =\n1"), self.BYPASS, self.COP, "X = 1") == []
-        issues = core.inspect_policies(self._ok_policies("X = 2"), self.BYPASS, self.COP, "X = 1")
-        assert any("过滤条件" in i for i in issues)
-
-    def test_missing_copilot_policy(self):
-        issues = core.inspect_policies(self._ok_policies()[:1], self.BYPASS, self.COP, "X = 1")
-        assert any("rls_copilot_subquery_policy" in i and "缺失" in i for i in issues)
-
-    def test_copilot_member_in_whitelist_group(self):
-        issues = core.inspect_whitelist_membership(
-            {"group:w@x.com": ["serviceAccount:copilot-u-1@p.iam.gserviceaccount.com",
-                               "serviceAccount:etl@p.iam.gserviceaccount.com"]},
-            copilot_patterns=["copilot-*@*"])
-        assert len(issues) == 1 and "copilot-u-1" in issues[0]
-
-
-# --------------------------------------------------------------------------- #
-# 其他
-# --------------------------------------------------------------------------- #
-class TestServiceAgent:
-    def test_google_managed_service_agents(self):
-        for m in ["serviceAccount:service-123@gcp-sa-pubsub.iam.gserviceaccount.com",
-                  "serviceAccount:service-123@container-engine-robot.iam.gserviceaccount.com",
-                  "serviceAccount:123@cloudservices.gserviceaccount.com",
-                  "serviceAccount:bqcx-123-7kfg@gcp-sa-bigquery-condel.iam.gserviceaccount.com",
-                  "serviceAccount:123@cloudbuild.gserviceaccount.com"]:
-            assert core.is_service_agent(m), m
-
-    def test_regular_sa_is_not_agent(self):
-        assert not core.is_service_agent("serviceAccount:etl@p.iam.gserviceaccount.com")
-        assert not core.is_service_agent("serviceAccount:123-compute@developer.gserviceaccount.com")
-        assert not core.is_service_agent("user:a@x.com")
-
-
-class TestImpersonationRisk:
-    PERMS = {
-        "roles/iam.serviceAccountTokenCreator": ["iam.serviceAccounts.getAccessToken"],
-        "roles/owner": ["resourcemanager.projects.get"],
-        "roles/custom": ["iam.serviceAccounts.implicitDelegation"],
-    }
-
-    def test_finds_project_level_impersonators_except_allowed(self):
-        bindings = [
-            {"role": "roles/iam.serviceAccountTokenCreator",
-             "members": ["user:admin@x.com", "serviceAccount:api@p.iam.gserviceaccount.com"]},
-            {"role": "roles/owner", "members": ["user:owner@x.com"]},
-            {"role": "roles/custom", "members": ["group:ops@x.com"]},
-        ]
-        risks = core.impersonation_risks(bindings, self.PERMS.get,
-                                         allowed=["api@p.iam.gserviceaccount.com"])
-        assert risks == [("group:ops@x.com", "roles/custom"),
-                         ("user:admin@x.com", "roles/iam.serviceAccountTokenCreator")]
-
-    def test_no_risk(self):
-        assert core.impersonation_risks([{"role": "roles/owner", "members": ["user:o@x.com"]}],
-                                        self.PERMS.get) == []
-
-
-class TestProjectSaWhitelistRows:
-    def _sa(self, email, project="p", disabled=False, source="project-sa"):
-        return {"email": email, "project": project, "display_name": "", "disabled": disabled,
-                "source": source}
-
-    def test_all_sas_suggested_to_target_group(self):
-        rows = core.build_sa_whitelist_rows(
-            [self._sa("etl@p.iam.gserviceaccount.com"), self._sa("bi@p.iam.gserviceaccount.com")],
-            group="write")
-        assert [(r["principal"], r["suggested_group"]) for r in rows] == [
-            ("serviceAccount:bi@p.iam.gserviceaccount.com", "write"),
-            ("serviceAccount:etl@p.iam.gserviceaccount.com", "write")]
-
-    def test_copilot_sas_excluded(self):
-        rows = core.build_sa_whitelist_rows(
-            [self._sa("copilot-u-1@p.iam.gserviceaccount.com"), self._sa("api@p.iam.gserviceaccount.com"),
-             self._sa("etl@p.iam.gserviceaccount.com")],
-            group="read", copilot_members=["api@p.iam.gserviceaccount.com"],
-            copilot_patterns=["copilot-*@*"])
-        by = {r["principal"]: r for r in rows}
-        assert by["serviceAccount:copilot-u-1@p.iam.gserviceaccount.com"]["suggested_group"] == ""
-        assert by["serviceAccount:copilot-u-1@p.iam.gserviceaccount.com"]["copilot"] is True
-        assert by["serviceAccount:api@p.iam.gserviceaccount.com"]["suggested_group"] == ""
-        assert by["serviceAccount:etl@p.iam.gserviceaccount.com"]["suggested_group"] == "read"
-
-    def test_disabled_excluded_by_default(self):
-        rows = core.build_sa_whitelist_rows([self._sa("old@p.iam.gserviceaccount.com", disabled=True)],
-                                            group="write")
-        assert rows[0]["suggested_group"] == "" and "已禁用" in rows[0]["note"]
-        rows = core.build_sa_whitelist_rows([self._sa("old@p.iam.gserviceaccount.com", disabled=True)],
-                                            group="write", include_disabled=True)
-        assert rows[0]["suggested_group"] == "write"
-
-    def test_dedupes_and_merges_sources(self):
-        rows = core.build_sa_whitelist_rows(
-            [self._sa("x@q.iam.gserviceaccount.com", project="q"),
-             self._sa("x@q.iam.gserviceaccount.com", project="p", source="iam-binding")],
-            group="write")
-        assert len(rows) == 1
-        assert rows[0]["sources"] == "q:project-sa; p:iam-binding"
-
-    def test_service_agent_noted(self):
-        rows = core.build_sa_whitelist_rows(
-            [self._sa("service-1@gcp-sa-pubsub.iam.gserviceaccount.com", source="iam-binding")],
-            group="write")
-        assert "服务代理" in rows[0]["note"] and rows[0]["suggested_group"] == "write"
-
-    def test_rejects_bad_group(self):
-        with pytest.raises(ValueError):
-            core.build_sa_whitelist_rows([], group="admin")
-
-
-class TestQuota:
-    def test_within_quota(self):
-        core.check_sa_quota(existing=10, to_create=5)
-
-    def test_exceeds_quota(self):
-        with pytest.raises(ValueError, match="100"):
-            core.check_sa_quota(existing=98, to_create=5)
-
-
-# --------------------------------------------------------------------------- #
-# C1 挂载后验证：按分区要求生成探测 SQL
+# 挂载后验证 SQL
 # --------------------------------------------------------------------------- #
 class TestVisibilityProbeSql:
-    def test_plain_table_samples_one_row(self):
+    def test_sample(self):
         assert core.visibility_probe_sql("p.d.t", None) == "SELECT 1 FROM `p.d.t` LIMIT 1"
 
-    def test_partition_filter_not_required_no_where(self):
-        part = {"require_filter": False, "field": "dt", "kind": "time"}
-        assert core.visibility_probe_sql("p.d.t", part) == "SELECT 1 FROM `p.d.t` LIMIT 1"
+    def test_count(self):
+        assert core.visibility_probe_sql("p.d.t", None, mode="count") == "SELECT COUNT(*) AS n FROM `p.d.t`"
 
-    def test_column_time_partition_requires_filter(self):
-        part = {"require_filter": True, "field": "dt", "kind": "time"}
-        assert core.visibility_probe_sql("p.d.t", part) == \
-            "SELECT 1 FROM `p.d.t` WHERE `dt` IS NOT NULL LIMIT 1"
+    def test_partition_filter(self):
+        sql = core.visibility_probe_sql("p.d.t", {"require_filter": True, "field": "dt"})
+        assert "WHERE `dt` IS NOT NULL" in sql
 
-    def test_ingestion_time_partition_uses_pseudo_column(self):
-        part = {"require_filter": True, "field": None, "kind": "time"}
-        assert core.visibility_probe_sql("p.d.t", part) == \
-            "SELECT 1 FROM `p.d.t` WHERE _PARTITIONTIME IS NOT NULL LIMIT 1"
-
-    def test_range_partition(self):
-        part = {"require_filter": True, "field": "cust_id", "kind": "range"}
-        assert "WHERE `cust_id` IS NOT NULL" in core.visibility_probe_sql("p.d.t", part)
-
-    def test_count_mode(self):
-        part = {"require_filter": True, "field": "dt", "kind": "time"}
-        assert core.visibility_probe_sql("p.d.t", part, mode="count") == \
-            "SELECT COUNT(*) AS n FROM `p.d.t` WHERE `dt` IS NOT NULL"
+    def test_ingestion_time_partition(self):
+        sql = core.visibility_probe_sql("p.d.t", {"require_filter": True, "field": None})
+        assert "_PARTITIONTIME IS NOT NULL" in sql
 
 
 # --------------------------------------------------------------------------- #
-# C3 Reservation 版本前置检查
+# Copilot 审核 CSV
 # --------------------------------------------------------------------------- #
-class TestEditionCheck:
-    def test_standard_jobs_flagged(self):
-        rows = [{"edition": "STANDARD", "reservation_id": "a:US.std", "n": 12},
-                {"edition": "ENTERPRISE", "reservation_id": "a:US.ent", "n": 3},
-                {"edition": None, "reservation_id": None, "n": 5}]
-        assert core.standard_edition_usage(rows) == [("a:US.std", 12)]
-
-    def test_no_jobs_is_unknown(self):
-        assert core.standard_edition_usage([]) == []
-
-    def test_sql_targets_project_region(self):
-        sql = core.edition_usage_sql("p", "us", days=7)
-        assert "`p`.`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT" in sql
-        assert "edition" in sql and "INTERVAL 7 DAY" in sql
+class TestCopilotPlanCsvRows:
+    def test_columns(self):
+        assert core.COPILOT_PLAN_COLUMNS == ["table", "policy_name", "action", "dimensions", "filter", "note"]
+        assert core.COPILOT_PLAN_COLUMNS_APPLY == core.COPILOT_PLAN_COLUMNS + ["result"]
 
 
-# --------------------------------------------------------------------------- #
-# C2 跨项目 / 组织级作业历史
-# --------------------------------------------------------------------------- #
-class TestJobsSqlScope:
-    def test_project_view_default(self):
-        assert "INFORMATION_SCHEMA.JOBS_BY_PROJECT" in core.jobs_access_sql("p", "us", 30)
+class TestRegistry:
+    """apply_bypass_rls.py 的登记表（adm_user_mem_copilot_tb）判定。"""
 
-    def test_organization_view(self):
-        sql = core.jobs_access_sql("p", "us", 30, scope="organization")
-        assert "`p`.`region-us`.INFORMATION_SCHEMA.JOBS_BY_ORGANIZATION" in sql
-        assert "JOBS_BY_PROJECT" not in sql
+    def test_status_enabled_disabled_conflict(self):
+        rows = [{"table_name": "p.d.a", "rls_enabled": 1},
+                {"table_name": "p.d.b", "rls_enabled": 0},
+                {"table_name": "p.d.c", "rls_enabled": 1}, {"table_name": "p.d.c", "rls_enabled": 0},
+                {"table_name": "p.d.d", "rls_enabled": 1}, {"table_name": "p.d.d", "rls_enabled": 1},
+                {"table_name": "p.d.e", "rls_enabled": None}, {"table_name": "p.d.e", "rls_enabled": 2}]
+        st = core.registry_status(rows)
+        assert st == {"p.d.a": "enabled", "p.d.b": "disabled", "p.d.c": "conflict", "p.d.d": "enabled",
+                      "p.d.e": "disabled"}
 
-    def test_rejects_unknown_scope(self):
+    def test_names_compared_raw(self):
+        st = core.registry_status([{"table_name": " p.d.a", "rls_enabled": 1}, {"table_name": "P.d.a", "rls_enabled": 1}])
+        assert "p.d.a" not in st and st[" p.d.a"] == "enabled" and st["P.d.a"] == "enabled"
+
+    def test_bool_true_is_not_one(self):
+        assert core.registry_status([{"table_name": "p.d.a", "rls_enabled": True}])["p.d.a"] == "disabled"
+
+    def test_null_table_name_ignored(self):
+        assert core.registry_status([{"table_name": None, "rls_enabled": 1}]) == {}
+
+    @pytest.mark.parametrize("fields", [
+        [("table_name", "STRING", "REQUIRED"), ("rls_enabled", "INTEGER", "REQUIRED")],
+        [("table_name", "STRING", "NULLABLE"), ("rls_enabled", "INT64", "NULLABLE"), ("status", "INTEGER", "REQUIRED")],
+    ])
+    def test_validate_fields_ok(self, fields):
+        core.validate_registry_fields(fields)
+
+    @pytest.mark.parametrize("fields", [
+        [("rls_enabled", "INTEGER", "REQUIRED")],
+        [("table_name", "STRING", "REQUIRED")],
+        [("table_name", "STRING", "REQUIRED"), ("rls_enabled", "FLOAT", "REQUIRED")],
+        [("table_name", "BYTES", "REQUIRED"), ("rls_enabled", "INTEGER", "REQUIRED")],
+        [("table_name", "STRING", "REQUIRED"), ("rls_enabled", "INTEGER", "REPEATED")],
+    ])
+    def test_validate_fields_bad(self, fields):
         with pytest.raises(ValueError):
-            core.jobs_access_sql("p", "us", 30, scope="folder")
-
-
-# --------------------------------------------------------------------------- #
-# E1 大小写不敏感匹配
-# --------------------------------------------------------------------------- #
-class TestCaseInsensitiveFilter:
-    def test_upper_wraps_both_sides(self):
-        f = core.build_copilot_filter([("region", "region")], COND, case_insensitive=True)
-        assert f.startswith("(UPPER(`region`) IN (SELECT UPPER(v) FROM")
-        assert "UNNEST(c.region) AS v" in f
-
-    def test_upper_with_cast(self):
-        f = core.build_copilot_filter([("code", "prdtype")], COND, column_types={"code": "INT64"},
-                                      case_insensitive=True)
-        assert f.startswith("(UPPER(CAST(`code` AS STRING)) IN (SELECT UPPER(v)")
-
-    def test_default_is_case_sensitive(self):
-        assert "UPPER(" not in core.build_copilot_filter([("region", "region")], COND)
-
-
-# --------------------------------------------------------------------------- #
-# E2 巡检：Copilot SA 归属 / 条件行 / API SA / 条件表聚簇
-# --------------------------------------------------------------------------- #
-class TestInspectCopilotMembership:
-    HI, LO = "group:hi@x.com", "group:lo@x.com"
-    S1, S2, S3 = ("s1@p.iam.gserviceaccount.com", "s2@p.iam.gserviceaccount.com",
-                  "s3@p.iam.gserviceaccount.com")
-
-    def test_all_good(self):
-        issues, warns = core.inspect_copilot_membership(
-            {self.HI: {self.S1}, self.LO: {self.S2}}, condition_sas={self.S1, self.S2},
-            api_sa="api@p.iam.gserviceaccount.com")
-        assert issues == [] and warns == []
-
-    def test_sa_in_both_groups_is_issue(self):
-        issues, _ = core.inspect_copilot_membership(
-            {self.HI: {self.S1}, self.LO: {self.S1}}, condition_sas={self.S1})
-        assert any("同时" in i and self.S1 in i for i in issues)
-
-    def test_sa_without_condition_row_is_warning_only(self):
-        issues, warns = core.inspect_copilot_membership(
-            {self.HI: {self.S1, self.S3}}, condition_sas={self.S1})
-        assert issues == [] and any(self.S3 in w and "条件行" in w for w in warns)
-
-    def test_condition_row_without_group_is_warning(self):
-        _, warns = core.inspect_copilot_membership({self.HI: {self.S1}}, condition_sas={self.S1, self.S2})
-        assert any(self.S2 in w and "不在任何" in w for w in warns)
-
-    def test_api_sa_in_copilot_group_is_issue(self):
-        issues, _ = core.inspect_copilot_membership(
-            {self.HI: {self.S1, "api@p.iam.gserviceaccount.com"}}, condition_sas={self.S1},
-            api_sa="api@p.iam.gserviceaccount.com")
-        assert any("API SA" in i for i in issues)
-
-    def test_clustering_check(self):
-        assert core.inspect_condition_clustering(["sa"]) == []
-        assert core.inspect_condition_clustering(["sa", "status"]) == []
-        assert len(core.inspect_condition_clustering([])) == 1
-        assert len(core.inspect_condition_clustering(["status"])) == 1
-
-
-# --------------------------------------------------------------------------- #
-# E3 通配符表查询检测
-# --------------------------------------------------------------------------- #
-class TestWildcardSql:
-    def test_pattern_matches_wildcard_refs_in_target_datasets(self):
-        import re
-        pat = core.wildcard_pattern(["my-proj.dw", "my-proj.dw_2"])
-        assert re.search(pat, "SELECT * FROM `my-proj.dw.fact_*` WHERE 1=1")
-        assert re.search(pat, "select x from dw.events_2024*")
-        assert not re.search(pat, "SELECT * FROM `my-proj.dw.fact_orders`")
-        assert not re.search(pat, "SELECT * FROM `other.dw.fact_*`") or True  # 数据集同名的跨项目引用允许命中
-
-    def test_sql_uses_parameter(self):
-        sql = core.wildcard_jobs_sql("p", "us", 30)
-        assert "REGEXP_CONTAINS(query, @pattern)" in sql and "JOBS_BY_PROJECT" in sql
-
-
-class TestJobsSql:
-    def test_contains_referenced_and_destination_and_params(self):
-        sql = core.jobs_access_sql("p", "us", days=30)
-        assert "`p`.`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT" in sql
-        assert "UNNEST(referenced_tables)" in sql
-        assert "destination_table" in sql
-        assert "@tables" in sql
-        assert "INTERVAL 30 DAY" in sql
-
-    def test_rejects_bad_region(self):
-        with pytest.raises(ValueError):
-            core.jobs_access_sql("p", "us`; --", days=30)
-
-
-class TestAccountId:
-    def test_account_id_from_email(self):
-        assert core.sa_account_id("copilot-u-1@p.iam.gserviceaccount.com") == "copilot-u-1"
-        assert core.sa_account_id("copilot-u-1") == "copilot-u-1"
-
-    def test_sa_email(self):
-        assert core.sa_email("copilot-u-1", "p") == "copilot-u-1@p.iam.gserviceaccount.com"
-
-    def test_invalid_account_id(self):
-        with pytest.raises(ValueError):
-            core.sa_account_id("Bad_ID")
-
-
-# --------------------------------------------------------------------------- #
-# 8 张权限表：表名推导、bind/grant SQL、一 SA 一 Group、白名单名册
-# --------------------------------------------------------------------------- #
-class TestAuthTables:
-    def test_default_names_from_dataset(self):
-        assert core.auth_table("bind", dataset="auth-proj.auth") == \
-            "auth-proj.auth.adm_user_mem_copilot_user_bind"
-        assert core.auth_table("acl", dataset="auth-proj.auth") == \
-            "auth-proj.auth.adm_user_mem_copilot_acl_group_sa"
-
-    def test_explicit_table_wins(self):
-        assert core.auth_table("group", dataset="auth-proj.auth",
-                               override="p:d.my_groups") == "p.d.my_groups"
-
-    def test_requires_dataset_or_override(self):
-        with pytest.raises(ValueError):
-            core.auth_table("grant")
-        with pytest.raises(ValueError):
-            core.auth_table("grant", dataset="only-dataset")
-
-    def test_bind_sql_joins_condition_and_group(self):
-        sql = core.bind_sa_group_sql("a.b.bind", "a.b.cond", "a.b.grp")
-        assert "`a.b.bind` AS b" in sql and "`a.b.cond` AS c ON c.id = b.condition_id" in sql
-        assert "`a.b.grp` AS g ON g.id = b.group_id" in sql
-        assert "LOWER(c.sa) AS sa" in sql and "g.`group`" in sql      # group 是保留字，必须反引号
-
-    def test_grant_sql_joins_group(self):
-        sql = core.grant_scope_sql("a.b.grant_tb", "a.b.grp")
-        assert "`a.b.grant_tb` AS t" in sql and "g.id = t.group_id" in sql
-        assert "t.table_name AS resource" in sql
-
-    def test_sql_rejects_bad_names(self):
-        with pytest.raises(ValueError):
-            core.bind_sa_group_sql("a.b.bind`; DROP", "a.b.cond", "a.b.grp")
-
-
-class TestSaRows:
-    def test_parse_accepts_csv_and_table_shapes(self):
-        rows = [{"account_id": "copilot-u-001", "group": "G_High@X.com", "display_name": "HK lead"},
-                {"sa": "copilot-u-002@p.iam.gserviceaccount.com", "grp": "g_low@x.com"},
-                {"sa": "copilot-u-002@p.iam.gserviceaccount.com", "grp": "G_LOW@x.com"}]   # 重复行
-        assert core.parse_sa_rows(rows) == [("copilot-u-001", "g_high@x.com", "HK lead"),
-                                            ("copilot-u-002", "g_low@x.com", None)]
-
-    def test_parse_rejects_missing_group(self):
-        with pytest.raises(ValueError):
-            core.parse_sa_rows([{"account_id": "copilot-u-001", "group": ""}])
-
-    def test_one_group_per_sa(self):
-        sas = [("u-001", "high@x.com", None), ("u-002", "low@x.com", None), ("u-001", "low@x.com", None)]
-        assert core.sa_group_conflicts(sas) == {"u-001": ["high@x.com", "low@x.com"]}
-        assert core.sa_group_conflicts(sas[:2]) == {}
-
-    def test_parse_grants(self):
-        rows = [{"group": "High@x.com", "resource": "p:d.t"},
-                {"grp": "low@x.com", "table_name": "p.d"},
-                {"grp": "low@x.com", "table_name": "p.d"}]
-        assert core.parse_grant_rows(rows) == [("high@x.com", "p.d.t"), ("low@x.com", "p.d")]
-
-
-class TestAclRoster:
-    W, R = "group_full_write@x.com", "group_full_read@x.com"
-
-    def test_resolve_by_email_or_suffix(self):
-        assert core.resolve_acl_group("Group_Full_Write@x.com", self.W, self.R) == self.W
-        assert core.resolve_acl_group("group_full_read", self.W, self.R) == self.R
-        assert core.resolve_acl_group("WRITE", self.W, self.R) == self.W
-
-    def test_resolve_rejects_unknown(self):
-        with pytest.raises(ValueError):
-            core.resolve_acl_group("other@x.com", self.W, self.R)
-        with pytest.raises(ValueError):
-            core.resolve_acl_group("vip", self.W, self.R)
-        with pytest.raises(ValueError):
-            core.resolve_acl_group("full_write", None, self.R)        # 名册有写账号但没给 --write-group
-
-    def test_roster_to_plan(self):
-        rows = [{"sa": "etl@p.iam.gserviceaccount.com", "acl_group": "group_full_write"},
-                {"sa": "admin@x.com", "acl_group": self.W},
-                {"sa": "iba@p.iam.gserviceaccount.com", "acl_group": "read"}]
-        assert core.acl_roster(rows, self.W, self.R) == {
-            self.W: ["serviceAccount:etl@p.iam.gserviceaccount.com", "user:admin@x.com"],
-            self.R: ["serviceAccount:iba@p.iam.gserviceaccount.com"]}
-
-    def test_roster_collects_all_errors(self):
-        rows = [{"sa": "a@x.com", "acl_group": "vip"}, {"sa": "", "acl_group": "read"}]
-        with pytest.raises(ValueError) as ei:
-            core.acl_roster(rows, self.W, self.R)
-        assert "vip" in str(ei.value) and "sa 为空" in str(ei.value)
-
-    def test_inspect_roster_both_directions(self):
-        actual = {self.W: {"etl@p.iam.gserviceaccount.com", "probe@p.iam.gserviceaccount.com",
-                           "stranger@x.com"},
-                  self.R: {"iba@p.iam.gserviceaccount.com"}}
-        roster = {self.W: {"etl@p.iam.gserviceaccount.com"},
-                  self.R: {"iba@p.iam.gserviceaccount.com", "late@p.iam.gserviceaccount.com"}}
-        issues = core.inspect_acl_roster(actual, roster, ignore=["probe@p.iam.gserviceaccount.com"])
-        assert len(issues) == 2
-        assert any("stranger@x.com" in i and "不在白名单名册" in i for i in issues)
-        assert any("late@p.iam.gserviceaccount.com" in i and "还没有加入" in i for i in issues)
-        assert core.inspect_acl_roster(roster, roster) == []
-
-
-# --------------------------------------------------------------------------- #
-# SA 所属项目反推 / Cloud Asset Inventory 结果解析（组织级 SA 盘点）
-# --------------------------------------------------------------------------- #
-class TestSaHomeProject:
-    def test_user_managed_app_engine_and_default_compute(self):
-        assert core.sa_home_project("serviceAccount:etl@etl-proj.iam.gserviceaccount.com") == "etl-proj"
-        assert core.sa_home_project("prod-proj@appspot.gserviceaccount.com") == "prod-proj"
-        assert core.sa_home_project("123456789012-compute@developer.gserviceaccount.com") == "123456789012"
-
-    def test_non_sa_and_google_managed_return_none(self):
-        assert core.sa_home_project("user:admin@x.com") is None
-        assert core.sa_home_project("service-123@gcp-sa-pubsub.iam.gserviceaccount.com") is None
-        assert core.sa_home_project("123456789012@cloudservices.gserviceaccount.com") is None   # 服务代理
-        assert core.sa_home_project("specialGroup:projectReaders") is None
-
-    def test_home_projects_dedup_sorted(self):
-        ps = ["serviceAccount:a@p2.iam.gserviceaccount.com", "serviceAccount:b@p1.iam.gserviceaccount.com",
-              "serviceAccount:c@p1.iam.gserviceaccount.com", "user:x@y.com"]
-        assert core.sa_home_projects(ps) == ["p1", "p2"]
-
-
-class TestAssetRows:
-    SA = {"name": "//iam.googleapis.com/projects/my-proj/serviceAccounts/etl@my-proj.iam.gserviceaccount.com",
-          "assetType": "iam.googleapis.com/ServiceAccount", "project": "projects/123",
-          "displayName": "ETL", "state": "ENABLED",
-          "additionalAttributes": {"email": "ETL@my-proj.iam.gserviceaccount.com"},
-          "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/my-proj"}
-
-    def test_sa_resource_rows(self):
-        rows = core.asset_sa_rows([self.SA, {**self.SA, "state": "DISABLED", "additionalAttributes": {},
-                                             "name": "//iam.googleapis.com/projects/my-proj/serviceAccounts/old@my-proj.iam.gserviceaccount.com"}])
-        assert rows[0] == {"email": "etl@my-proj.iam.gserviceaccount.com", "project": "my-proj",
-                           "display_name": "ETL", "disabled": False, "source": "asset-sa"}
-        assert rows[1]["email"] == "old@my-proj.iam.gserviceaccount.com" and rows[1]["disabled"] is True
-
-    def test_iam_policy_rows_keep_only_sa_members_with_resource_and_role(self):
-        results = [{"resource": "//bigquery.googleapis.com/projects/p/datasets/d/tables/t",
-                    "policy": {"bindings": [
-                        {"role": "roles/bigquery.dataViewer",
-                         "members": ["serviceAccount:r@p.iam.gserviceaccount.com", "user:u@x.com"]}]}},
-                   {"resource": "//cloudresourcemanager.googleapis.com/folders/42",
-                    "policy": {"bindings": [{"role": "roles/bigquery.dataEditor",
-                                             "members": ["serviceAccount:e@q.iam.gserviceaccount.com"]}]}}]
-        rows = core.asset_iam_sa_rows(results)
-        assert rows == [
-            {"email": "r@p.iam.gserviceaccount.com", "project": "projects/p/datasets/d/tables/t",
-             "display_name": "", "disabled": False, "source": "iam-binding:roles/bigquery.dataViewer"},
-            {"email": "e@q.iam.gserviceaccount.com", "project": "folders/42",
-             "display_name": "", "disabled": False, "source": "iam-binding:roles/bigquery.dataEditor"}]
-
-    def test_rows_feed_whitelist_builder(self):
-        rows = core.build_sa_whitelist_rows(core.asset_sa_rows([self.SA]) + core.asset_iam_sa_rows([
-            {"resource": "//cloudresourcemanager.googleapis.com/organizations/1",
-             "policy": {"bindings": [{"role": "roles/bigquery.admin",
-                                      "members": ["serviceAccount:etl@my-proj.iam.gserviceaccount.com"]}]}}]),
-            "write")
-        assert len(rows) == 1
-        assert rows[0]["sources"] == "my-proj:asset-sa; organizations/1:iam-binding:roles/bigquery.admin"
-
-    def test_asset_scope(self):
-        assert core.asset_scope(organization="123") == "organizations/123"
-        assert core.asset_scope(organization="organizations/123") == "organizations/123"
-        assert core.asset_scope(folder="folders/9") == "folders/9"
-        with pytest.raises(ValueError):
-            core.asset_scope()
-
-
-# --------------------------------------------------------------------------- #
-# 嵌套 Group 展开（P0：Copilot SA 不能藏在白名单的嵌套组里）
-# --------------------------------------------------------------------------- #
-SA = "SERVICE_ACCOUNT"
-
-
-def _fetcher(tree):
-    """tree: {group: [(member, type)] 或 None（无法读取）}"""
-    calls = []
-
-    def fetch(g):
-        calls.append(g)
-        return tree.get(g, None) if g in tree else None
-    fetch.calls = calls
-    return fetch
-
-
-class TestExpandGroup:
-    def test_direct_and_nested_with_path(self):
-        tree = {"wl@x.com": [("etl@p.iam.gserviceaccount.com", SA), ("team@x.com", "GROUP")],
-                "team@x.com": [("bi@p.iam.gserviceaccount.com", SA), ("sub@x.com", "GROUP")],
-                "sub@x.com": [("copilot-u-1@c.iam.gserviceaccount.com", SA), ("alice@x.com", "USER")]}
-        members, unresolved = core.expand_group("wl@x.com", _fetcher(tree))
-        assert members["etl@p.iam.gserviceaccount.com"] == {"type": SA, "via": ["wl@x.com"]}
-        assert members["copilot-u-1@c.iam.gserviceaccount.com"]["via"] == ["wl@x.com", "team@x.com", "sub@x.com"]
-        assert members["team@x.com"]["type"] == "GROUP"
-        assert unresolved == []
-
-    def test_cycle_is_visited_once(self):
-        tree = {"a@x.com": [("b@x.com", "GROUP")], "b@x.com": [("a@x.com", "GROUP"), ("s@p.iam.gserviceaccount.com", SA)]}
-        f = _fetcher(tree)
-        members, _ = core.expand_group("a@x.com", f)
-        assert "s@p.iam.gserviceaccount.com" in members and f.calls.count("a@x.com") == 1
-
-    def test_unreadable_nested_group_reported(self):
-        tree = {"wl@x.com": [("ext@partner.com", "GROUP")]}          # 外部域的组读不到
-        members, unresolved = core.expand_group("wl@x.com", _fetcher(tree))
-        assert unresolved == [("ext@partner.com", ["wl@x.com"])]
-
-    def test_missing_type_inferred_from_email(self):
-        tree = {"wl@x.com": [("s@p.iam.gserviceaccount.com", None)]}
-        members, _ = core.expand_group("wl@x.com", _fetcher(tree))
-        assert members["s@p.iam.gserviceaccount.com"]["type"] == SA
-
-
-class TestNestedCopilot:
-    def test_only_indirect_members_reported_with_path(self):
-        expanded = {"wl@x.com": ({"copilot-u-1@c.iam.gserviceaccount.com": {"type": SA, "via": ["wl@x.com", "team@x.com"]},
-                                  "copilot-u-2@c.iam.gserviceaccount.com": {"type": SA, "via": ["wl@x.com"]},
-                                  "etl@p.iam.gserviceaccount.com": {"type": SA, "via": ["wl@x.com", "team@x.com"]}},
-                                 [("ext@partner.com", ["wl@x.com"])])}
-        issues, warns = core.inspect_nested_copilot(expanded, copilot_patterns=["copilot-*@*"])
-        assert issues == ["白名单组 wl@x.com 经由嵌套组 wl@x.com > team@x.com 混入 Copilot SA: "
-                          "copilot-u-1@c.iam.gserviceaccount.com"]          # 直接成员由原有检查负责，不重复报
-        assert len(warns) == 1 and "ext@partner.com" in warns[0]
-
-    def test_clean(self):
-        assert core.inspect_nested_copilot({"wl@x.com": ({}, [])}, copilot_patterns=["copilot-*@*"]) == ([], [])
-
-
-# --------------------------------------------------------------------------- #
-# analyzeIamPolicy 结果解析（展开 Group + 继承层级）
-# --------------------------------------------------------------------------- #
-class TestAnalysisPrincipals:
-    RESULTS = [
-        {"attachedResourceFullName": "//bigquery.googleapis.com/projects/p/datasets/d/tables/t",
-         "iamBinding": {"role": "roles/bigquery.dataViewer", "members": ["group:team@x.com", "serviceAccount:r@p.iam.gserviceaccount.com"]},
-         "accessControlLists": [{"accesses": [{"permission": "bigquery.tables.getData"}]}],
-         "identityList": {"identities": [{"name": "group:team@x.com"}, {"name": "serviceAccount:r@p.iam.gserviceaccount.com"},
-                                         {"name": "group:sub@x.com"}, {"name": "serviceAccount:n@p.iam.gserviceaccount.com"}],
-                          "groupEdges": [{"sourceNode": "group:team@x.com", "targetNode": "group:sub@x.com"},
-                                         {"sourceNode": "group:sub@x.com", "targetNode": "serviceAccount:n@p.iam.gserviceaccount.com"}]}},
-        {"attachedResourceFullName": "//cloudresourcemanager.googleapis.com/folders/42",
-         "iamBinding": {"role": "roles/bigquery.dataEditor", "members": ["serviceAccount:w@q.iam.gserviceaccount.com"]},
-         "accessControlLists": [{"accesses": [{"permission": "bigquery.tables.getData"},
-                                              {"permission": "bigquery.tables.updateData"}]}],
-         "identityList": {"identities": [{"name": "serviceAccount:w@q.iam.gserviceaccount.com"}]}}]
-
-    def test_direct_nested_and_inherited(self):
-        rows = {r["principal"]: r for r in core.analysis_principals(self.RESULTS)}
-        assert rows["serviceAccount:r@p.iam.gserviceaccount.com"]["via"] == []
-        assert rows["serviceAccount:n@p.iam.gserviceaccount.com"]["via"] == ["group:team@x.com", "group:sub@x.com"]
-        assert rows["serviceAccount:n@p.iam.gserviceaccount.com"]["read"] and not rows["serviceAccount:n@p.iam.gserviceaccount.com"]["write"]
-        w = rows["serviceAccount:w@q.iam.gserviceaccount.com"]
-        assert w["resource"] == "folders/42" and w["read"] and w["write"] and w["role"] == "roles/bigquery.dataEditor"
-
-    def test_source_label(self):
-        r = [x for x in core.analysis_principals(self.RESULTS) if x["principal"].startswith("serviceAccount:n@")][0]
-        assert core.analysis_source(r) == ("analyze:projects/p/datasets/d/tables/t:roles/bigquery.dataViewer"
-                                           " via group:team@x.com > group:sub@x.com")
-
-
-# --------------------------------------------------------------------------- #
-# CAI 查询、Group 引用、范围外 SA、授权视图
-# --------------------------------------------------------------------------- #
-class TestCaiExtras:
-    def test_permission_query_or(self):
-        assert core.iam_permission_query(["bigquery.tables.getData", "bigquery.tables.updateData"]) == (
-            "policy.role.permissions:bigquery.tables.getData OR policy.role.permissions:bigquery.tables.updateData")
-        with pytest.raises(ValueError):
-            core.iam_permission_query(["bad perm"])
-
-    def test_group_refs(self):
-        results = [{"resource": "//bigquery.googleapis.com/projects/p/datasets/d",
-                    "policy": {"bindings": [{"role": "roles/bigquery.dataViewer",
-                                             "members": ["group:Team@x.com", "serviceAccount:s@p.iam.gserviceaccount.com"]}]}}]
-        assert core.asset_iam_group_refs(results) == [("team@x.com", "projects/p/datasets/d", "roles/bigquery.dataViewer")]
-
-    def test_out_of_scope_sa_flagged(self):
-        sas = [{"email": "in@p.iam.gserviceaccount.com", "project": "p", "source": "asset-sa"},
-               {"email": "partner@vendor.iam.gserviceaccount.com", "project": "projects/p/datasets/d",
-                "source": "iam-binding:roles/bigquery.dataViewer"}]
-        rows = {r["principal"]: r for r in core.build_sa_whitelist_rows(
-            sas, "write", scope_emails={"in@p.iam.gserviceaccount.com"})}
-        assert "范围外" in rows["serviceAccount:partner@vendor.iam.gserviceaccount.com"]["note"]
-        assert "范围外" not in rows["serviceAccount:in@p.iam.gserviceaccount.com"]["note"]
-        assert rows["serviceAccount:partner@vendor.iam.gserviceaccount.com"]["suggested_group"] == "write"
-
-    def test_authorized_entries(self):
-        entries = [("view", {"projectId": "p2", "datasetId": "views", "tableId": "v_orders"}),
-                   ("dataset", {"dataset": {"projectId": "p3", "datasetId": "shared"}, "targetTypes": ["VIEWS"]}),
-                   ("routine", {"projectId": "p", "datasetId": "d", "routineId": "f"}),
-                   ("userByEmail", "a@x.com")]
-        assert core.authorized_entries(entries) == (["p2.views.v_orders"], ["p3.shared"])
+            core.validate_registry_fields(fields)

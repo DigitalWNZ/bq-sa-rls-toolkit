@@ -1,131 +1,234 @@
 #!/usr/bin/env python3
 """
-T4 为白名单 Group 批量授予 FILTER TRUE 策略（存量业务零感知的旁路保护）。
+为一个白名单 Group 在目标表上设置 FILTER TRUE 行级规则（Doc 第 3 步）：
+该 Group 的成员不受行级过滤、可见全部记录（前提是本来就有读表权限；本脚本不授予读表权限）。
 
-对每张目标表创建/维护同一条 policy（默认 rls_bypass_full_access），一次性授予所有白名单 Group:
-  CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access` ON `表`
-  GRANT TO ("group:full-write@x.com", "group:full-read@x.com") FILTER USING (TRUE)
+每个 Group 单独一条规则，规则名 rls_bypass_full_access_<邮箱，小写，非字母数字换成 _>:
+  CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access_<group>` ON `表`
+  GRANT TO ("group:<group>") FILTER USING (TRUE)
+一次只处理一个 Group（--group），ReadOnly、Writable 各运行一次。
 
-安全规则:
-  - 表上原本没有任何 RLS 时（首条 policy 会触发 Implicit Deny），必须加 --force-first-policy，
-    否则整批中止（exit 2），不做任何变更。请先完成 whitelist_groups.py 的探针验证。
-  - 表上已有同名 policy 但授权对象/过滤条件不同 -> [CONFLICT] 跳过该表（不覆盖别人的 policy）；
-    加 --merge 时对授权对象取并集（过滤条件不同时仍冲突）。
-  - 已一致 -> [NOOP]。
-  - 版本前置检查：目标项目最近 N 天若有查询作业运行在 STANDARD 版本 Reservation 上，整批中止（exit 5）。
-  - --verify-sa 挂载后验证：以白名单 SA 身份 SELECT 1 ... LIMIT 1（要求分区过滤的表自动加条件），
-    看到数据即通过；--verify-mode count 改为 COUNT(*) 与元数据行数比对。
+目标表（可叠加；每个参数的值可直接写（逗号 / 空格分隔），也可写单列无表头的 .csv 文件，可混用）:
+  --tables     project.dataset.table（反引号可选，如 `trip-prod.dw.orders`；不支持 project:dataset.table）
+  --datasets   project.dataset（展开为其中全部表）
+  --projects   Project ID（展开为项目内全部表）
+  三类至少给出一类（任给其一即可），都不给则报错（退出码 2）。
+
+双重保证: 最终表 = (--tables ∪ --datasets 展开 ∪ --projects 展开) ∩ 登记表中 rls_enabled = 1 的表。
+  --registry-table 必填：登记表（adm_user_mem_copilot_tb），只读 table_name、rls_enabled 两列（不看 status）；
+  table_name 按原始字符串精确比较；不在登记表或 rls_enabled ≠ 1 的表逐张打印 [SKIP]，不授权（退出码不受影响）；
+  同一 table_name 有多行且 rls_enabled 不一致 -> [WARN] + [SKIP]，退出码 1。
+逐表判断: 无同名规则 -> [CREATE]；同名且内容相同 -> [NOOP]；同名但内容不同 -> [REPLACE]（日志打印被覆盖的旧内容）。
+首次设置提示: 表上原本没有任何 RLS 时，新建第一条会让未被授权的账号查到 0 行；
+  这些表会在日志中列出（「将为以下这些表首次设置RLS规则」），只作提示，不拦截。
+--verify-sa: 执行后扮演该 Group 里的一个 SA 查表，300 秒内查到任意一行即通过。
+--parallel: 同时处理的表数（默认 16）；同一张表上的操作始终顺序执行。
 
 示例:
-  python apply_bypass_rls.py --tables-file tables.txt \\
-      --groups full-write@x.com,full-read@x.com --force-first-policy --apply
+  python apply_bypass_rls.py --group group_existingsa_read@domain.com --tables tables.csv \\
+      --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb
+  python apply_bypass_rls.py ... --apply --verify-sa reader@prod.iam.gserviceaccount.com
 
-退出码: 0 成功；1 有冲突/失败/验证失败；2 首条 policy 未加 --force-first-policy（未做任何变更）；
-        5 目标项目最近有作业运行在 STANDARD 版本（未做任何变更）
+退出码: 0 成功；1 DDL 执行失败 / 验证失败 / 登记表记录冲突；2 参数错误 / 登记表不可用（未做任何变更）
 """
 
 import argparse
+import os
 import sys
 
 import gcp_ops as ops
 import rls_core as core
-from gcp_auth import get_credentials
+from gcp_auth import AuthConfigError, describe_auth, resolve_auth
+
+VERIFY_TIMEOUT = 300                       # --verify-sa：新规则生效最多等待的秒数
+FIRST_POLICY_MSG = "[NOTE] 将为以下这些表首次设置RLS规则（未被任何规则授权的账号将查到 0 行）："
 
 
-def main():
-    p = argparse.ArgumentParser(description="批量为白名单 Group 授予 FILTER TRUE 策略")
-    p.add_argument("--tables", nargs="*", default=[])
-    p.add_argument("--tables-file", default=None)
-    p.add_argument("--groups", nargs="+", required=True, help="白名单 Group（可写 user:/serviceAccount: 前缀）")
-    p.add_argument("--policy-name", default=core.BYPASS_POLICY)
-    p.add_argument("--merge", action="store_true", help="同名 policy 授权对象不同时取并集")
-    p.add_argument("--force-first-policy", action="store_true")
-    p.add_argument("--project", default=None, help="quota / 运行 DDL 的项目（默认第一张表的项目）")
+def log_first_policy_tables(tables):
+    """只作提示：列出将首次设置 RLS 的表（按表名排序）。apply_copilot_rls.py 共用。"""
+    if tables:
+        ops.log(FIRST_POLICY_MSG + "\n" + "\n".join(f"  - {t}" for t in sorted(tables)))
+
+
+# --------------------------------------------------------------------------- #
+# 与 rollback_rls.py 共用的参数 / 辅助
+# --------------------------------------------------------------------------- #
+def add_scope_args(p):
+    p.add_argument("--tables", nargs="*", action="extend", default=[],
+                   help="project.dataset.table（反引号可选），逗号或空格分隔；也可写 .csv 文件（单列无表头）")
+    p.add_argument("--datasets", nargs="*", action="extend", default=[], help="project.dataset（展开为其中全部表）；也可写 .csv 文件")
+    p.add_argument("--projects", nargs="*", action="extend", default=[], help="Project ID（展开为项目内全部表）；也可写 .csv 文件")
+    p.add_argument("--parallel", type=int, default=16, help="同时处理的表数（默认 16；实测 32 以内 DDL 吞吐线性增长、无后端错误，48 时 BigQuery 开始大量返回暂时性错误，建议不超过 32）")
+
+
+def read_scope(args):
+    """返回 (tables, datasets, projects, 默认项目)；格式错误抛 ValueError。"""
+    tables = list(dict.fromkeys(core.parse_table_arg(t) for t in core.collect_values(args.tables)))
+    datasets = list(dict.fromkeys(core.parse_dataset_arg(d) for d in core.collect_values(args.datasets)))
+    projects = core.collect_values(args.projects)
+    for x in projects:
+        core.project_scope(x)
+    first = (tables + datasets + projects or [""])[0].split(".")[0] or None
+    return tables, datasets, projects, first
+
+
+def load_registry(ctx, registry):
+    """读取登记表 -> {table_name 原值: 状态}；表不存在 / 列不对 / 读不到时抛 ValueError。"""
+    if not ops.table_exists(ctx, registry):
+        raise ValueError(f"登记表 {registry} 不存在（--registry-table）")
+    core.validate_registry_fields(ops.table_fields(ctx, registry))
+    try:
+        rows = ops.read_registry_rows(ctx, registry)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"读取登记表 {registry} 失败: {e}") from e
+    return core.registry_status(rows)
+
+
+def filter_by_registry(table_list, status, registry):
+    """(可授权的表, 冲突表数)；未开启的表逐张打印 [SKIP]（按表名排序），冲突的表另加 [WARN]。"""
+    allowed, conflicts = [], 0
+    for t in sorted(table_list):
+        st = status.get(t)
+        if st == "enabled":
+            allowed.append(t)
+        elif st == "conflict":
+            conflicts += 1
+            ops.log(f"[WARN] {t}: 登记表中有多条记录且 rls_enabled 不一致（既有 1 又有其它值），按未开启处理")
+            ops.log(f"[SKIP] {t}: 登记表记录冲突，不授权")
+        elif st == "disabled":
+            ops.log(f"[SKIP] {t}: 登记表中 rls_enabled ≠ 1，不授权")
+        else:
+            ops.log(f"[SKIP] {t}: 不在登记表 {registry} 中，不授权")
+    keep = set(allowed)
+    return [t for t in table_list if t in keep], conflicts
+
+
+def workers(args):
+    return max(1, args.parallel)
+
+
+def run_main(fn, argv):
+    """统一的顶层错误处理：意外异常打印 [ERROR] 并返回 1（RLS_DEBUG=1 时抛出完整堆栈）。"""
+    try:
+        return fn(argv)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        ops.log("[ERROR] 已被用户中断")
+        return 130
+    except Exception as e:  # noqa: BLE001
+        if os.environ.get("RLS_DEBUG"):
+            raise
+        ops.log(f"[ERROR] {type(e).__name__}: {str(e)[:500]}")
+        return 1
+
+
+# --------------------------------------------------------------------------- #
+def _main(argv):
+    p = argparse.ArgumentParser(description="为一个白名单 Group 设置 FILTER TRUE 行级规则", allow_abbrev=False)
+    p.add_argument("--group", required=True, help="白名单 Group 邮箱（只能一个）")
+    add_scope_args(p)
+    p.add_argument("--registry-table", required=True,
+                   help="登记表 project.dataset.table（adm_user_mem_copilot_tb）：只有其中 rls_enabled = 1 的表才授权")
+    p.add_argument("--quota-project", default=None, help="quota / 运行查询与 DDL 的项目（默认 gcloud 默认项目，其次 application-default 凭证的 quota 项目）")
     p.add_argument("--verify-sa", default=None,
-                   help="挂载后验证用的白名单 SA（需在白名单 Group 中、有表读权限，执行账号可扮演它）")
-    p.add_argument("--verify-timeout", type=int, default=300)
-    p.add_argument("--verify-mode", choices=["sample", "count"], default="sample",
-                   help="sample：查到任意一行即通过（默认，成本极低）；count：COUNT(*) 与元数据行数比对")
-    p.add_argument("--skip-edition-check", action="store_true",
-                   help="跳过 Reservation 版本检查（RLS 不支持 Standard 版本）")
-    p.add_argument("--edition-days", type=int, default=7, help="版本检查回看最近 N 天的作业")
-    p.add_argument("--gcloud-account", default=None)
-    p.add_argument("--apply", action="store_true")
-    args = p.parse_args()
+                   help="挂载后验证用的 SA（在该 Group 中、有表读权限、执行账号可扮演）：300 秒内查到任意一行即通过")
+    p.add_argument("--gcloud-account", default=None, help="执行账号（默认 gcloud 当前活动账号，其次 application-default 凭证）")
+    p.add_argument("--apply", action="store_true", help="真正执行；默认只演练")
+    args = p.parse_args(argv)
 
-    tables = core.split_items(args.tables) + (core.read_list_file(args.tables_file)
-                                               if args.tables_file else [])
-    if not tables:
-        p.error("请指定 --tables 或 --tables-file")
-    tables = list(dict.fromkeys(core.fq(t) for t in tables))
-    grantees = [core.normalize_member(g) for g in core.split_items(args.groups)]
-    project = args.project or core.parse_table(tables[0])[0]
-    ctx = ops.Ctx(get_credentials(args.gcloud_account, project), project)
+    groups = core.split_items([args.group])
+    if len(groups) != 1:
+        ops.log(f"[ERROR] --group 只能指定一个 Group，收到 {len(groups)} 个: {groups}")
+        return 2
+    group = core.member_email(groups[0])
+    grantee = f"group:{group}"
+    policy_name = core.bypass_policy_name(group)
+    try:
+        core.build_policy_ddl("p.d.t", policy_name, [grantee], "TRUE")   # 提前校验 Group 邮箱
+        tables, datasets, projects, _ = read_scope(args)
+        registry = core.parse_table_arg(args.registry_table)
+    except (ValueError, OSError) as e:
+        ops.log(f"[ERROR] {e}")
+        return 2
+    if not (tables or datasets or projects):
+        ops.log("[ERROR] 请指定 --tables、--datasets、--projects 中的至少一项")
+        return 2
+
+    try:
+        auth = resolve_auth(args.gcloud_account, args.quota_project)
+    except AuthConfigError as e:
+        ops.log(f"[ERROR] {e}")
+        return 2
+    ops.log(describe_auth(auth))
+    ctx = ops.Ctx(auth.creds, auth.project)
     mode = "APPLY" if args.apply else "DRY-RUN"
-    ops.log(f"===== 模式: {mode}  policy={args.policy_name}  grantees={grantees} =====")
+    ops.log(f"===== 模式: {mode}  规则: {policy_name}  授权对象: {grantee}  并行: {workers(args)} =====")
+    try:
+        status = load_registry(ctx, registry)
+    except ValueError as e:
+        ops.log(f"[ERROR] {e}")
+        return 2
 
-    # C3: Reservation 版本前置检查——Standard 版本不支持 RLS，挂上策略后存量查询会失败
-    if not args.skip_edition_check:
-        blocked = False
-        for proj, region in sorted({(core.parse_table(t)[0], ctx.table_location(t).lower()) for t in tables}):
-            try:
-                rows = [dict(r.items()) for r in ops.run_query(
-                    ctx, core.edition_usage_sql(proj, region, args.edition_days), region)]
-            except Exception as e:  # noqa: BLE001
-                ops.log(f"[EDITION] {proj}/{region}: 无法读取作业历史（{str(e)[:120]}），跳过版本检查")
-                continue
-            std = core.standard_edition_usage(rows)
-            if std:
-                blocked = True
-                for res, n in std:
-                    ops.log(f"[EDITION] {proj}/{region}: 最近 {args.edition_days} 天有 {n} 个查询作业运行在 "
-                            f"STANDARD 版本 Reservation {res}，RLS 不支持 Standard")
-            elif not rows:
-                ops.log(f"[EDITION] {proj}/{region}: 最近 {args.edition_days} 天没有查询作业，无法判断版本，请人工确认")
-            else:
-                ops.log(f"[EDITION] {proj}/{region}: OK（{', '.join(sorted({(r['edition'] or 'on-demand') for r in rows}))}）")
-        if blocked:
-            ops.log("已中止，未做任何变更。请先完成 Reservation 切换到 Enterprise（RUNBOOK 阶段 1），"
-                    "确认后可用 --skip-edition-check 跳过。")
-            return 5
+    try:
+        scope_list = ops.expand_tables(ctx, tables, datasets, projects)
+    except Exception as e:  # noqa: BLE001
+        ops.log(f"[ERROR] 展开目标表失败: {e}")
+        return 1
+    table_list, conflicts = filter_by_registry(scope_list, status, registry)
+    skipped = len(scope_list) - len(table_list)
+    ops.log(f"[SCAN] 目标范围 {len(scope_list)} 张表；登记表中已开启 {len(table_list)} 张，跳过 {skipped} 张")
 
+    # 阶段 1：并行读取现有规则（只读取本规则名的授权对象），生成计划
+    failed = conflicts > 0
     plans = {}
-    for t in tables:
-        plans[t] = core.plan_policy_upsert(ops.list_policies(ctx, t), args.policy_name, "TRUE",
-                                           grantees, merge=args.merge)
-    first = [t for t, pl in plans.items() if pl.first_policy and pl.action == "create"]
-    if first:
-        ops.log(f"[WARNING] 以下 {len(first)} 张表目前没有任何 RLS，创建后未被授权的账号将查不到数据:")
-        for t in first:
-            ops.log(f"  - {t}")
-        if args.apply and not args.force_first_policy:
-            ops.log("已中止，未做任何变更。确认白名单 Group 已生效（探针通过）后加 --force-first-policy。")
-            return 2
-
-    failed = False
-    for t, pl in plans.items():
-        if pl.action == "noop":
-            ops.log(f"[NOOP] {t}")
-            continue
-        if pl.action == "conflict":
+    for t, pl, err in ops.parallel_map(
+            lambda t: core.plan_upsert(ops.list_policies(ctx, t, grantees_for={policy_name}),
+                                       policy_name, "TRUE", [grantee]),
+            table_list, workers=workers(args), desc="plan"):
+        if err:
             failed = True
-            ops.log(f"[CONFLICT] {t}: {pl.reason}（如需合并授权对象请加 --merge）")
-            continue
-        ddl = core.build_bypass_policy_ddl(t, pl.grantees, args.policy_name)
-        ops.log(f"[{pl.action.upper()}] {t}\n{ddl}")
+            ops.log(f"[ERROR] {t}: 读取现有规则失败: {err}")
+        else:
+            plans[t] = pl
+
+    log_first_policy_tables([t for t, pl in plans.items() if pl.first_policy and pl.action == "create"])
+
+    # 阶段 2：并行执行（每张表一条 DDL）
+    def execute(t):
+        pl = plans[t]
+        lines = []
+        if pl.action == "noop":
+            return [f"[NOOP] {t}"], True
+        ddl = core.build_policy_ddl(t, policy_name, [grantee], "TRUE")
+        lines.append(f"[{pl.action.upper()}] {t}\n{ddl}")
+        if pl.action == "replace":
+            lines.append(f"  被覆盖的旧内容: grantees={pl.old['grantees']} filter={pl.old['filter']}")
         if args.apply:
             try:
                 ops.run_ddl(ctx, ddl, ctx.table_location(t))
             except Exception as e:  # noqa: BLE001
-                failed = True
-                ops.log(f"  [ERROR] {e}")
+                lines.append(f"  [ERROR] {e}")
+                return lines, False
+        return lines, True
 
+    counts = {"SKIP": skipped} if skipped else {}
+    for t, res, err in ops.parallel_map(execute, list(plans), workers=workers(args), desc="ddl"):
+        if err:
+            failed = True
+            ops.log(f"[ERROR] {t}: {err}")
+            continue
+        lines, ok = res
+        ops.log("\n".join(lines))
+        failed = failed or not ok
+        counts[plans[t].action.upper()] = counts.get(plans[t].action.upper(), 0) + 1
+
+    # 阶段 3：挂载后验证（并行）
     if args.apply and args.verify_sa:
-        # 实测：新建 policy 后白名单账号可能有十几秒到数十秒看到 0 行 / DML 报
-        # "does not have full access"。以白名单账号身份轮询，直到行数与表元数据一致。
-        for t in tables:
-            status, detail = ops.verify_full_access(ctx, t, args.verify_sa, args.verify_timeout,
-                                                    mode=args.verify_mode)
+        def verify(t):
+            return ops.verify_full_access(ctx, t, args.verify_sa, VERIFY_TIMEOUT, mode="sample")
+        for t, res, err in ops.parallel_map(verify, list(plans), workers=workers(args), desc="verify"):
+            status, detail = ("fail", str(err)) if err else res
             if status == "ok":
                 ops.log(f"[VERIFY-OK] {t}: {args.verify_sa} {detail}")
             elif status == "skip":
@@ -134,9 +237,13 @@ def main():
                 failed = True
                 ops.log(f"[VERIFY-FAIL] {t}: {detail}")
     elif args.apply:
-        ops.log("[NOTE] 未做挂载后验证；新 policy 生效有短暂窗口，建议用 --verify-sa 指定一个白名单账号验证")
-    ops.log(f"===== 完成 ({mode}) =====")
+        ops.log("[NOTE] 未做挂载后验证；新规则生效有短暂窗口，建议用 --verify-sa 指定该 Group 里的一个 SA 验证")
+    ops.log(f"===== 完成 ({mode})：" + ("，".join(f"{k} {v}" for k, v in sorted(counts.items())) or "无") + " =====")
     return 1 if failed else 0
+
+
+def main(argv=None):
+    return run_main(_main, argv)
 
 
 if __name__ == "__main__":

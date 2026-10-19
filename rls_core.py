@@ -1,30 +1,29 @@
 """
-RLS 工具集的纯逻辑核心（不访问 GCP，便于单元测试）。
-
-包含：输入解析、权限读写分类、Copilot SA 防混入、白名单/Copilot RLS DDL 生成、
-策略合并计划、回退计划、巡检、SA 配额校验、作业历史 SQL。
+纯逻辑模块（不访问 GCP，便于单元测试）：
+输入解析、规则命名、主体抽取、DDL 生成、Copilot 过滤条件、计划（CREATE / NOOP / REPLACE / 回退）。
 """
 
+import csv
 import fnmatch
+import functools
+import hashlib
 import re
 from dataclasses import dataclass, field
 
-BYPASS_POLICY = "rls_bypass_full_access"
-COPILOT_POLICY = "rls_copilot_subquery_policy"
-DIMENSIONS = ("region", "prdtype", "refername")
-SA_PER_PROJECT_LIMIT = 100
-
-READ_PERMISSION = "bigquery.tables.getData"
-WRITE_PERMISSION = "bigquery.tables.updateData"
+BYPASS_PREFIX = "rls_bypass_full_access_"
+COPILOT_PREFIX = "rls_copilot_"
 RLS_GRANTEE_ROLE = "roles/bigquery.filteredDataViewer"
+MAX_POLICIES_PER_TABLE = 400          # BigQuery：每张表最多 400 条 RLS 规则
+POLICY_NAME_MAX = 256                 # BigQuery：规则名最长 256 字符
 
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]*$")
 _DATASET_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _TABLE_RE = re.compile(r"^[A-Za-z0-9_\-$]+$")
-_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_REGION_RE = re.compile(r"^[a-z0-9\-]+$")
-_SA_ID_RE = re.compile(r"^[a-z][a-z0-9\-]{4,28}[a-z0-9]$")
-_GRANTEE_RE = re.compile(r"^[A-Za-z]+:[^\"'`\s]+$|^allUsers$|^allAuthenticatedUsers$")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_POLICY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_ORG_RE = re.compile(r"^\d+$")
+_GRANTEE_RE = re.compile(r"^(user|group|serviceAccount|domain):[^\"'`\s\\]+$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 _SPECIAL_MEMBERS = {"allUsers", "allAuthenticatedUsers"}
 
 
@@ -40,16 +39,70 @@ def split_items(values):
 
 
 def read_list_file(path):
-    with open(path) as f:
-        return split_items(l for l in f if not l.strip().startswith("#"))
+    """读取单列、无表头的 CSV：每行一个值；空行忽略；不支持注释；多列报错。"""
+    out = []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for i, row in enumerate(csv.reader(f), 1):
+            cells = [c.strip() for c in row if c.strip()]
+            if not cells:
+                continue
+            if len(cells) > 1:
+                raise ValueError(f"{path} 第 {i} 行有多列，文件应为单列、无表头的 CSV")
+            out.append(cells[0])
+    return out
+
+
+def _is_list_file(item):
+    """以 .csv 结尾（不区分大小写）且不在反引号内的值当作单列文件。"""
+    return item.lower().endswith(".csv") and not item.startswith("`")
+
+
+def collect_values(values):
+    """
+    列表参数（--tables / --datasets / --projects / --principals / --policy-names / --organizations）：
+    值用逗号或空格分隔；以 .csv 结尾的项读取为单列、无表头的 CSV 文件（文件不存在 -> OSError）；
+    可混用；去重保序。
+    """
+    items = []
+    for item in split_items(values or []):
+        if _is_list_file(item):
+            items.extend(read_list_file(item))
+        else:
+            items.append(item)
+    return list(dict.fromkeys(items))
+
+
+def _strip_backticks(value, what):
+    v = str(value).strip()
+    if v.startswith("`") or v.endswith("`"):
+        if not (len(v) > 2 and v.startswith("`") and v.endswith("`")) or "`" in v[1:-1]:
+            raise ValueError(f"{what}的反引号不配对或位置不对（应为 `project.dataset.table` 整体一对）: {value!r}")
+        v = v[1:-1]
+    return v
+
+
+def parse_table_arg(value):
+    """命令行 / 参数文件中的表名 -> 'project.dataset.table'：必须三段、点分隔，可带一对反引号；不接受 project:dataset.table。"""
+    v = _strip_backticks(value, "表名")
+    if ":" in v:
+        raise ValueError(f"表名应为 project.dataset.table（点分隔，不支持 project:dataset.table 写法）: {value!r}")
+    if len(v.split(".")) != 3:
+        raise ValueError(f"表名应为 project.dataset.table（必须三段）: {value!r}")
+    return fq(v)
+
+
+def parse_dataset_arg(value):
+    """命令行 / 参数文件中的数据集 -> 'project.dataset'：点分隔，可带一对反引号；不接受 project:dataset。"""
+    v = _strip_backticks(value, "数据集名")
+    if ":" in v:
+        raise ValueError(f"数据集应为 project.dataset（点分隔，不支持 project:dataset 写法）: {value!r}")
+    return ".".join(parse_dataset(v))
 
 
 def normalize_member(m, default_prefix="group"):
     """
-    规范化 IAM 主体:
-      - 无前缀邮箱: *.gserviceaccount.com -> serviceAccount:，其他 -> default_prefix:
-      - 有前缀: 保留前缀，邮箱小写
-      - allUsers / allAuthenticatedUsers / deleted:... 原样保留
+    规范化 IAM 主体：无前缀邮箱 -> *.gserviceaccount.com 为 serviceAccount:，其他为 default_prefix:；
+    有前缀则保留前缀、邮箱小写；allUsers / allAuthenticatedUsers / deleted:... 原样保留。
     """
     m = m.strip()
     if m in _SPECIAL_MEMBERS or m.startswith("deleted:"):
@@ -83,119 +136,215 @@ def fq(table, default_project=None):
     return ".".join(parse_table(table, default_project))
 
 
+def parse_dataset(ref):
+    """'p.d' / 'p:d' -> (p, d)。"""
+    parts = ref.strip().replace(":", ".").split(".")
+    if len(parts) != 2 or not (_PROJECT_RE.match(parts[0]) and _DATASET_RE.match(parts[1])):
+        raise ValueError(f"数据集格式应为 project.dataset: {ref}")
+    return parts[0], parts[1]
+
+
+def org_scope(org):
+    """组织数字 ID（或 organizations/<id>） -> organizations/<id>（校验为数字）。"""
+    o = str(org).strip()
+    o = o[len("organizations/"):] if o.startswith("organizations/") else o
+    if not _ORG_RE.match(o):
+        raise ValueError(f"组织 ID 应为数字: {org}")
+    return f"organizations/{o}"
+
+
+def project_scope(project):
+    """Project ID（全数字的 Project Number 也兼容） -> projects/<id>（校验格式）。"""
+    p = str(project).strip()
+    p = p[len("projects/"):] if p.startswith("projects/") else p
+    if not _PROJECT_RE.match(p):
+        raise ValueError(f"非法的项目 ID: {project}")
+    return f"projects/{p}"
+
+
 # --------------------------------------------------------------------------- #
-# 权限分类
+# 规则命名
 # --------------------------------------------------------------------------- #
-def classify_permissions(perms):
-    """返回 (can_read, can_write)。"""
-    perms = set(perms)
-    return READ_PERMISSION in perms, WRITE_PERMISSION in perms
+def _policy_name(prefix, email):
+    suffix = re.sub(r"[^a-z0-9]", "_", member_email(email))
+    name = prefix + suffix
+    if len(name) > POLICY_NAME_MAX:
+        digest = hashlib.sha1(suffix.encode()).hexdigest()[:8]
+        name = name[:POLICY_NAME_MAX - 9] + "_" + digest
+    return name
 
 
-_LEGACY_DATASET_ROLES = {
-    "READER": (True, False),
-    "WRITER": (True, True),
-    "OWNER": (True, True),
-}
+def bypass_policy_name(group_email):
+    """rls_bypass_full_access_<邮箱，小写，非字母数字换成 _>。"""
+    return _policy_name(BYPASS_PREFIX, group_email)
 
 
-def classify_legacy_dataset_role(role):
-    """数据集 ACL 中的 legacy 角色 -> (read, write)；非 legacy（roles/...）返回 None，由调用方展开。"""
-    return _LEGACY_DATASET_ROLES.get(role)
+def copilot_policy_name(email):
+    """rls_copilot_<邮箱，小写，非字母数字换成 _>。"""
+    return _policy_name(COPILOT_PREFIX, email)
+
+
+def is_bypass_policy(name):
+    return name.startswith(BYPASS_PREFIX) and len(name) > len(BYPASS_PREFIX)
 
 
 # --------------------------------------------------------------------------- #
-# Copilot SA 防混入
+# list_principals：主体抽取
 # --------------------------------------------------------------------------- #
-def is_copilot_member(member, copilot_members=(), copilot_patterns=()):
-    email = member_email(member)
-    explicit = {member_email(c) for c in copilot_members}
-    return email in explicit or any(fnmatch.fnmatch(email, p.lower()) for p in copilot_patterns)
-
-
-def filter_whitelist_members(members, copilot_members=(), copilot_patterns=()):
-    """返回 (allowed, rejected)，rejected 为命中 Copilot SA 名单/模式的主体。"""
-    allowed, rejected = [], []
-    for m in members:
-        (rejected if is_copilot_member(m, copilot_members, copilot_patterns) else allowed).append(m)
-    return allowed, rejected
-
+PRINCIPAL_COLUMNS = ["email", "principal_type", "home_project"]
 
 _SERVICE_AGENT_RE = re.compile(
-    r"^(service-\d+@.+\.gserviceaccount\.com"          # service-<项目号>@<服务>.iam.gserviceaccount.com
-    r"|[^@]+@gcp-sa-[a-z0-9\-]+\.iam\.gserviceaccount\.com"  # 任意前缀@gcp-sa-*（如 BigQuery 连接 bqcx-*）
+    r"^(service-\d+@.+\.gserviceaccount\.com"
+    r"|[^@]+@gcp-sa-[a-z0-9\-]+\.iam\.gserviceaccount\.com"
     r"|\d+@(cloudservices|cloudbuild)\.gserviceaccount\.com)$")
+_SA_HOME_RES = [
+    re.compile(r"^[^@]+@([a-z][a-z0-9\-]+)\.iam\.gserviceaccount\.com$"),
+    re.compile(r"^([a-z][a-z0-9\-]+)@appspot\.gserviceaccount\.com$"),
+    re.compile(r"^(\d+)-compute@developer\.gserviceaccount\.com$"),
+]
 
 
-def is_service_agent(member):
-    """Google 托管的服务代理（service-<项目号>@gcp-sa-*.iam.gserviceaccount.com 等）。"""
-    return bool(_SERVICE_AGENT_RE.match(member_email(member)))
+def is_service_agent(email):
+    return bool(_SERVICE_AGENT_RE.match(member_email(email)))
 
 
-IMPERSONATION_PERMISSIONS = {
-    "iam.serviceAccounts.getAccessToken", "iam.serviceAccounts.implicitDelegation",
-    "iam.serviceAccounts.signBlob", "iam.serviceAccounts.signJwt",
-    "iam.serviceAccounts.getOpenIdToken",
-}
+def principal_type(email):
+    e = member_email(email)
+    if is_service_agent(e):
+        return "serviceAgent"
+    return "serviceAccount" if e.endswith("gserviceaccount.com") else "user"
 
 
-def impersonation_risks(bindings, role_permissions, allowed=()):
+def sa_home_project(email):
+    """SA 邮箱反推所属项目（gcp-sa-* 等服务代理不算，返回空）。"""
+    e = member_email(email)
+    if is_service_agent(e):
+        return ""
+    for rx in _SA_HOME_RES:
+        m = rx.match(e)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def split_iam_members(members):
     """
-    项目级 IAM 中能扮演项目内任意 SA 的主体（会绕过"只有 API SA 能扮演权限 SA"的设计）。
-    role_permissions: role -> 权限列表 的函数。返回 [(member, role)]（排序）。
+    IAM 成员列表 -> (principals, groups)：user: / serviceAccount: 进 principals，group: 进 groups；
+    deleted:、domain:、allUsers 等非具体账号跳过。
     """
-    allowed = {member_email(a) for a in allowed}
-    risks = set()
-    for b in bindings:
-        if not IMPERSONATION_PERMISSIONS & set(role_permissions(b["role"]) or []):
+    principals, groups = set(), set()
+    for m in members:
+        if m.startswith("deleted:") or ":" not in m:
             continue
-        for m in b.get("members", []):
-            if member_email(m) not in allowed:
-                risks.add((normalize_member(m), b["role"]))
-    return sorted(risks)
+        prefix, _, rest = m.partition(":")
+        if prefix in ("user", "serviceAccount"):
+            principals.add(rest.lower())
+        elif prefix == "group":
+            groups.add(rest.lower())
+    return principals, groups
 
 
-def build_sa_whitelist_rows(sas, group, copilot_members=(), copilot_patterns=(),
-                            include_disabled=False, scope_emails=None):
+
+
+GET_DATA_PERMISSION = "bigquery.tables.getData"
+# 数据集旧式 ACL 角色 -> 对应的预定义角色（三者都含 bigquery.tables.getData）
+LEGACY_DATASET_ROLES = {"READER": "roles/bigquery.dataViewer", "WRITER": "roles/bigquery.dataEditor",
+                        "OWNER": "roles/bigquery.dataOwner"}
+
+
+def dataset_role_name(role):
+    """数据集 ACL 的 role 字段（READER / WRITER / OWNER 或 roles/...）-> IAM 角色名。"""
+    return LEGACY_DATASET_ROLES.get(role, role) if role else role
+
+
+def binding_members(bindings, role_ok):
     """
-    把项目内（及 IAM 绑定中出现的）全部 SA 生成白名单候选行，列与 scan_bq_access.py 的 CSV 兼容。
-    sas: [{"email","project","display_name","disabled","source"}]；同一 SA 多次出现会合并来源。
-    排除：Copilot SA；已禁用 SA（除非 include_disabled）。
-    scope_emails: 组织 / 文件夹范围内盘点到的 SA 集合；给出时，不在其中的 SA（其他组织的 SA，
-    或已删除的 SA）在 note 里标为"范围外"，照常建议加入但需要重点审核。
+    IAM 策略 bindings [{"role","members",("condition")}] -> (principals, groups)，只取 role_ok(role) 为真的绑定。
+    带条件的绑定同样纳入（宁可多列）。
     """
-    if group not in ("write", "read"):
-        raise ValueError(f"group 只能是 write 或 read: {group}")
-    merged = {}
-    for s in sas:
-        email = s["email"].lower()
-        m = merged.setdefault(email, {"display_name": s.get("display_name") or "",
-                                      "disabled": bool(s.get("disabled")), "sources": []})
-        src = f"{s.get('project', '')}:{s.get('source', 'project-sa')}"
-        if src not in m["sources"]:
-            m["sources"].append(src)
+    principals, groups = set(), set()
+    for bd in bindings:
+        if not role_ok(bd.get("role")):
+            continue
+        p, g = split_iam_members(bd.get("members", []))
+        principals |= p
+        groups |= g
+    return principals, groups
+
+
+def acl_members(entries, role_ok):
+    """
+    数据集 ACL 条目 [(role, entity_type, entity_id)] -> (principals, groups)，只取 role_ok(角色) 为真的条目。
+    userByEmail（含 SA 邮箱）-> principal；groupByEmail -> group；iamMember 按前缀；
+    specialGroup（projectReaders 等，已由项目 IAM 覆盖）/ domain / view / routine / dataset 跳过。
+    """
+    principals, groups = set(), set()
+    for role, etype, eid in entries:
+        if not isinstance(eid, str) or etype not in ("userByEmail", "groupByEmail", "iamMember"):
+            continue
+        if not role_ok(dataset_role_name(role)):
+            continue
+        if etype == "userByEmail":
+            principals.add(eid.strip().lower())
+        elif etype == "groupByEmail":
+            groups.add(eid.strip().lower())
+        else:
+            p, g = split_iam_members([eid])
+            principals |= p
+            groups |= g
+    return principals, groups
+
+
+def _member_type(email, mtype):
+    if mtype:
+        return mtype
+    return "SERVICE_ACCOUNT" if email.endswith("gserviceaccount.com") else "UNKNOWN"
+
+
+def expand_group(root, fetch, max_depth=10):
+    """
+    递归展开 Group。fetch(group_email) -> [(member_email, type)]，读不到时返回 None。
+    返回 (members, unresolved)：members {email: {"type", "via": [root, ..., 直接所在的组]}}；
+    unresolved [(group_email, via)]：读不到成员的嵌套组。
+    """
+    root = root.lower()
+    members, unresolved, visited = {}, [], set()
+    queue = [(root, [root])]
+    while queue:
+        group, path = queue.pop(0)
+        if group in visited:
+            continue
+        visited.add(group)
+        items = fetch(group)
+        if items is None:
+            if group != root:
+                unresolved.append((group, path[:-1]))
+            continue
+        for email, mtype in items:
+            email = email.lower()
+            t = _member_type(email, mtype)
+            if email not in members:
+                members[email] = {"type": t, "via": list(path)}
+            if t == "GROUP" and email not in visited and len(path) < max_depth:
+                queue.append((email, path + [email]))
+    return members, unresolved
+
+
+def is_excluded(email, members=(), patterns=()):
+    e = member_email(email)
+    return e in {member_email(m) for m in members} or any(fnmatch.fnmatch(e, p.lower()) for p in patterns)
+
+
+def build_principal_rows(emails, exclude_members=(), exclude_patterns=()):
+    """
+    主体邮箱集合 -> CSV 行（PRINCIPAL_COLUMNS，按邮箱排序）。三列都由邮箱本身推算：
+    principal_type 看邮箱后缀，home_project 从 SA 邮箱反推（user / 服务代理为空）。
+    """
     rows = []
-    for email, m in sorted(merged.items()):
-        principal = f"serviceAccount:{email}"
-        copilot = is_copilot_member(principal, copilot_members, copilot_patterns)
-        notes, suggested = [], group
-        if copilot:
-            suggested = ""
-            notes.append("Copilot SA，已排除出白名单")
-        elif m["disabled"] and not include_disabled:
-            suggested = ""
-            notes.append("SA 已禁用，默认不加入（--include-disabled 可加入）")
-        if is_service_agent(principal):
-            notes.append("Google 托管服务代理")
-        elif scope_emails is not None and email not in scope_emails:
-            notes.append("范围外 SA（其他组织的 SA 或已删除的 SA），拿不到禁用状态，请重点审核")
-        rows.append({
-            "principal": principal, "principal_type": "serviceAccount",
-            "can_read": "", "can_write": "", "suggested_group": suggested,
-            "sources": "; ".join(m["sources"]), "jobs_read_count": 0, "jobs_write_count": 0,
-            "copilot": copilot, "note": "; ".join(notes),
-            "display_name": m["display_name"], "disabled": m["disabled"],
-        })
+    for email in sorted({member_email(e) for e in emails}):
+        if is_excluded(email, exclude_members, exclude_patterns):
+            continue
+        rows.append({"email": email, "principal_type": principal_type(email), "home_project": sa_home_project(email)})
     return rows
 
 
@@ -211,8 +360,8 @@ def _validate_grantees(grantees):
 
 
 def build_policy_ddl(table, policy_name, grantees, filter_sql):
-    if not _COLUMN_RE.match(policy_name):
-        raise ValueError(f"非法的 policy 名称: {policy_name}")
+    if not _POLICY_RE.match(policy_name) or len(policy_name) > POLICY_NAME_MAX:
+        raise ValueError(f"非法的规则名: {policy_name}")
     _validate_grantees(grantees)
     grant = ", ".join(f'"{g}"' for g in grantees)
     return (f"CREATE OR REPLACE ROW ACCESS POLICY `{policy_name}`\n"
@@ -221,28 +370,103 @@ def build_policy_ddl(table, policy_name, grantees, filter_sql):
             f"FILTER USING ({filter_sql})")
 
 
-def sanitize_identifier(s):
-    return re.sub(r"[^A-Za-z0-9_]", "_", s)
+def drop_policy_ddl(table, policy_name):
+    if not _POLICY_RE.match(policy_name) or len(policy_name) > POLICY_NAME_MAX:
+        raise ValueError(f"非法的规则名: {policy_name}")
+    return f"DROP ROW ACCESS POLICY `{policy_name}` ON `{fq(table)}`"
 
 
-def build_bypass_policy_ddl(table, grantees, policy_name=BYPASS_POLICY):
-    return build_policy_ddl(table, policy_name, grantees, "TRUE")
+def drop_all_ddl(table):
+    return f"DROP ALL ROW ACCESS POLICIES ON `{fq(table)}`"
+
+
+def copilot_group(value):
+    """
+    --group 的值 -> 规范化的 Group 邮箱（小写）。必须是裸邮箱（不能带 group: 等前缀），不能是 SA 邮箱；
+    引号 / 反引号 / 反斜杠等会被拒绝（防止转义出 DDL 字符串）。
+    """
+    e = str(value).strip().lower()
+    if not _EMAIL_RE.match(e) or any(ch in e for ch in "\"'`\\ "):
+        raise ValueError(f"--group 应为 Group 邮箱（如 group_copilot@domain.com，不带 group: 前缀）: {value!r}")
+    if e.endswith("gserviceaccount.com"):
+        raise ValueError(f"--group 不能是 SA 邮箱: {value!r}")
+    return e
+
+
+def invalid_sa_values(raw_values):
+    """条件表 sa 列里不是裸邮箱的原值（带 user: / group: 等前缀、allUsers、乱码）：永远匹配不到 SESSION_USER()。"""
+    return sorted({v for v in raw_values if isinstance(v, str) and not _EMAIL_RE.match(v.strip().lower())})
+
+
+def duplicate_sa_values(counts):
+    """{sa 原值: 行数} -> 有多行的 sa（各维度独立判断时，多行会产生交叉组合）。"""
+    return sorted(sa for sa, n in counts.items() if n > 1)
+
+
+# --------------------------------------------------------------------------- #
+# apply_copilot_rls：维度、选表、过滤条件
+# --------------------------------------------------------------------------- #
+_TYPE_ALIASES = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL", "STRUCT": "RECORD"}
+_FILTERABLE_TYPES = {"STRING", "INT64", "NUMERIC", "BIGNUMERIC", "BOOL", "DATE"}
+_CONDITION_KEYS = {"id", "sa"}
+
+
+def condition_dimensions(fields):
+    """
+    条件表字段 [(name, type, mode)] -> (维度列表, 警告)。
+    维度 = 除 id、sa 外的列；只有 REPEATED STRING（ARRAY<STRING>）列可用作维度，其他列给警告并忽略。
+    """
+    names = {n.lower() for n, _, _ in fields}
+    if "sa" not in names:
+        raise ValueError("条件表缺少 sa 列")
+    dims, warns = [], []
+    for name, ftype, mode in fields:
+        if name.lower() in _CONDITION_KEYS:
+            continue
+        if not _IDENT_RE.match(name):
+            warns.append(f"条件表列 {name!r} 含有特殊字符，不作为维度")
+        elif _TYPE_ALIASES.get(ftype, ftype) == "STRING" and (mode or "").upper() == "REPEATED":
+            dims.append(name.lower())
+        else:
+            warns.append(f"条件表列 {name}（{ftype} {mode}）不是 ARRAY<STRING>，不作为维度")
+    return dims, warns
 
 
 def _validate_column_path(col):
     parts = col.split(".")
-    if not all(_COLUMN_RE.match(x) for x in parts):
+    if not all(_IDENT_RE.match(x) for x in parts):
         raise ValueError(f"非法的列名: {col}")
     return parts
 
 
-def _validate_mapping(mapping):
-    if not mapping:
-        raise ValueError("过滤字段映射为空")
-    for col, dim in mapping:
-        if dim not in DIMENSIONS:
-            raise ValueError(f"未知维度 {dim}，只支持 {DIMENSIONS}")
-        _validate_column_path(col)
+def select_copilot_tables(rows, dimensions, default_project=None):
+    """
+    映射表行 -> ({fq_table: [(col_name, dim)]}, 忽略原因列表)。
+    只看 to_name：to_name 属于维度的行才算；无效行忽略；一张表全部无效则整张表不出现。
+    """
+    dims = {d.lower() for d in dimensions}
+    mapping, ignored = {}, []
+    for r in rows:
+        table_name = str(r.get("table_name") or "").strip()
+        col = str(r.get("col_name") or "").strip()
+        dim = str(r.get("to_name") or "").strip().lower()
+        try:
+            table = fq(table_name, default_project)
+        except ValueError as e:
+            ignored.append(f"{table_name}: {e}")
+            continue
+        if dim not in dims:
+            ignored.append(f"{table}: to_name={dim or '(空)'} 不是条件表的维度，忽略该映射行")
+            continue
+        try:
+            _validate_column_path(col)
+        except ValueError as e:
+            ignored.append(f"{table}: {e}")
+            continue
+        lst = mapping.setdefault(table, [])
+        if (col, dim) not in lst:
+            lst.append((col, dim))
+    return mapping, ignored
 
 
 def _column_expr(col, column_types):
@@ -253,37 +477,26 @@ def _column_expr(col, column_types):
     return expr
 
 
-def build_copilot_filter(mapping, condition_table, column_types=None, case_insensitive=False):
+def build_copilot_filter(mapping, condition_table, column_types=None):
     """
-    mapping: [(目标表列名, 维度名)]，列名可为嵌套路径 a.b；维度名 ∈ region/prdtype/refername。
-    column_types: {列名: BigQuery 类型}，非 STRING 列会 CAST 为 STRING 再与条件表匹配。
-    case_insensitive: 两侧都用 UPPER() 比较（R6 大小写标准化）。
-    每个维度：列值 ∈ UNNEST(条件数组)，或条件数组为 NULL/空 时全量放行；多维度 AND。
+    mapping: [(目标表列名 col_name, 维度 to_name)]。每个维度一段，多段 AND：
+      列值 ∈ UNNEST(条件表.<维度>)（当前查询者 SESSION_USER() 的行）
+      OR 当前查询者该维度为 NULL / 空数组（全部可见）
     """
-    _validate_mapping(mapping)
+    if not mapping:
+        raise ValueError("过滤字段映射为空")
     cond = fq(condition_table)
     clauses = []
     for col, dim in mapping:
-        lhs, rhs = _column_expr(col, column_types), "v"
-        if case_insensitive:
-            lhs, rhs = f"UPPER({lhs})", "UPPER(v)"
+        if not _IDENT_RE.match(dim):
+            raise ValueError(f"非法的维度名: {dim}")
+        lhs = _column_expr(col, column_types)
         clauses.append(
-            f"({lhs} IN (SELECT {rhs} FROM `{cond}` AS c, "
-            f"UNNEST(c.{dim}) AS v WHERE c.sa = SESSION_USER()) "
+            f"({lhs} IN (SELECT v FROM `{cond}` AS c, UNNEST(c.{dim}) AS v "
+            f"WHERE c.sa = SESSION_USER()) "
             f"OR EXISTS (SELECT 1 FROM `{cond}` AS c WHERE c.sa = SESSION_USER() "
             f"AND (c.{dim} IS NULL OR ARRAY_LENGTH(c.{dim}) = 0)))")
     return " AND ".join(clauses)
-
-
-def build_copilot_policy_ddl(table, mapping, condition_table, grantees,
-                             policy_name=COPILOT_POLICY, column_types=None, case_insensitive=False):
-    return build_policy_ddl(table, policy_name, grantees,
-                            build_copilot_filter(mapping, condition_table, column_types,
-                                                 case_insensitive))
-
-
-_TYPE_ALIASES = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL", "STRUCT": "RECORD"}
-_FILTERABLE_TYPES = {"STRING", "INT64", "NUMERIC", "BIGNUMERIC", "BOOL", "DATE"}
 
 
 def flatten_schema(fields, prefix=""):
@@ -318,38 +531,22 @@ def validate_mapping_against_schema(mapping, schema):
     return errors
 
 
-def parse_mapping_rows(rows, default_project=None):
-    """
-    adm_user_mem_copilot_tb_col_mapping 行 -> {fq_table: [(col_name, to_name), ...]}
-    """
-    out = {}
-    for r in rows:
-        table = fq(r["table_name"], default_project)
-        dim = str(r["to_name"]).strip().lower()
-        col = str(r["col_name"]).strip()
-        _validate_mapping([(col, dim)])
-        lst = out.setdefault(table, [])
-        if (col, dim) not in lst:
-            lst.append((col, dim))
-    return out
-
-
 # --------------------------------------------------------------------------- #
-# 策略合并计划
+# 计划
 # --------------------------------------------------------------------------- #
 _STRING_LITERAL_RE = re.compile(r"('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")")
 _PUNCT_SPACE_RE = re.compile(r"\s*([(),.=<>+\-*/])\s*")
 
 
+@functools.lru_cache(maxsize=65536)
 def normalize_filter(s):
     """
-    规范化过滤条件以便比较：BigQuery 存储时会重新排版（去掉简单标识符的反引号、换行缩进、
-    'EXISTS (' -> 'EXISTS('）。字符串字面量之外：去反引号、统一小写、压缩空白、去掉标点两侧空白；
-    字符串字面量原样保留（'HK' 与 'hk' 不同）。
+    规范化过滤条件以便比较：BigQuery 存储时会重新排版（去掉反引号、换行缩进、'EXISTS (' -> 'EXISTS('）。
+    字符串字面量之外：去反引号、统一小写、压缩空白、去掉标点两侧空白；字符串字面量原样保留。
     """
     out = []
     for i, part in enumerate(_STRING_LITERAL_RE.split(str(s))):
-        if i % 2:          # 字符串字面量
+        if i % 2:
             out.append(part)
             continue
         part = " ".join(part.replace("`", "").lower().split())
@@ -360,190 +557,73 @@ def normalize_filter(s):
 
 @dataclass
 class PolicyPlan:
-    action: str               # create / noop / replace / conflict
-    grantees: list
-    first_policy: bool
+    action: str               # create / noop / replace / collision
+    first_policy: bool        # 表上原本没有任何规则
+    old: dict = None          # replace / collision 时的现有规则
     reason: str = ""
 
 
-def plan_policy_upsert(existing, policy_name, filter_sql, grantees, merge=False):
+def plan_upsert(existing, policy_name, filter_sql, grantees, check_collision=False):
     """
-    existing: [{"id","filter","grantees"}]
-    - 不存在同名 policy -> create
-    - 同名且过滤条件、授权对象一致 -> noop
-    - 同名但授权对象不同: merge=True -> replace(并集)，否则 conflict
-    - 同名但过滤条件不同 -> conflict（避免覆盖别人的 policy）
+    existing: 表上现有规则 [{"id","filter","grantees"}]
+    - 无同名规则 -> create
+    - 同名且过滤条件、授权对象都相同 -> noop
+    - 同名但内容不同 -> replace
+    - check_collision 且同名规则的授权对象里没有本次的主体（邮箱替换后撞名）-> collision
     """
-    want = list(dict.fromkeys(normalize_member(g) for g in grantees))
+    want = {normalize_member(g) for g in grantees}
     first = len(existing) == 0
     cur = next((p for p in existing if p["id"] == policy_name), None)
     if cur is None:
-        return PolicyPlan("create", want, first)
-    if normalize_filter(cur["filter"]) != normalize_filter(filter_sql):
-        return PolicyPlan("conflict", want, first,
-                          f"同名 policy 过滤条件不同: {cur['filter']}")
+        return PolicyPlan("create", first)
     have = {normalize_member(g) for g in cur["grantees"]}
-    if have == set(want):
-        return PolicyPlan("noop", sorted(have), first)
-    if not merge:
-        return PolicyPlan("conflict", want, first,
-                          f"同名 policy 授权对象不同: {sorted(have)}")
-    union = sorted(have | set(want))
-    if set(union) == have:
-        return PolicyPlan("noop", union, first)
-    return PolicyPlan("replace", union, first)
+    if check_collision and not (want & have):
+        return PolicyPlan("collision", first, cur,
+                          f"规则名 {policy_name} 已被其他主体使用: {sorted(member_email(g) for g in have)}")
+    if have == want and normalize_filter(cur["filter"]) == normalize_filter(filter_sql):
+        return PolicyPlan("noop", first, cur)
+    return PolicyPlan("replace", first, cur)
 
 
-# --------------------------------------------------------------------------- #
-# 回退计划
-# --------------------------------------------------------------------------- #
+def remaining_policy_slots(existing_count):
+    return max(0, MAX_POLICIES_PER_TABLE - existing_count)
+
+
 @dataclass
 class RollbackPlan:
     to_drop: list = field(default_factory=list)
-    to_update: list = field(default_factory=list)   # [(policy, remaining_grantees)]
-    drop_all: bool = False
+    drop_all: bool = False        # 表上所有规则都将被删除（需用 DROP ALL）
 
 
-def plan_rollback(policies, members, strip_only=False, policy_names=None):
+def plan_rollback(policies, principals=None, policy_names=None):
     """
-    members 为空 -> 删除（policy_names 范围内的）全部 policy
-    否则       -> 删除授权对象含任一 member 的 policy；strip_only 时仅剥离这些 member
-    drop_all: 表上所有 policy 都将被删除（需用 DROP ALL，规避"不能删最后一条"的限制）
+    principals: 邮箱集合（不分类型）；规则授权对象里有其中任一邮箱即匹配。
+    policy_names: 规则名集合。两者都给时取交集；都不给时选中全部规则。
     """
-    members = {normalize_member(m) for m in members}
-    candidates = [p for p in policies if not policy_names or p["id"] in policy_names]
+    emails = {member_email(p) for p in principals} if principals else None
+    names = set(policy_names) if policy_names else None
     plan = RollbackPlan()
-    for p in candidates:
-        if not members:
-            plan.to_drop.append(p)
+    for p in policies:
+        if names is not None and p["id"] not in names:
             continue
-        norm = [normalize_member(g) for g in p["grantees"]]
-        if not set(norm) & members:
+        if emails is not None and not ({member_email(g) for g in p["grantees"]} & emails):
             continue
-        others = [g for g, n in zip(p["grantees"], norm) if n not in members]
-        if strip_only and others:
-            plan.to_update.append((p, others))
-        else:
-            plan.to_drop.append(p)
+        plan.to_drop.append(p)
     plan.drop_all = bool(plan.to_drop) and len(plan.to_drop) == len(policies)
     return plan
 
 
 # --------------------------------------------------------------------------- #
-# 巡检
-# --------------------------------------------------------------------------- #
-def inspect_policies(policies, bypass_grantees, copilot_grantees, expected_copilot_filter,
-                     bypass_name=BYPASS_POLICY, copilot_name=COPILOT_POLICY):
-    """返回问题列表（空 = 正常）。expected_copilot_filter 为 None 时不检查 Copilot policy。"""
-    issues = []
-    by_id = {p["id"]: p for p in policies}
-
-    def check(name, grantees, expected_filter, filter_desc):
-        p = by_id.get(name)
-        if p is None:
-            issues.append(f"`{name}` 缺失")
-            return
-        if normalize_filter(p["filter"]) != normalize_filter(expected_filter):
-            issues.append(f"`{name}` {filter_desc}: {p['filter']}")
-        have = {normalize_member(g) for g in p["grantees"]}
-        for g in grantees:
-            if normalize_member(g) not in have:
-                issues.append(f"`{name}` 缺少授权对象 {g}")
-
-    check(bypass_name, bypass_grantees, "TRUE", "过滤条件不是 TRUE")
-    if expected_copilot_filter is not None:
-        check(copilot_name, copilot_grantees, expected_copilot_filter, "过滤条件与映射表不一致")
-    return issues
-
-
-def inspect_whitelist_membership(group_members, copilot_members=(), copilot_patterns=()):
-    """group_members: {group: [members]}；返回白名单组中混入 Copilot SA 的问题。"""
-    issues = []
-    for group, members in group_members.items():
-        _, bad = filter_whitelist_members(members, copilot_members, copilot_patterns)
-        issues.extend(f"白名单组 {group} 中混入 Copilot SA: {m}" for m in bad)
-    return issues
-
-
-# --------------------------------------------------------------------------- #
-# 其他
-# --------------------------------------------------------------------------- #
-def check_sa_quota(existing, to_create, limit=SA_PER_PROJECT_LIMIT):
-    if existing + to_create > limit:
-        raise ValueError(
-            f"SA 数量将达到 {existing + to_create}，超过单项目默认上限 {limit}；"
-            f"请复用 SA 或申请配额")
-
-
-def sa_account_id(s):
-    aid = s.split("@")[0].strip().lower() if "@" in s else s.strip()
-    if not _SA_ID_RE.match(aid):
-        raise ValueError(f"非法的 SA account id（6-30 位小写字母/数字/-，字母开头）: {s}")
-    return aid
-
-
-def sa_email(account_id, project):
-    return f"{sa_account_id(account_id)}@{project}.iam.gserviceaccount.com"
-
-
-_JOBS_VIEWS = {"project": "JOBS_BY_PROJECT", "organization": "JOBS_BY_ORGANIZATION"}
-
-
-def _jobs_view(project, region, scope):
-    if not _PROJECT_RE.match(project) or not _REGION_RE.match(region):
-        raise ValueError(f"非法的 project/region: {project} / {region}")
-    if scope not in _JOBS_VIEWS:
-        raise ValueError(f"scope 只能是 {sorted(_JOBS_VIEWS)}: {scope}")
-    return f"`{project}`.`region-{region}`.INFORMATION_SCHEMA.{_JOBS_VIEWS[scope]}"
-
-
-def jobs_access_sql(project, region, days, scope="project"):
-    """
-    统计最近 N 天真实读/写过目标表的账号（参数 @tables: ARRAY<STRING> of 'p.d.t'）。
-    READ: referenced_tables 包含目标表；WRITE: destination_table 为目标表的 LOAD/COPY/DML/CTAS。
-    scope=organization 时查 JOBS_BY_ORGANIZATION（需要组织级 bigquery.jobs.listAll），可覆盖跨项目作业。
-    """
-    return f"""
-WITH j AS (
-  SELECT user_email, job_type, statement_type, referenced_tables, destination_table
-  FROM {_jobs_view(project, region, scope)}
-  WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
-),
-acc AS (
-  SELECT user_email, CONCAT(t.project_id, '.', t.dataset_id, '.', t.table_id) AS tbl, 'READ' AS mode
-  FROM j, UNNEST(referenced_tables) AS t
-  UNION ALL
-  SELECT user_email,
-         CONCAT(destination_table.project_id, '.', destination_table.dataset_id, '.',
-                destination_table.table_id) AS tbl,
-         'WRITE' AS mode
-  FROM j
-  WHERE destination_table.table_id IS NOT NULL
-    AND (job_type IN ('LOAD', 'COPY')
-         OR statement_type IN ('INSERT', 'UPDATE', 'DELETE', 'MERGE',
-                               'CREATE_TABLE_AS_SELECT', 'TRUNCATE_TABLE'))
-)
-SELECT LOWER(user_email) AS user_email, tbl, mode, COUNT(*) AS job_count
-FROM acc
-WHERE tbl IN UNNEST(@tables)
-GROUP BY 1, 2, 3
-"""
-
-
-# --------------------------------------------------------------------------- #
-# C1 挂载后验证 / 探针：按分区要求生成探测 SQL
+# 挂载后验证 SQL
 # --------------------------------------------------------------------------- #
 def visibility_probe_sql(table, partitioning, mode="sample"):
     """
-    partitioning: None 或 {"require_filter": bool, "field": str|None, "kind": "time"|"range"}
-    mode=sample: SELECT 1 ... LIMIT 1（能看到任意一行即说明命中了 TRUE 策略，扫描量极小）
-    mode=count : SELECT COUNT(*)（用于与元数据行数比对，大表成本高）
+    mode=sample: SELECT 1 ... LIMIT 1；mode=count: SELECT COUNT(*)。
     表要求分区过滤时自动加 <分区列> IS NOT NULL（摄取时间分区用 _PARTITIONTIME）。
     """
     where = ""
     if partitioning and partitioning.get("require_filter"):
-        field = partitioning.get("field")
-        col = f"`{field}`" if field else "_PARTITIONTIME"
+        col = f"`{partitioning['field']}`" if partitioning.get("field") else "_PARTITIONTIME"
         where = f" WHERE {col} IS NOT NULL"
     if mode == "count":
         return f"SELECT COUNT(*) AS n FROM `{fq(table)}`{where}"
@@ -551,466 +631,60 @@ def visibility_probe_sql(table, partitioning, mode="sample"):
 
 
 # --------------------------------------------------------------------------- #
-# C3 Reservation 版本前置检查
+# Copilot 审核 CSV
 # --------------------------------------------------------------------------- #
-def edition_usage_sql(project, region, days=7):
-    """最近 N 天查询作业按 edition / reservation 的分布（edition 为 NULL 表示按需）。"""
-    return f"""
-SELECT edition, reservation_id, COUNT(*) AS n
-FROM {_jobs_view(project, region, "project")}
-WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
-  AND job_type = 'QUERY'
-GROUP BY 1, 2
-"""
+COPILOT_PLAN_COLUMNS = ["table", "policy_name", "action", "dimensions", "filter", "note"]
+COPILOT_PLAN_COLUMNS_APPLY = COPILOT_PLAN_COLUMNS + ["result"]
+
+_CSV_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
 
 
-def standard_edition_usage(rows):
-    """返回 [(reservation_id, 作业数)]，仅 STANDARD 版本（RLS 不支持 Standard，查询会失败）。"""
-    return [(r.get("reservation_id"), r.get("n", 0)) for r in rows
-            if (r.get("edition") or "").upper() == "STANDARD"]
+def csv_safe(value):
+    """输出到 CSV 前处理：以 = + - @ 制表符 回车 开头的字符串前加单引号，防止被 Excel 当作公式执行（CSV 注入）。"""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIX):
+        return "'" + value
+    return value
 
 
-# --------------------------------------------------------------------------- #
-# E2 巡检：Copilot SA 归属 / 条件行 / API SA / 条件表聚簇
-# --------------------------------------------------------------------------- #
-def inspect_copilot_membership(group_members, condition_sas, api_sa=None):
-    """
-    group_members: {copilot_group: {sa_email}}；condition_sas: 条件表中出现的 sa（小写）
-    返回 (issues, warnings)：
-      issue  : SA 同时在多个 Copilot 组；API SA 出现在 Copilot 组
-      warning: Copilot 组成员没有条件行（会查不到任何数据）；条件行的 sa 不在任何 Copilot 组
-    """
-    issues, warns = [], []
-    where = {}
-    for g, members in group_members.items():
-        for m in members:
-            where.setdefault(member_email(m), []).append(g)
-    api = member_email(api_sa) if api_sa else None
-    cond = {s.lower() for s in condition_sas}
-    for sa, groups in sorted(where.items()):
-        if len(groups) > 1:
-            issues.append(f"{sa} 同时属于多个 Copilot 组 {sorted(groups)}（约定一 SA 一组）")
-        if api and sa == api:
-            issues.append(f"API SA {sa} 出现在 Copilot 组 {sorted(groups)} 中（API SA 不应直接查询）")
-        elif sa not in cond:
-            warns.append(f"{sa} 在 Copilot 组中但条件表没有条件行（该 SA 将查不到任何数据）")
-    for sa in sorted(cond - set(where)):
-        warns.append(f"条件表中的 {sa} 不在任何 Copilot 组（没有表级权限，条件不会生效）")
-    return issues, warns
+def csv_safe_row(row):
+    return {k: csv_safe(v) for k, v in row.items()}
 
 
-def inspect_condition_clustering(clustering_fields):
-    fields = list(clustering_fields or [])
-    if not fields or fields[0] != "sa":
-        return [f"条件表未按 sa 聚簇（当前 CLUSTER BY {fields or '无'}），RLS 子查询会扫描整表"]
-    return []
+def unnormalized_sa_values(raw_values):
+    """条件表 sa 列里不是「小写且无首尾空白」的原值。RLS 子查询按原值与 SESSION_USER() 精确比较，这些账号会查到 0 行。"""
+    return sorted({v for v in raw_values if isinstance(v, str) and v != v.strip().lower()})
 
 
 # --------------------------------------------------------------------------- #
-# E3 通配符表查询检测（R5：有 RLS 的表不支持 table_* 查询）
+# apply_bypass_rls：登记表（adm_user_mem_copilot_tb）
 # --------------------------------------------------------------------------- #
-def wildcard_pattern(datasets):
+REGISTRY_INT_TYPES = ("INTEGER", "INT64")
+
+
+def validate_registry_fields(fields):
+    """登记表必须有 table_name（STRING）和 rls_enabled（INT64）两列，且都不是数组；否则抛 ValueError。"""
+    by_name = {name: (ftype, mode) for name, ftype, mode in fields}
+    for col, types in (("table_name", ("STRING",)), ("rls_enabled", REGISTRY_INT_TYPES)):
+        if col not in by_name:
+            raise ValueError(f"登记表缺少 {col} 列")
+        ftype, mode = by_name[col]
+        if ftype not in types or mode == "REPEATED":
+            raise ValueError(f"登记表 {col} 列类型应为 {'/'.join(types)}（非数组），实际为 {ftype} {mode}")
+
+
+def registry_status(rows):
     """
-    匹配 SQL 文本中对目标数据集的通配符表引用，如 `proj.dw.fact_*` 或 dw.events_*。
-    datasets: ['project.dataset', ...]；项目限定可选（同名数据集的跨项目引用也会命中，宁多勿漏）。
+    {table_name 原值: "enabled" | "disabled" | "conflict"}。table_name 按原始字符串比较，不做任何规范化；不看 status。
+      所有行 rls_enabled == 1        -> enabled
+      所有行 rls_enabled != 1        -> disabled（含 NULL / 其它数值）
+      既有 1 又有其它值（同名多行）  -> conflict（按未开启处理）
     """
-    alts = []
-    for d in datasets:
-        p, ds = d.replace(":", ".").split(".")
-        alts.append(rf"(?:{re.escape(p)}[.:])?{re.escape(ds)}\.[A-Za-z0-9_]*\*")
-    return r"(?i)`?(?:" + "|".join(alts) + r")`?"
-
-
-def wildcard_jobs_sql(project, region, days, scope="project"):
-    """最近 N 天使用过通配符表查询目标数据集的账号（参数 @pattern: STRING 正则）。"""
-    return f"""
-SELECT LOWER(user_email) AS user_email, COUNT(*) AS job_count
-FROM {_jobs_view(project, region, scope)}
-WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
-  AND job_type = 'QUERY' AND query IS NOT NULL
-  AND REGEXP_CONTAINS(query, @pattern)
-GROUP BY 1
-"""
-
-
-# --------------------------------------------------------------------------- #
-# 客户权限表（文档「1014 最新权限表架构解析」8 张表中脚本会用到的 6 张）
-# --------------------------------------------------------------------------- #
-AUTH_TABLES = {
-    "condition": "adm_user_mem_copilot_condition",      # RLS Lookup 主表：sa + 三个维度数组
-    "mapping": "adm_user_mem_copilot_tb_col_mapping",   # 目标表过滤字段映射
-    "group": "adm_user_mem_copilot_group",              # 表级权限组字典：id, group（Group 邮箱）
-    "grant": "adm_user_mem_copilot_grant_tb",           # Group -> 授权表范围：group_id, table_name
-    "bind": "adm_user_mem_copilot_user_bind",           # 用户绑定：condition_id(-> sa), group_id
-    "acl": "adm_user_mem_copilot_acl_group_sa",         # 全量白名单名册：sa, acl_group
-}
-
-
-def auth_table(key, dataset=None, override=None):
-    """权限表全名：显式 --xxx-table 优先，否则 --auth-dataset + 文档默认表名。"""
-    if override:
-        return fq(override)
-    if not dataset:
-        raise ValueError(f"需要 --auth-dataset 或 --{key}-table")
-    parts = dataset.strip().replace(":", ".").split(".")
-    if len(parts) != 2 or not (_PROJECT_RE.match(parts[0]) and _DATASET_RE.match(parts[1])):
-        raise ValueError(f"--auth-dataset 格式应为 project.dataset: {dataset}")
-    return f"{parts[0]}.{parts[1]}.{AUTH_TABLES[key]}"
-
-
-def bind_sa_group_sql(bind_table, condition_table, group_table):
-    """用户绑定表 -> (sa, group)：bind.condition_id -> condition.sa；bind.group_id -> group.group。"""
-    b, c, g = fq(bind_table), fq(condition_table), fq(group_table)
-    return (f"SELECT DISTINCT LOWER(c.sa) AS sa, LOWER(g.`group`) AS grp\n"
-            f"FROM `{b}` AS b\n"
-            f"JOIN `{c}` AS c ON c.id = b.condition_id\n"
-            f"JOIN `{g}` AS g ON g.id = b.group_id\n"
-            f"WHERE c.sa IS NOT NULL AND g.`group` IS NOT NULL")
-
-
-def grant_scope_sql(grant_table, group_table):
-    """Group 授权范围表 -> (group, resource)：grant_tb.group_id -> group.group。"""
-    t, g = fq(grant_table), fq(group_table)
-    return (f"SELECT DISTINCT LOWER(g.`group`) AS grp, t.table_name AS resource\n"
-            f"FROM `{t}` AS t\n"
-            f"JOIN `{g}` AS g ON g.id = t.group_id\n"
-            f"WHERE t.table_name IS NOT NULL")
-
-
-def _first(row, *keys):
-    for k in keys:
-        v = row.get(k)
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    return ""
-
-
-def parse_sa_rows(rows):
-    """
-    权限 SA 清单行 -> [(account_id, group_email, display_name)]，去重。
-    兼容 CSV 列（account_id, group[, display_name]）和表查询列（sa, grp）。
-    """
-    out, seen = [], set()
-    for i, r in enumerate(rows, 1):
-        sa, grp = _first(r, "account_id", "sa"), _first(r, "group", "grp")
-        if not sa or not grp:
-            raise ValueError(f"第 {i} 行缺少 account_id/sa 或 group: {r}")
-        item = (sa_account_id(sa), grp.lower(), _first(r, "display_name") or None)
-        if item[:2] not in seen:
-            seen.add(item[:2])
-            out.append(item)
-    return out
-
-
-def sa_group_conflicts(sas):
-    """「一 SA 一 Group」校验：返回 {account_id: [group, ...]}，只含映射到多个 Group 的 SA。"""
-    groups = {}
-    for aid, grp, _ in sas:
-        groups.setdefault(aid, set()).add(grp)
-    return {aid: sorted(g) for aid, g in sorted(groups.items()) if len(g) > 1}
-
-
-def parse_grant_rows(rows):
-    """授权范围行 -> [(group_email, resource)]；resource 为 p.d.t（表级）或 p.d（数据集级），去重。"""
-    out, seen = [], set()
-    for i, r in enumerate(rows, 1):
-        grp, res = _first(r, "group", "grp"), _first(r, "resource", "table_name")
-        if not grp or not res:
-            raise ValueError(f"第 {i} 行缺少 group 或 resource: {r}")
-        res = res.replace(":", ".")
-        res = fq(res) if res.count(".") == 2 else res
-        item = (grp.lower(), res)
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def resolve_acl_group(value, write_group=None, read_group=None):
-    """
-    白名单名册的 acl_group -> 白名单 Group 邮箱。
-    接受：Group 邮箱（必须等于 --write-group / --read-group），或以 write / read 结尾的标识
-    （如 group_full_write、full_read、WRITE）。
-    """
-    v = (value or "").strip().lower()
-    w, r = (write_group or "").lower() or None, (read_group or "").lower() or None
-    if "@" in v:
-        if v in (w, r):
-            return v
-        raise ValueError(f"名册中的 acl_group {value} 不是 --write-group / --read-group 指定的 Group")
-    if v.endswith("write"):
-        if not w:
-            raise ValueError(f"名册中 acl_group={value} 属于写白名单，但未指定 --write-group")
-        return w
-    if v.endswith("read"):
-        if not r:
-            raise ValueError(f"名册中 acl_group={value} 属于读白名单，但未指定 --read-group")
-        return r
-    raise ValueError(f"无法识别的 acl_group: {value}（应为 Group 邮箱，或以 write / read 结尾）")
-
-
-def acl_roster(rows, write_group=None, read_group=None):
-    """名册行 [{sa, acl_group}] -> {group_email: [规范化成员, ...]}；所有错误汇总后一次抛出。"""
-    plan, errors = {}, []
-    for i, r in enumerate(rows, 1):
-        sa = _first(r, "sa")
-        if not sa:
-            errors.append(f"第 {i} 行 sa 为空")
+    seen = {}
+    for r in rows:
+        name = r.get("table_name")
+        if name is None:
             continue
-        try:
-            grp = resolve_acl_group(_first(r, "acl_group"), write_group, read_group)
-        except ValueError as e:
-            errors.append(f"第 {i} 行（{sa}）: {e}")
-            continue
-        members = plan.setdefault(grp, [])
-        m = normalize_member(sa, "user")
-        if m not in members:
-            members.append(m)
-    if errors:
-        raise ValueError("白名单名册有误:\n  " + "\n  ".join(errors))
-    return plan
-
-
-def inspect_acl_roster(actual, roster, ignore=()):
-    """
-    把名册当作白名单的事实来源，与 Group 实际成员双向比对。
-    actual / roster: {group_email: 可迭代的成员邮箱}；ignore: 忽略的账号（如探针 SA）。
-    """
-    ign = {m.lower() for m in ignore}
-    issues = []
-    for g in sorted(set(actual) | set(roster)):
-        a = {m.lower() for m in actual.get(g, ())} - ign
-        r = {m.lower() for m in roster.get(g, ())} - ign
-        for m in sorted(a - r):
-            issues.append(f"白名单组 {g} 的成员 {m} 不在白名单名册中（来历不明的全量权限，请补录名册或移出组）")
-        for m in sorted(r - a):
-            issues.append(f"白名单名册中的 {m} 还没有加入 {g}（存量任务可能查不到数据，请热修补）")
-    return issues
-
-
-# --------------------------------------------------------------------------- #
-# SA 所属项目反推 / Cloud Asset Inventory（组织级 SA 盘点，不依赖项目列表）
-# --------------------------------------------------------------------------- #
-_SA_HOME_RES = [
-    re.compile(r"^[^@]+@([a-z0-9][a-z0-9\-]*)\.iam\.gserviceaccount\.com$"),   # 用户自建 SA
-    re.compile(r"^([a-z0-9][a-z0-9\-]*)@appspot\.gserviceaccount\.com$"),       # App Engine 默认 SA
-    re.compile(r"^(\d+)-compute@developer\.gserviceaccount\.com$"),             # 默认计算 SA（项目号）
-]   # Google 托管服务代理（含 <项目号>@cloudservices）不算：它们不是客户需要盘点的 SA
-
-
-def sa_home_project(principal):
-    """SA 邮箱（可带前缀）-> 所属项目 ID 或项目号；非 SA / Google 托管服务代理返回 None。"""
-    e = principal.strip().lower()
-    if ":" in e:
-        prefix, _, e = e.partition(":")
-        if prefix != "serviceaccount":
-            return None
-    if is_service_agent(f"serviceAccount:{e}"):
-        return None
-    for rx in _SA_HOME_RES:
-        m = rx.match(e)
-        if m:
-            return m.group(1)
-    return None
-
-
-def sa_home_projects(principals):
-    """去重排序后的 SA 所属项目列表（可作为 list_project_sas.py 的项目列表）。"""
-    return sorted({p for p in (sa_home_project(x) for x in principals) if p})
-
-
-def asset_scope(organization=None, folder=None):
-    """Cloud Asset Inventory 搜索范围：organizations/<id> 或 folders/<id>。"""
-    if organization:
-        o = str(organization).strip()
-        return o if o.startswith("organizations/") else f"organizations/{o}"
-    if folder:
-        f = str(folder).strip()
-        return f if f.startswith("folders/") else f"folders/{f}"
-    raise ValueError("需要 --organization 或 --folder")
-
-
-def asset_resource_short(full_name):
-    """'//bigquery.googleapis.com/projects/p/datasets/d/tables/t' -> 'projects/p/datasets/d/tables/t'。"""
-    name = full_name or ""
-    if name.startswith("//"):
-        name = name[2:].split("/", 1)[1] if "/" in name[2:] else name[2:]
-    return name
-
-
-def asset_sa_rows(results):
-    """
-    Cloud Asset searchAllResources(assetTypes=iam.googleapis.com/ServiceAccount) 的结果
-    -> [{"email","project","display_name","disabled","source"}]，可直接交给 build_sa_whitelist_rows。
-    """
-    rows = []
-    for r in results:
-        attrs = r.get("additionalAttributes") or {}
-        email = (attrs.get("email") or r.get("name", "").rsplit("/serviceAccounts/", 1)[-1]).lower()
-        parent = r.get("parentFullResourceName", "")
-        project = parent.rsplit("/", 1)[-1] if "/projects/" in parent else (r.get("project") or "").split("/")[-1]
-        rows.append({"email": email, "project": project, "display_name": r.get("displayName", ""),
-                     "disabled": str(r.get("state", "")).upper() == "DISABLED", "source": "asset-sa"})
-    return rows
-
-
-def asset_iam_sa_rows(results):
-    """
-    Cloud Asset searchAllIamPolicies 的结果 -> 其中的 SA 成员行（任何层级：组织 / 文件夹 / 项目 / 数据集 / 表）。
-    project 字段放资源简名，source 放 iam-binding:<role>。
-    """
-    rows = []
-    for r in results:
-        res = asset_resource_short(r.get("resource", ""))
-        for b in (r.get("policy") or {}).get("bindings", []):
-            for m in b.get("members", []):
-                if m.startswith("serviceAccount:"):
-                    rows.append({"email": member_email(m), "project": res, "display_name": "",
-                                 "disabled": False, "source": f"iam-binding:{b.get('role', '')}"})
-    return rows
-
-
-# --------------------------------------------------------------------------- #
-# 嵌套 Group 展开（白名单组里的嵌套组也要检查 Copilot SA）
-# --------------------------------------------------------------------------- #
-def _member_type(email, mtype):
-    if mtype:
-        return mtype
-    return "SERVICE_ACCOUNT" if email.endswith("gserviceaccount.com") else "UNKNOWN"
-
-
-def expand_group(root, fetch, max_depth=10):
-    """
-    递归展开 Group 成员。fetch(group_email) -> [(member_email, type)]，读不到时返回 None。
-    type 取 Cloud Identity membership.type（USER / SERVICE_ACCOUNT / GROUP / ...）。
-    返回 (members, unresolved)：
-      members    {email: {"type", "via": [root, ..., 直接所在的组]}}，同一成员只记最短路径
-      unresolved [(group_email, via)]：读不到成员的嵌套组（外部域、无权限）
-    """
-    root = root.lower()
-    members, unresolved, visited = {}, [], set()
-    queue = [(root, [root])]
-    while queue:
-        group, path = queue.pop(0)
-        if group in visited:
-            continue
-        visited.add(group)
-        items = fetch(group)
-        if items is None:
-            if group != root:
-                unresolved.append((group, path[:-1]))
-            continue
-        for email, mtype in items:
-            email = email.lower()
-            t = _member_type(email, mtype)
-            if email not in members:
-                members[email] = {"type": t, "via": list(path)}
-            if t == "GROUP" and email not in visited and len(path) < max_depth:
-                queue.append((email, path + [email]))
-    return members, unresolved
-
-
-def inspect_nested_copilot(expanded, copilot_members=(), copilot_patterns=()):
-    """
-    expanded: {白名单组: (members, unresolved)}（expand_group 的结果）。
-    只报经由嵌套组混入的 Copilot SA（直接成员由 inspect_whitelist_membership 报）；
-    读不到的嵌套组给提醒。返回 (issues, warns)。
-    """
-    issues, warns = [], []
-    for group, (members, unresolved) in expanded.items():
-        for email, info in sorted(members.items()):
-            if len(info["via"]) > 1 and is_copilot_member(email, copilot_members, copilot_patterns):
-                issues.append(f"白名单组 {group} 经由嵌套组 {' > '.join(info['via'])} 混入 Copilot SA: {email}")
-        for g, via in unresolved:
-            warns.append(f"白名单组 {group} 中的嵌套组 {g}（路径 {' > '.join(via + [g])}）无法展开"
-                         f"（外部域或无权限），其中的成员没有做 Copilot SA 检查")
-    return issues, warns
-
-
-# --------------------------------------------------------------------------- #
-# analyzeIamPolicy（按资源展开 Group 与继承层级）
-# --------------------------------------------------------------------------- #
-READ_PERMISSION = "bigquery.tables.getData"
-WRITE_PERMISSION = "bigquery.tables.updateData"
-
-
-def analysis_principals(results):
-    """
-    analyzeIamPolicy 的 analysisResults -> [{"principal","role","resource","read","write","via"}]。
-    via: 经由的 Group 链（从绑定里的组到成员直接所在的组）；直接绑定为 []。
-    read / write 取自 accessControlLists 里匹配到的权限（getData / updateData）。
-    """
-    out = []
-    for ar in results:
-        role = (ar.get("iamBinding") or {}).get("role", "")
-        resource = asset_resource_short(ar.get("attachedResourceFullName", ""))
-        perms = {a.get("permission") for acl in ar.get("accessControlLists", [])
-                 for a in acl.get("accesses", [])}
-        read = READ_PERMISSION in perms or not perms
-        write = WRITE_PERMISSION in perms
-        ident = ar.get("identityList") or {}
-        parent = {}
-        for e in ident.get("groupEdges", []):
-            parent.setdefault(e["targetNode"].lower(), e["sourceNode"].lower())
-        for i in ident.get("identities", []):
-            name = i.get("name", "")
-            key = name.lower()
-            via, cur, seen = [], key, set()
-            while cur in parent and cur not in seen:
-                seen.add(cur)
-                cur = parent[cur]
-                via.insert(0, cur)
-            principal = normalize_member(name) if ":" in name else name
-            out.append({"principal": principal, "role": role, "resource": resource,
-                        "read": read, "write": write, "via": via})
-    return out
-
-
-def analysis_source(row):
-    """analysis_principals 的一行 -> scan CSV 的 sources 片段。"""
-    s = f"analyze:{row['resource']}:{row['role']}"
-    return s + (f" via {' > '.join(row['via'])}" if row["via"] else "")
-
-
-# --------------------------------------------------------------------------- #
-# Cloud Asset：权限查询、Group 引用；授权视图 / 授权数据集
-# --------------------------------------------------------------------------- #
-_PERMISSION_RE = re.compile(r"^[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9]+)+$")
-
-
-def iam_permission_query(permissions):
-    """searchAllIamPolicies 的 query：任一权限命中即可（OR）。"""
-    perms = [p.strip() for p in permissions if p.strip()]
-    if not perms or not all(_PERMISSION_RE.match(p) for p in perms):
-        raise ValueError(f"非法的权限名: {permissions}")
-    return " OR ".join(f"policy.role.permissions:{p}" for p in perms)
-
-
-def asset_iam_group_refs(results):
-    """searchAllIamPolicies 结果中作为成员出现的 Group -> [(group_email, 资源简名, role)]，去重。"""
-    out, seen = [], set()
-    for r in results:
-        res = asset_resource_short(r.get("resource", ""))
-        for b in (r.get("policy") or {}).get("bindings", []):
-            for m in b.get("members", []):
-                if m.startswith("group:"):
-                    item = (member_email(m), res, b.get("role", ""))
-                    if item not in seen:
-                        seen.add(item)
-                        out.append(item)
-    return out
-
-
-def authorized_entries(entries):
-    """
-    数据集 ACL 条目 [(entity_type, entity_id)] -> (授权视图 [p.d.t], 授权数据集 [p.d])。
-    这些视图 / 数据集里的对象在读目标数据集的数据：它们的读者也会受目标表 RLS 影响。
-    """
-    views, datasets = [], []
-    for etype, eid in entries:
-        if etype == "view" and isinstance(eid, dict):
-            views.append(f"{eid['projectId']}.{eid['datasetId']}.{eid['tableId']}")
-        elif etype == "dataset" and isinstance(eid, dict):
-            d = eid.get("dataset", eid)
-            datasets.append(f"{d['projectId']}.{d['datasetId']}")
-    return sorted(set(views)), sorted(set(datasets))
+        v = r.get("rls_enabled")
+        on = isinstance(v, int) and not isinstance(v, bool) and v == 1
+        seen.setdefault(name, set()).add(on)
+    return {name: ("conflict" if len(s) == 2 else "enabled" if True in s else "disabled") for name, s in seen.items()}

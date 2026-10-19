@@ -1,8 +1,6 @@
-# Audit outputs may contain real service account emails / project info
+# Outputs may contain real account emails / table names (principals.csv, copilot_rls_plan.csv, list files)
 *.csv
-tables.txt
-projects.txt
-groups.txt
+perf_report*.md
 
 # Credentials
 *.json
@@ -15,6 +13,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
 
 # OS / IDE
 .DS_Store
@@ -22,7 +21,4 @@ venv/
 .vscode/
 
 # Run artifacts
-logs/
-backup/
 *.log
-.pytest_cache/

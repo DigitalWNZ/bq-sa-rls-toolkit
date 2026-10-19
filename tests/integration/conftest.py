@@ -1,8 +1,11 @@
-"""集成测试环境准备：数据集、表、权限表、映射表、存量账号（fixture SA）及其权限。"""
+"""集成测试环境准备：数据集、业务表、条件表、映射表、测试 SA、Group 及其权限。"""
 
+import os
 import sys
+import time
 
 import pytest
+from google.cloud import bigquery
 from googleapiclient.errors import HttpError
 
 from tests.integration import itlib as L
@@ -16,100 +19,84 @@ def _log(msg):
 
 
 def _values_sql():
-    return ", ".join(
-        f"STRUCT('{r}' AS region, '{p}' AS prd_type, '{f}' AS refername, {a} AS amount)"
-        for r, p, f, a in L.ROWS)
+    return ", ".join(f"STRUCT('{r}' AS region, '{p}' AS prd_type, '{f}' AS refername, {a} AS amount)"
+                     for r, p, f, a in L.ROWS)
+
+
+def _q(sql):
+    L.bq().query(sql, location=L.LOCATION).result()
 
 
 def _create_tables():
     client = L.bq()
-    from google.cloud import bigquery
-    ds = bigquery.Dataset(f"{L.PROJECT}.{L.DATASET}")
-    ds.location = L.LOCATION
-    client.create_dataset(ds, exists_ok=True)
-    for t in (L.T_ORDERS, L.T_SENSITIVE, L.T_CONFLICT, L.T_NOBYPASS, L.T_BADMAP):
-        # CREATE OR REPLACE 会同时清掉旧的 RLS 和表级 IAM，保证每次测试从干净状态开始
-        client.query(f"CREATE OR REPLACE TABLE `{t}` AS SELECT * FROM UNNEST([{_values_sql()}])",
-                     location=L.LOCATION).result()
-    # 分区表：按 dt 分区且必须带分区过滤（验证 C1 自动加分区条件）
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_PART}`
-        PARTITION BY dt OPTIONS (require_partition_filter = TRUE) AS
-        SELECT DATE '2026-01-01' AS dt, * FROM UNNEST([{_values_sql()}])""",
-                 location=L.LOCATION).result()
-    # 异构表：同样的数据，列名不同且 refername 在嵌套字段里
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_ALT}` AS
-        SELECT region AS area, prd_type AS ptype,
-               STRUCT(refername AS ref, amount * 10 AS code) AS meta, amount
-        FROM UNNEST([{_values_sql()}])""", location=L.LOCATION).result()
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_COND}`
-        (id STRING, sa STRING, region ARRAY<STRING>, prdtype ARRAY<STRING>, refername ARRAY<STRING>)
-        CLUSTER BY sa""", location=L.LOCATION).result()
-    client.query(f"""
-        INSERT INTO `{L.T_COND}` (id, sa, region, prdtype, refername) VALUES
-          ('c1', '{L.SA_COP_HI}', ['HK', 'SG'], [], ['REF_A']),
-          ('c2', '{L.SA_COP_LO}', [], ['P1'], [])""", location=L.LOCATION).result()
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_MAPPING}` AS
-        SELECT * FROM UNNEST([
-          STRUCT('{L.T_ORDERS}' AS table_name, 'region' AS col_name, 'region' AS to_name),
-          STRUCT('{L.T_ORDERS}', 'prd_type', 'prdtype'),
-          STRUCT('{L.T_ORDERS}', 'refername', 'refername'),
-          STRUCT('{L.T_SENSITIVE}', 'region', 'region'),
-          STRUCT('{L.T_ALT}', 'area', 'region'),
-          STRUCT('{L.T_ALT}', 'ptype', 'prdtype'),
-          STRUCT('{L.T_ALT}', 'meta.ref', 'refername'),
-          STRUCT('{L.T_BADMAP}', 'missing_col', 'region'),
-          STRUCT('{L.T_NOBYPASS}', 'region', 'region')])""", location=L.LOCATION).result()
-    # 其余权限表（文档 8 张表中脚本会用到的）：表级权限组字典、Group 授权范围、用户绑定、白名单名册
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_GROUP}` AS
-        SELECT * FROM UNNEST([STRUCT('g1' AS id, '{L.G_HIGH}' AS `group`),
-                              STRUCT('g2', '{L.G_LOW}')])""", location=L.LOCATION).result()
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_GRANT}` AS
-        SELECT * FROM UNNEST([STRUCT('g1' AS group_id, '{L.T_ORDERS}' AS table_name),
-                              STRUCT('g1', '{L.T_SENSITIVE}'), STRUCT('g1', '{L.T_ALT}'),
-                              STRUCT('g2', '{L.T_ORDERS}'), STRUCT('g2', '{L.T_ALT}')])""",
-                 location=L.LOCATION).result()
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_BIND}` AS
-        SELECT * FROM UNNEST([STRUCT('b1' AS id, 'r1' AS role_id, 'c1' AS condition_id, 'g1' AS group_id),
-                              STRUCT('b2', 'r1', 'c2', 'g2')])""", location=L.LOCATION).result()
-    client.query(f"""
-        CREATE OR REPLACE TABLE `{L.T_ACL}` AS
-        SELECT * FROM UNNEST([STRUCT('{L.SA_ETL}' AS sa, '{L.G_WRITE}' AS acl_group),
-                              STRUCT('{L.SA_READER}', 'full_read')])""", location=L.LOCATION).result()
-
-
-def _create_authorized_view():
-    from google.cloud import bigquery
-    client = L.bq()
-    ds = bigquery.Dataset(f"{L.PROJECT}.{L.VIEW_DATASET}")
-    ds.location = L.LOCATION
-    client.create_dataset(ds, exists_ok=True)
-    client.query(f"CREATE OR REPLACE VIEW `{L.T_VIEW}` AS SELECT * FROM `{L.T_ORDERS}`",
-                 location=L.LOCATION).result()
-    src = client.get_dataset(f"{L.PROJECT}.{L.DATASET}")
-    ref = {"projectId": L.PROJECT, "datasetId": L.VIEW_DATASET, "tableId": "v_orders"}
-    if not any(e.entity_type == "view" and e.entity_id == ref for e in src.access_entries):
-        src.access_entries = list(src.access_entries) + [bigquery.AccessEntry(None, "view", ref)]
-        L.eventually(lambda: client.update_dataset(src, ["access_entries"]),
-                     timeout=300, interval=10, desc="authorize view")
+    for ds_id in (L.DATASET, L.AUTH_DATASET, L.NB_DATASET):
+        ds = bigquery.Dataset(f"{L.PROJECT}.{ds_id}")
+        ds.location = L.LOCATION
+        client.create_dataset(ds, exists_ok=True)
+    # CREATE OR REPLACE 会同时清掉旧的 RLS，保证每次从干净状态开始
+    for t in (L.T_ORDERS, L.T_BADMAP, L.T_NOMAP, L.T_NOBYPASS, L.T_DISABLED):
+        _q(f"CREATE OR REPLACE TABLE `{t}` AS SELECT * FROM UNNEST([{_values_sql()}])")
+    _q(f"""CREATE OR REPLACE TABLE `{L.T_ALT}` AS
+           SELECT region AS market, prd_type AS ptype, STRUCT(refername AS ref) AS meta, amount
+           FROM UNNEST([{_values_sql()}])""")
+    _q(f"""CREATE OR REPLACE TABLE `{L.T_PART}` PARTITION BY dt OPTIONS (require_partition_filter = TRUE) AS
+           SELECT DATE '2026-01-01' AS dt, * FROM UNNEST([{_values_sql()}])""")
+    _q(f"""CREATE OR REPLACE TABLE `{L.T_COND}`
+           (id STRING, sa STRING, region ARRAY<STRING>, prdtype ARRAY<STRING>, refername ARRAY<STRING>)
+           CLUSTER BY sa""")
+    _q(f"""INSERT INTO `{L.T_COND}` (id, sa, region, prdtype, refername) VALUES
+           ('c1', '{L.SA_COP_A}', ['HK'], [], []),
+           ('c2', '{L.SA_COP_B}', [], [], []),
+           ('c3', '{L.ACCOUNT}', ['SG'], [], [])""")
+    _q(f"""CREATE OR REPLACE TABLE `{L.T_MAPPING}` AS SELECT * FROM UNNEST([
+           STRUCT('{L.T_ORDERS}' AS table_name, 'region' AS col_name, 'region' AS to_name),
+           STRUCT('{L.T_ORDERS}', 'prd_type', 'prdtype'),
+           STRUCT('{L.T_ORDERS}', 'refername', 'refername'),
+           STRUCT('{L.T_ORDERS}', 'whatever', 'not_a_dimension'),
+           STRUCT('{L.T_ALT}', 'market', 'region'),
+           STRUCT('{L.T_ALT}', 'ptype', 'prdtype'),
+           STRUCT('{L.T_ALT}', 'meta.ref', 'refername'),
+           STRUCT('{L.T_PART}', 'region', 'region'),
+           STRUCT('{L.T_BADMAP}', 'missing_col', 'region'),
+           STRUCT('{L.T_COND}', 'sa', 'region')])""")         # 误配：条件表自身，应被排除
+    _q(f"""CREATE OR REPLACE TABLE `{L.T_MAPPING_NB}` AS SELECT * FROM UNNEST([
+           STRUCT('{L.T_NOBYPASS}' AS table_name, 'region' AS col_name, 'region' AS to_name)])""")
+    # apply_bypass_rls.py 的登记表（与客户 trip-bq-admin.bq_auth.adm_user_mem_copilot_tb 同结构）
+    _q(f"""CREATE OR REPLACE TABLE `{L.T_REGISTRY}` (
+           id STRING NOT NULL, table_name STRING NOT NULL, rls_enabled INT64 NOT NULL, status INT64 NOT NULL,
+           create_time TIMESTAMP NOT NULL, update_time TIMESTAMP NOT NULL)""")
+    enabled = [L.T_ORDERS, L.T_ALT, L.T_PART, L.T_BADMAP, L.T_NOMAP, L.T_NOBYPASS]
+    rows = [(t, 1, 1) for t in enabled] + [
+        (L.T_NOMAP, 1, 0),                       # 软删除的重复行（rls_enabled 相同）：不看 status，仍为开启
+        (L.T_DISABLED, 0, 1),                    # 未开启
+        (L.T_COND, 0, 1), (L.T_MAPPING, 0, 1),   # 客户把条件表 / 映射表登记为未开启（T_MAPPING_NB、登记表自身未登记）
+    ]
+    values = ",\n".join(f"(GENERATE_UUID(), '{t}', {on}, {st}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"
+                        for t, on, st in rows)
+    _q(f"INSERT INTO `{L.T_REGISTRY}` (id, table_name, rls_enabled, status, create_time, update_time) VALUES\n{values}")
 
 
 def _ensure_sa(email):
     iam = L.api("iam", "v1")
-    account_id = email.split("@")[0]
     try:
-        iam.projects().serviceAccounts().create(
-            name=f"projects/{L.PROJECT}",
-            body={"accountId": account_id, "serviceAccount": {"displayName": account_id}}).execute()
-        _log(f"创建 SA {email}")
+        iam.projects().serviceAccounts().get(name=f"projects/{L.PROJECT}/serviceAccounts/{email}").execute()
+        return
     except HttpError as e:
-        if e.resp.status != 409:
+        if e.resp.status != 404:
+            raise
+    for attempt in range(8):
+        try:
+            iam.projects().serviceAccounts().create(
+                name=f"projects/{L.PROJECT}",
+                body={"accountId": email.split("@")[0], "serviceAccount": {"displayName": email.split("@")[0]}}).execute()
+            _log(f"创建 SA {email}")
+            return
+        except HttpError as e:
+            if e.resp.status == 409:
+                return
+            if e.resp.status == 429 and attempt < 7:          # SA 创建每分钟配额（与其他测试并行时会碰到）
+                time.sleep(30)
+                continue
             raise
 
 
@@ -132,65 +119,58 @@ def _sa_binding(sa_email, role, member):
     iam = L.api("iam", "v1").projects().serviceAccounts()
     res = f"projects/{L.PROJECT}/serviceAccounts/{sa_email}"
     _add_binding(lambda: iam.getIamPolicy(resource=res).execute(),
-                 lambda pol: iam.setIamPolicy(resource=res, body={"policy": pol}).execute(),
-                 role, member)
+                 lambda pol: iam.setIamPolicy(resource=res, body={"policy": pol}).execute(), role, member)
 
 
 def _project_binding(role, member):
     crm = L.api("cloudresourcemanager", "v1").projects()
     _add_binding(lambda: crm.getIamPolicy(resource=L.PROJECT, body={}).execute(),
-                 lambda pol: crm.setIamPolicy(resource=L.PROJECT, body={"policy": pol}).execute(),
-                 role, member)
+                 lambda pol: crm.setIamPolicy(resource=L.PROJECT, body={"policy": pol}).execute(), role, member)
 
 
-def _table_viewer(table, member):
+def _dataset_access(ds_id, entries):
+    """entries: [(role, entity_type, entity_id)]，已存在的跳过。"""
     client = L.bq()
 
     def op():
-        pol = client.get_iam_policy(table)
-        pol.bindings.append({"role": "roles/bigquery.dataViewer", "members": {member}})
-        client.set_iam_policy(table, pol)
-    L.eventually(op, timeout=300, interval=10, desc=f"table viewer {member}")
-
-
-def _dataset_writer(email):
-    from google.cloud import bigquery
-    client = L.bq()
-    ds = client.get_dataset(f"{L.PROJECT}.{L.DATASET}")
-    if any(e.entity_id == email and e.role == "WRITER" for e in ds.access_entries):
-        return
-    ds.access_entries = list(ds.access_entries) + [
-        bigquery.AccessEntry("WRITER", "userByEmail", email)]
-    L.eventually(lambda: client.update_dataset(ds, ["access_entries"]),
-                 timeout=300, interval=10, desc="dataset writer")
+        ds = client.get_dataset(f"{L.PROJECT}.{ds_id}")
+        have = {(e.role, e.entity_type, e.entity_id) for e in ds.access_entries}
+        add = [bigquery.AccessEntry(r, t, i) for r, t, i in entries if (r, t, i) not in have]
+        if add:
+            ds.access_entries = list(ds.access_entries) + add
+            client.update_dataset(ds, ["access_entries"])
+    L.eventually(op, timeout=300, interval=10, desc=f"dataset access {ds_id}")
 
 
 @pytest.fixture(scope="session")
 def world():
     _log("建表 ...")
     _create_tables()
-    for email in L.FIXTURE_SAS:
+    for email in L.ALL_SAS:
         _ensure_sa(email)
     admin = f"user:{L.ACCOUNT}"
-    for email in L.FIXTURE_SAS:
-        # 测试执行账号可直接扮演 fixture SA（存量账号 / API SA / 探针）
-        _sa_binding(email, "roles/iam.serviceAccountTokenCreator", admin)
-    for email in L.FIXTURE_SAS:
+    for email in L.ALL_SAS:
+        _sa_binding(email, "roles/iam.serviceAccountTokenCreator", admin)    # 测试账号可扮演
         _project_binding("roles/bigquery.jobUser", f"serviceAccount:{email}")
-    _dataset_writer(L.SA_ETL)                              # 存量写：数据集级 WRITER
-    for t in (L.T_ORDERS, L.T_SENSITIVE, L.T_PART):
-        _table_viewer(t, f"serviceAccount:{L.SA_READER}")  # 存量读：表级 dataViewer
-    # 等待扮演与权限生效
-    L.eventually(lambda: L.query(L.impersonate(L.SA_ETL), f"SELECT 1 FROM `{L.T_ORDERS}` LIMIT 1"),
-                 desc="etl ready")
-    L.eventually(lambda: L.query(L.impersonate(L.SA_READER), f"SELECT 1 FROM `{L.T_ORDERS}` LIMIT 1"),
-                 desc="reader ready")
-    # 授权视图：另一个数据集里的视图读 orders，被 rls_it 授权；late 只有视图的读权限（R1）
-    _create_authorized_view()
-    _table_viewer(L.T_VIEW, f"serviceAccount:{L.SA_LATE}")
-    # 嵌套组：业务组里有 Copilot SA，验证白名单的嵌套组防护（P0）
-    L.ensure_group(L.G_NESTED)
-    L.eventually(lambda: L.set_group_member(L.G_NESTED, L.SA_COP_HI, True), timeout=300, interval=15,
-                 desc="nested group member")
+    customer = L.customer_id()
+    for g in (L.G_READ, L.G_WRITE, L.G_ACL, L.G_COPILOT):
+        L.ensure_group(g, customer)
+    members = [(L.G_READ, L.SA_READER), (L.G_WRITE, L.SA_ETL), (L.G_ACL, L.SA_ACL)]
+    members += [(L.G_COPILOT, m) for m in (L.SA_COP_A, L.SA_COP_B, L.SA_COP_N, L.ACCOUNT)]
+    for g, m in members:
+        L.eventually(lambda g=g, m=m: L.set_group_member(g, m), timeout=300, interval=15, desc=f"member {m}")
+    # 业务数据集：存量读 / 写账号、Copilot 账号的读权限；ACL 里授权一个 Group（list_principals 要展开它）
+    readers = [L.SA_READER, L.SA_COP_A, L.SA_COP_B, L.SA_COP_N]
+    _dataset_access(L.DATASET, [("READER", "userByEmail", e) for e in readers]
+                    + [("WRITER", "userByEmail", L.SA_ETL), ("READER", "groupByEmail", L.G_ACL)])
+    # 条件表所在数据集：Copilot Group 需要读条件表（RLS 子查询以查询者身份执行）
+    _dataset_access(L.AUTH_DATASET, [("READER", "groupByEmail", L.G_COPILOT)])
+    for who in (L.SA_READER, L.SA_ETL, L.SA_COP_A):
+        L.eventually(lambda who=who: L.amounts(who, L.T_ORDERS), desc=f"{who} ready")
     _log("环境就绪")
-    return {}
+    yield {}
+    # 默认保留测试数据集、SA 与 Group，便于事后查看；下次运行会重建表、清掉旧规则。设置 RLS_IT_CLEANUP=1 才删除数据集
+    if os.environ.get("RLS_IT_CLEANUP") == "1":
+        _log("清理数据集（SA 与 Group 保留）")
+        for ds_id in (L.DATASET, L.AUTH_DATASET, L.NB_DATASET):
+            L.bq().delete_dataset(f"{L.PROJECT}.{ds_id}", delete_contents=True, not_found_ok=True)
