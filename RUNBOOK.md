@@ -36,10 +36,45 @@
 
 ### 0.2 授予执行账号权限（一次）
 
+先确定执行账号（之后运行四个脚本的账号）属于哪种情况，再按对应小节操作：
+
+| 情况 | 判断标准 | 要做的 |
+|---|---|---|
+| **A** | 执行账号已是以下**每一个**项目的 Owner：业务表所在的项目、quota 项目、三张控制表所在的项目 | 0.2.1 → 0.2.2 → 0.2.4 |
+| **B** | 不满足 A（例如客户安全规范要求用专门的、最小权限的执行账号） | 0.2.1 → 0.2.3 → 0.2.4 |
+
+> [!NOTE]
+> 本节命令是**给执行账号授权**，通常由客户的管理员执行一次（所需权限见 [0.2.5](#025-执行本节命令的人需要的权限)）；执行账号自己权限足够时也可自己执行。
+
+#### 0.2.1 两种情况都要做：设置变量、在 quota 项目启用 API
+
 ```bash
+# ORG：客户的 GCP 组织 ID（数字）
+# ME ：执行账号，即之后运行脚本的那个账号（人写 user:邮箱；SA 写 serviceAccount:邮箱）
+# QP ：quota 项目，脚本的查询 / DDL 作业在这里运行，配额和费用也记在这里
 ORG=123456789012; ME=user:rls-admin@trip.com; QP=trip-bq-admin
 
-# 第 1 步（list_principals，只读）
+# quota 项目启用 API（已启用的会自动跳过；放在最前面，后面的 bq 命令也要用到 BigQuery API）
+gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bigquery.googleapis.com \
+    cloudidentity.googleapis.com admin.googleapis.com iamcredentials.googleapis.com --project $QP
+```
+
+#### 0.2.2 情况 A：执行账号已是相关项目的 Owner
+
+项目 Owner 已包含 BigQuery Data Owner、Job User、Service Usage Consumer 以及读取项目内全部数据集的权限，**第 3 / 7 / 8 步不需要再授权**。只有第 1 步用 `--organizations` 扫描整个组织时，还需要组织级的 3 个只读角色（项目 Owner 看不到组织、文件夹和其它项目）：
+
+```bash
+# 只在第 1 步使用 --organizations 时需要；只用 --projects 扫描自己是 Owner 的项目则跳过
+for r in roles/browser roles/iam.securityReviewer roles/bigquery.metadataViewer; do
+  gcloud organizations add-iam-policy-binding $ORG --member=$ME --role=$r
+done
+```
+
+#### 0.2.3 情况 B：最小权限的执行账号
+
+```bash
+# 第 1 步（list_principals，只读）：组织上授予 3 个只读角色
+#   只用 --projects 时，把 organizations $ORG 换成 projects <项目ID>，对每个要扫描的项目授予即可
 for r in roles/browser roles/iam.securityReviewer roles/bigquery.metadataViewer; do
   gcloud organizations add-iam-policy-binding $ORG --member=$ME --role=$r
 done
@@ -48,15 +83,32 @@ done
 gcloud projects add-iam-policy-binding trip-prod --member=$ME --role=roles/bigquery.dataOwner
 # 运行查询 / DDL
 gcloud projects add-iam-policy-binding $QP --member=$ME --role=roles/bigquery.jobUser
-# 三张表的读权限（若执行账号对 bq_auth 数据集还没有读权限）
-bq add-iam-policy-binding --member=$ME --role=roles/bigquery.dataViewer trip-bq-admin:bq_auth.adm_user_mem_copilot_condition
-
-# quota 项目启用 API
-gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bigquery.googleapis.com \
-    cloudidentity.googleapis.com admin.googleapis.com iamcredentials.googleapis.com --project $QP
+# 允许把 QP 当作 quota 项目调用各 API（缺少时四个脚本的所有 API 调用都会报 403 USER_PROJECT_DENIED）
+gcloud projects add-iam-policy-binding $QP --member=$ME --role=roles/serviceusage.serviceUsageConsumer
+# 若执行账号还没有 condition/mapping/copilot_tb 三张表的读权限，则直接在三张表所在的数据集上开通
+bq query --project_id=$QP --use_legacy_sql=false \
+  "GRANT \`roles/bigquery.dataViewer\` ON SCHEMA \`trip-bq-admin.bq_auth\` TO \"$ME\""
 ```
 
-组织范围运行 list_principals 时，执行账号还需是 Workspace / Cloud Identity 中有「用户 → 读取」「群组 → 读取」权限的管理员（超级管理员 / 用户管理管理员已包含；否则请超级管理员在 Admin 控制台分配一次）。GCP 的组织管理员等 IAM 角色**不能**读取账号目录。
+业务表分布在多个项目时，对每个项目重复 Data Owner 那一行。
+
+#### 0.2.4 两种情况都要确认：Workspace 管理员角色（第 1 步组织范围）
+
+组织范围运行 list_principals 时，执行账号还需是 Workspace / Cloud Identity 中有「用户 → 读取」「群组 → 读取」权限的管理员（超级管理员 / 用户管理管理员已包含；否则请超级管理员在 Admin 控制台分配一次）。GCP 的组织管理员、项目 Owner 等 IAM 角色**都不能**读取账号目录。只指定项目时，若授权中出现 Group，展开其成员同样需要「群组 → 读取」（否则打印 `[WARN]`，该组成员不列出）。
+
+#### 0.2.5 执行本节命令的人需要的权限
+
+本节命令是给执行账号授权，执行者需要能修改相应资源的权限：
+
+| 命令 | 执行者需要 | 常见对应角色 |
+|---|---|---|
+| `gcloud services enable … --project $QP` | 在 QP 上启用 API | QP 的 Owner / Editor，或 Service Usage Admin |
+| `gcloud organizations add-iam-policy-binding` | 修改组织 IAM 策略 | 组织上的 Organization Administrator 或 Security Admin |
+| `gcloud projects add-iam-policy-binding` | 修改项目 IAM 策略 | 该项目 Owner 或 Project IAM Admin（组织上的上述两个角色也覆盖） |
+| `bq query … GRANT … ON SCHEMA` | 修改该数据集的权限，并在 QP 中运行查询 | 该数据集的 BigQuery Data Owner / Admin，加上 QP 上的 BigQuery Job User |
+| Workspace 管理员角色（0.2.4） | 在 Admin 控制台分配管理员角色 | Workspace 超级管理员 |
+
+实际操作中通常由客户的 GCP 组织管理员 + quota 项目 Owner 执行，Workspace 部分由超级管理员完成。
 
 ### 0.3 本地环境（一次）
 
@@ -235,6 +287,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 |---|---|
 | 退出码 2，`[ERROR] … gcloud auth login` | 没有登录或登录过期：`gcloud auth login <账号>` |
 | 退出码 2，`[ERROR] … gcloud config set project` | 没有默认项目：`gcloud config set project <项目ID>`，或加 `--quota-project` |
+| 报 403 `USER_PROJECT_DENIED` / `serviceusage.services.use` | 执行账号在 quota 项目上缺少 `roles/serviceusage.serviceUsageConsumer`（见 0.2） |
 | 退出码 2，参数错误 | 旧参数（如 `--tables-file`）已删除；表名必须 `project.dataset.table`（不接受冒号写法）；`.csv` 文件不存在 |
 | 某表 `[SKIP] … 不在登记表` | 登记表 `table_name` 与参数中的表名不完全一致（大小写、空格、少了项目名都算不一致） |
 | 某表 `[SKIP] … 表不存在（可能已被删除）` | 映射表 / 登记表里还有这张表，但它已被 drop 或表名写错：清理映射表 / 登记表中的记录（其余表不受影响，退出码 1） |

@@ -40,7 +40,8 @@
   - GCP（在组织上授予，均为只读）：roles/browser（组织信息、列文件夹 / 项目）、roles/iam.securityReviewer（IAM 策略、
     列 SA、读自定义角色、表 IAM 策略）、roles/bigquery.metadataViewer（列数据集、读数据集 ACL、列表）
   - Workspace / Cloud Identity：有「用户 → 读取」（读账号目录）和「群组 → 读取」（展开 Group）权限的管理员
-  - quota 项目：启用 cloudresourcemanager、iam、bigquery、cloudidentity、admin（Admin SDK）API；执行账号可使用该项目
+  - quota 项目：启用 cloudresourcemanager、iam、bigquery、cloudidentity、admin（Admin SDK）API；执行账号在该项目上有
+    roles/serviceusage.serviceUsageConsumer（四个脚本相同；缺少时 API 调用报 403 USER_PROJECT_DENIED）
   - 读不到某个自定义角色的定义（iam.roles.get 无权限）时，按「能读表数据」处理并 [WARN]（宁可多列）
 
 退出码: 0 成功；1 部分读取失败（其余结果仍写入 CSV）；2 参数错误

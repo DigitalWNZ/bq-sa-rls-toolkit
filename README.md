@@ -332,6 +332,7 @@ python rollback_rls.py --tables tables.csv --apply                              
 | list_principals.py | 组织上 3 个只读角色：`roles/browser`、`roles/iam.securityReviewer`、`roles/bigquery.metadataViewer`（只指定项目时授予在项目上即可）；组织范围还需 Workspace / Cloud Identity 中有「用户 → 读取」「群组 → 读取」权限的管理员角色（超级管理员 / 用户管理管理员已包含） |
 | apply_bypass_rls.py / apply_copilot_rls.py / rollback_rls.py | 目标表上：`bigquery.rowAccessPolicies.create / update / delete / list / getIamPolicy / setIamPolicy` 与 `bigquery.tables.getData`（**`roles/bigquery.dataOwner` 或 `roles/bigquery.admin`** 包含，可授予在项目 / 数据集 / 表上）；条件表（Copilot 规则的子查询引用它）、映射表、登记表的读权限；quota 项目上 `roles/bigquery.jobUser`（`bigquery.jobs.create`） |
 | `--verify-sa` | 对该 SA 的 `roles/iam.serviceAccountTokenCreator`；该 SA 有目标表的读权限 |
+| 四个脚本共同 | quota 项目上 `roles/serviceusage.serviceUsageConsumer`（`serviceusage.services.use`）：脚本以 quota 项目计配额调用各 API，缺少时所有调用报 403 `USER_PROJECT_DENIED`（项目 Owner / Editor 已包含） |
 
 **quota 项目**需启用 API：`cloudresourcemanager`、`iam`、`bigquery`、`cloudidentity`、`admin`（Admin SDK）、`iamcredentials`（`--verify-sa` 用）：
 
