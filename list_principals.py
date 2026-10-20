@@ -23,6 +23,7 @@
      GCS、Pub/Sub 等非 BigQuery 资源上的授权不纳入。
   跳过：deleted:、domain:、allUsers、allAuthenticatedUsers、principalSet:// 、specialGroup、授权视图 / 例程 / 数据集等非具体账号。
   任何项目 / 文件夹 / 数据集 / 表 / 账号目录读取失败都打印 [ERROR] 并以退出码 1 结束（其余结果照常写入 CSV），绝不悄悄跳过。
+  Group 读不到（无权限 / 外部域）或展开出错（API 未启用、限流重试用尽等）同样 [ERROR] + 退出码 1，结尾汇总未展开的 Group。
 
 输出: CSV（UTF-8 BOM，默认 principals.csv），列 email, principal_type, home_project（三列都由邮箱推算）。
 运行日志: 屏幕输出原样另存到 logs/list_principals_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录；四个脚本相同）。
@@ -231,23 +232,30 @@ def _main(argv):
     ops.log(f"[TABLE] {len(tables)} 张表 / 视图：能读表数据的授权对象 {n} 个")
 
     # ---- Group 展开 ----
+    # 读不到的 Group：[ERROR] + 退出码 1，其余结果照常写入 CSV，结尾汇总（成员未列入 CSV，不能当作「没有成员」）
+    unexpanded = {}                                   # group -> 原因
     for g, res, err in ops.parallel_map(lambda g: ops.expand_group(ctx, g), sorted(groups),
                                         workers=workers, desc="group"):
         if err:
             failed = True
-            ops.log(f"[ERROR] 展开 group:{g} 失败: {err}")
+            reason = str(err)
+            if any(h in reason.lower() for h in ops._CONFIG_ERROR_HINTS):
+                reason = f"Cloud Identity API 未在 quota 项目启用，或执行账号不能使用 quota 项目: {reason}"
+            unexpanded[g] = reason[:300]
+            ops.log(f"[ERROR] 展开 group:{g} 失败: {reason[:500]}")
             continue
-        members, unresolved = res
-        if not members and not unresolved:
-            ops.log(f"  [WARN] 无法展开 group:{g}（外部域或无权限），其中的成员未列出")
-            continue
+        members, unresolved, reasons = res
         for email, info in members.items():
             if info["type"] in _MEMBER_TYPES or (info["type"] == "UNKNOWN" and email.endswith("gserviceaccount.com")):
                 emails.add(email)
         for ug, via in unresolved:
-            ops.log(f"  [WARN] group:{g} 中的嵌套组 {ug} 无法展开（外部域或无权限），其中的成员未列出")
+            failed = True
+            reason = reasons.get(ug, ops.GROUP_UNREADABLE_REASON)
+            unexpanded[ug] = reason
+            where = f"（group:{g} 中的嵌套组）" if ug != g else ""
+            ops.log(f"[ERROR] 展开 group:{ug}{where} 失败：{reason}；其中的成员未列入 CSV")
     if groups:
-        ops.log(f"[GROUP] 展开了 {len(groups)} 个 Group")
+        ops.log(f"[GROUP] 共 {len(groups)} 个 Group，" + (f"其中 {len(unexpanded)} 个未能展开" if unexpanded else "全部展开"))
 
     rows = core.build_principal_rows(emails, core.split_items(args.exclude_members),
                                      core.split_items(args.exclude_patterns))
@@ -261,6 +269,9 @@ def _main(argv):
     scope_desc = f"{len(orgs)} 个组织、{len(projects)} 个项目"
     ops.log(f"===== 完成：{scope_desc}，共 {len(rows)} 个主体 "
             f"（{', '.join(f'{k} {v}' for k, v in sorted(by_type.items())) or '无'}），已写入 {args.output} =====")
+    if unexpanded:
+        ops.log(f"[ERROR] 以下 {len(unexpanded)} 个 Group 未能展开，其成员未列入 CSV，"
+                "请用有 Group 读取权限的账号重跑或手工核对：\n" + "\n".join(f"  - {g}" for g in sorted(unexpanded)))
     return 1 if failed else 0
 
 

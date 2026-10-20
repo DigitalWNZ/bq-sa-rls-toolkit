@@ -34,7 +34,8 @@
   - 条件表为空 -> [NOTE]，规则照建（组内成员都查到 0 行）
   - 同名规则：内容相同 -> NOOP；授权对象或过滤条件不同 -> REPLACE（审核 CSV 的 note 记录旧内容）
   - 每张表最多 400 条规则：已满且需要新建 -> [SKIP]，退出码 1
-  - 映射列不存在 / REPEATED / RECORD / 类型不支持 -> 跳过该表
+  - 映射列不存在 / REPEATED / RECORD / 类型不支持 -> 跳过该表（列名不区分大小写，过滤条件使用表中的真实写法）
+  - 执行时 BigQuery 报 Group 不存在 -> 不等待重试，立即停止（第一张需要变更的表先单独执行，失败则其余表都不执行）
   - 映射表 / 登记表里有、但表实际不存在（如已被 drop）-> [SKIP] 表不存在，其余表照常，退出码 1
   - 条件表 / 映射表是否设置 RLS 只看登记表：客户应把它们登记为 rls_enabled = 0
   - 表上原本没有任何 RLS 时只在日志中提示（[NOTE]）；现存账号会查到 0 行，可用 apply_bypass_rls.py 为其 Group 补上
@@ -52,7 +53,8 @@
       --registry-table auth-proj.auth.adm_user_mem_copilot_tb
   python apply_copilot_rls.py ... --apply
 
-退出码: 0 成功；1 有表被跳过 / 失败、条件表数据有问题、登记表记录冲突；2 参数错误 / 登记表不可用 / 无法确定执行账号（未做任何变更）
+退出码: 0 成功；1 有表被跳过 / 失败、条件表数据有问题、登记表记录冲突；2 参数错误 / 登记表不可用 / 无法确定执行账号 /
+  第一张表即报 Group 不存在（未做任何变更）
 """
 
 import argparse
@@ -63,7 +65,8 @@ from google.api_core.exceptions import NotFound
 
 import gcp_ops as ops
 import rls_core as core
-from apply_bypass_rls import filter_by_registry, load_registry, log_first_policy_tables, run_main
+from apply_bypass_rls import (execute_tables, filter_by_registry, load_registry, log_first_policy_tables,
+                              log_group_abort, run_main)
 from gcp_auth import AuthConfigError, describe_auth, resolve_auth
 
 
@@ -126,7 +129,7 @@ def _main(argv):
         ops.log(f"[ERROR] --group 只能指定一个 Group，收到 {len(groups)} 个: {groups}")
         return 2
     try:
-        group = core.copilot_group(groups[0])
+        group = core.group_email(groups[0])
         cond = core.parse_table_arg(args.condition_table)
         mapping_table = core.parse_table_arg(args.mapping_table)
         registry = core.parse_table_arg(args.registry_table)
@@ -217,6 +220,7 @@ def _main(argv):
             schema = ops.table_schema(ctx, table)
         except NotFound:
             return {"skip": core.TABLE_NOT_FOUND_MSG}
+        cols = core.resolve_column_case(cols, schema)        # BigQuery 列名不区分大小写：按表中真实写法
         errors = core.validate_mapping_against_schema(cols, schema)
         if errors:
             return {"skip": "; ".join(errors)}
@@ -245,33 +249,42 @@ def _main(argv):
                 first_tables.append(table)
     log_first_policy_tables(first_tables)          # 只作提示，不拦截；现存账号可用 apply_bypass_rls.py 补上
 
-    # 5. 执行（表之间并行；每张表一条 DDL）
+    # 5. 执行（每张表一条 DDL；执行模式先单独执行第一张，BigQuery 报 Group 不存在则立即停止）
     def execute(table):
         e = plans[table]
         if e["action"] == "NOOP":
-            return [f"[NOOP] {table}"], True
+            return [f"[NOOP] {table}"], True, False
         ddl = core.build_policy_ddl(table, policy_name, [grantee], e["filter"])
         lines = [f"[{e['action']}] {table}\n{ddl}"]
         if e["note"]:
             lines.append(f"  {e['note']}")
         if args.apply:
             try:
-                ops.run_ddl(ctx, ddl, ctx.table_location(table))
+                ops.run_ddl(ctx, ddl, ctx.table_location(table), retry_missing_principal=False)
                 e["result"] = "OK"
             except Exception as ex:  # noqa: BLE001
                 e["result"] = f"ERROR: {str(ex)[:300]}"
                 lines.append(f"  [ERROR] {ex}")
-                return lines, False
-        return lines, True
+                return lines, False, ops.is_principal_missing_error(ex)
+        return lines, True, False
 
-    for table, res, err in ops.parallel_map(execute, list(plans), workers=workers, desc="ddl"):
+    def on_result(table, res, err):
+        nonlocal failed
         if err:
             failed = True
             ops.log(f"[ERROR] {table}: {err}")
-            continue
-        lines, ok = res
+            return
+        lines, ok, _ = res
         ops.log("\n".join(lines))
         failed = failed or not ok
+
+    status, not_run = execute_tables(sorted(plans), execute, workers, args.apply,
+                                     lambda t: plans[t]["action"] != "NOOP", on_result)
+    abort_code = log_group_abort(status, not_run, group) if status != "ok" else None
+    if abort_code is not None:
+        for e in plans.values():
+            if args.apply and e["action"] in ("CREATE", "REPLACE") and "result" not in e:
+                e["result"] = "NOT RUN（因 Group 不存在已停止）"
 
     entries = [plans[t] for t in sorted(plans)]
     counts_by_action = {}
@@ -279,6 +292,9 @@ def _main(argv):
         counts_by_action[e["action"]] = counts_by_action.get(e["action"], 0) + 1
     write_plan_csv(args.output, entries, args.apply)
     ops.log(f"[CSV] 审核文件已写入 {args.output}（每张表一行，只含 CREATE / REPLACE）")
+    if abort_code is not None:
+        ops.log(f"===== 中止 ({mode})：未执行 {not_run} 张表 =====")
+        return abort_code
     ops.log(f"===== 完成 ({mode})：" + ("，".join(f"{k} {v}" for k, v in sorted(counts_by_action.items())) or "无")
             + " =====")
     return 1 if failed else 0

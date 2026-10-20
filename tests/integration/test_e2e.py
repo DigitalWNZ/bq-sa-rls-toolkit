@@ -7,6 +7,7 @@
 import csv
 import os
 import re
+import time
 
 import pytest
 
@@ -82,7 +83,15 @@ def test_01_list_principals_project_scope(world, tmp_path):
 def test_02_list_principals_org_scope(world, tmp_path):
     # 执行账号（Argolis 的 admin@）是 Workspace 超级管理员：用它自己的 gcloud 凭证读账号目录
     code, log, rows = _list(tmp_path, "--organizations", L.ORG)
-    assert code == 0 and "[ERROR]" not in log and "Traceback" not in log, log
+    assert "Traceback" not in log, log
+    # Argolis 组织 IAM 里授权给了 Google 内部的外部域 Group（…@twosync-src.google.com 等），任何客户账号都读不到：
+    # 这些组必须 [ERROR] + 汇总 + 退出码 1（不再静默跳过）；除此之外不应有其它错误
+    errors = [ln for ln in log.splitlines() if ln.startswith("[ERROR]")]
+    external = [ln for ln in errors if ln.startswith("[ERROR] 展开 group:") and f"@{L.DOMAIN}" not in ln]
+    assert errors == external + ([f"[ERROR] 以下 {len(external)} 个 Group 未能展开，其成员未列入 CSV，"
+                                  "请用有 Group 读取权限的账号重跑或手工核对："] if external else []), errors
+    assert code == (1 if external else 0), log
+    assert not any(f"group:rlsit-" in ln for ln in errors)               # 本域的测试 Group 全部展开
     assert "[ORG] organizations/" in log and "[DIR] 账号目录" in log
     for prj in ("rls-sapool-harrishe-1", "rls-sapool-harrishe-5"):    # 组织下其它项目的 SA（没有任何授权）也列出
         assert _iam_project_sas(prj) <= set(rows), prj
@@ -298,6 +307,8 @@ def test_22_copilot_apply(world, tmp_path):
         cop = [p for p in L.policies(t) if p.startswith(core.COPILOT_PREFIX)]
         assert cop == [COP_G] and L.policies(t)[COP_G]["grantees"] == {f"group:{L.G_COPILOT}"}
     assert "market" in L.policies(L.T_ALT)[COP_G]["filter"]
+    part_filter = L.policies(L.T_PART)[COP_G]["filter"]                  # 映射表写 REGION，表中是 region
+    assert "region" in part_filter and "REGION" not in part_filter
     assert not any(p.startswith(core.COPILOT_PREFIX) for p in L.policies(L.T_NOMAP))
     assert L.policies(L.T_COND) == {} and L.policies(L.T_MAPPING) == {}
     # 运行日志：--log-dir 下生成 apply_copilot_rls_<时间戳>.log，内容与屏幕输出完全一致
@@ -316,6 +327,22 @@ def test_22b_copilot_dropped_table_isolated_in_apply(world, tmp_path):
     assert f"[SKIP] {L.T_DROPPED}: {core.TABLE_NOT_FOUND_MSG}" in log and f"[NOOP] {L.T_ORDERS}" in log
     assert "Traceback" not in log and read_csv(out) == []
     assert COP_G in L.policies(L.T_ORDERS)
+
+
+def test_22c_nonexistent_group_stops_immediately(world, tmp_path):
+    # Group 写错：执行时 BigQuery 报「Group … does not exist」→ 不再每张表等 300 秒，第一张失败即停止，退出码 2
+    nosuch = L.grp("nosuch-group")
+    t0 = time.time()
+    code, log = bypass("--group", nosuch, "--tables", ",".join(L.TARGET_TABLES), "--apply")
+    elapsed = time.time() - t0
+    assert code == 2 and elapsed < 120, (elapsed, log)
+    assert f"BigQuery 报 Group {nosuch} 不存在，已停止" in log and "未做任何变更" in log and "[retry]" not in log
+    code, log = copilot("--group", nosuch, "--mapping-table", L.T_MAPPING, "-o", str(tmp_path / "p.csv"),
+                        "--tables", ",".join(COPILOT_TABLES), "--apply")
+    assert code == 2 and "未做任何变更" in log, log
+    name_b, name_c = core.bypass_policy_name(nosuch), core.copilot_policy_name(nosuch)
+    for t in L.TARGET_TABLES:
+        assert name_b not in L.policies(t) and name_c not in L.policies(t)
 
 
 def test_23_copilot_visibility(world):

@@ -304,9 +304,9 @@ def _member_type(email, mtype):
 
 def expand_group(root, fetch, max_depth=10):
     """
-    递归展开 Group。fetch(group_email) -> [(member_email, type)]，读不到时返回 None。
+    递归展开 Group。fetch(group_email) -> [(member_email, type)]，读不到时返回 None（空组返回 []）。
     返回 (members, unresolved)：members {email: {"type", "via": [root, ..., 直接所在的组]}}；
-    unresolved [(group_email, via)]：读不到成员的嵌套组。
+    unresolved [(group_email, via)]：读不到成员的组（最外层的组本身读不到时为 (root, [])）。
     """
     root = root.lower()
     members, unresolved, visited = {}, [], set()
@@ -318,8 +318,7 @@ def expand_group(root, fetch, max_depth=10):
         visited.add(group)
         items = fetch(group)
         if items is None:
-            if group != root:
-                unresolved.append((group, path[:-1]))
+            unresolved.append((group, path[:-1]))
             continue
         for email, mtype in items:
             email = email.lower()
@@ -381,10 +380,10 @@ def drop_all_ddl(table):
     return f"DROP ALL ROW ACCESS POLICIES ON `{fq(table)}`"
 
 
-def copilot_group(value):
+def group_email(value):
     """
     --group 的值 -> 规范化的 Group 邮箱（小写）。必须是裸邮箱（不能带 group: 等前缀），不能是 SA 邮箱；
-    引号 / 反引号 / 反斜杠等会被拒绝（防止转义出 DDL 字符串）。
+    引号 / 反引号 / 反斜杠等会被拒绝（防止转义出 DDL 字符串）。apply_bypass_rls.py / apply_copilot_rls.py 共用。
     """
     e = str(value).strip().lower()
     if not _EMAIL_RE.match(e) or any(ch in e for ch in "\"'`\\ "):
@@ -392,6 +391,9 @@ def copilot_group(value):
     if e.endswith("gserviceaccount.com"):
         raise ValueError(f"--group 不能是 SA 邮箱: {value!r}")
     return e
+
+
+copilot_group = group_email          # 旧名（保持兼容）
 
 
 def invalid_sa_values(raw_values):
@@ -510,6 +512,17 @@ def flatten_schema(fields, prefix=""):
         if f.fields:
             out.update(flatten_schema(f.fields, prefix=f"{path}."))
     return out
+
+
+def resolve_column_case(mapping, schema):
+    """
+    BigQuery 列名不区分大小写：把映射表写的 col_name 换成表结构中的真实写法（如 Region -> region，Meta.Ref -> meta.ref）。
+    表中没有对应列时原样保留，由 validate_mapping_against_schema 报「不存在」。
+    """
+    by_lower = {}
+    for path in schema:
+        by_lower.setdefault(path.lower(), path)
+    return [(by_lower.get(col.lower(), col), dim) for col, dim in mapping]
 
 
 def validate_mapping_against_schema(mapping, schema):

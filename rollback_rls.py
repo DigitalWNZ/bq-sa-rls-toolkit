@@ -104,19 +104,27 @@ def _main(argv):
 
     # 阶段 2：并行执行
     def execute(t):
+        """返回 (日志行, 实际删除的规则数, 是否成功)。中途失败时仍返回已生成的 [DROP] 完整内容（已删规则可据此恢复）。"""
         pl, n_all = plans[t]
         lines = [f"[TABLE] {t}（共 {n_all} 条规则，删除 {len(pl.to_drop)} 条）"]
         for pol in pl.to_drop:
             g = pol["grantees"] if pol["grantees"] is not None else "（未读取）"
             lines.append(f"  [DROP] `{pol['id']}` grantees={g} filter={pol['filter']}")
         ddls = [core.drop_all_ddl(t)] if pl.drop_all else [core.drop_policy_ddl(t, pol["id"]) for pol in pl.to_drop]
+        done = 0
         for ddl in ddls:
             lines.append(f"    DDL: {ddl}")
             if args.apply:
-                ops.run_ddl(ctx, ddl, ctx.table_location(t))
+                try:
+                    ops.run_ddl(ctx, ddl, ctx.table_location(t))
+                except Exception as e:  # noqa: BLE001
+                    lines.append(f"  [ERROR] {t}: 第 {done + 1} / {len(ddls)} 条 DDL 执行失败"
+                                 f"（此前 {done} 条已执行，对应规则的完整内容见上方 [DROP]）: {e}")
+                    return lines, (0 if pl.drop_all else done), False
+                done += 1
         if pl.drop_all:
             lines.append("  [NOTE] 该表已没有任何 RLS 规则，所有有读表权限的账号都能看到全部数据")
-        return lines, len(pl.to_drop)
+        return lines, len(pl.to_drop), True
 
     total = 0
     for t, res, err in ops.parallel_map(execute, list(plans), workers=workers(args), desc="ddl"):
@@ -124,9 +132,10 @@ def _main(argv):
             failed = True
             ops.log(f"  [ERROR] {t}: {err}")
             continue
-        lines, n = res
+        lines, n, ok = res
         ops.log("\n".join(lines))
         total += n
+        failed = failed or not ok
 
     if args.apply and args.verify_sa:
         def visible(t):

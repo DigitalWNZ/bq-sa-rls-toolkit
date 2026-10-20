@@ -135,7 +135,8 @@ python list_principals.py --organizations 123456789012 --exclude-patterns 'copil
 ```
 
 - 输出 `existing.csv`：`email, principal_type, home_project`。
-- 退出码 1 = 部分读取失败（日志里的 `[ERROR]` 说明是哪个项目 / 数据集 / 表 / 账号目录），其余结果已写入；修好权限后重跑。
+- 退出码 1 = 部分读取失败（日志里的 `[ERROR]` 说明是哪个项目 / 数据集 / 表 / 账号目录 / Group），其余结果已写入；修好权限后重跑。
+- **Group 未能展开**：日志结尾的 `[ERROR] 以下 N 个 Group 未能展开` 列出了这些组，组内成员**没有**列入 CSV。用有 Group 读取权限的账号重跑，或在 Admin 控制台手工核对这些组的成员（其中的 SA / user 同样要加入白名单 Group）。外部域的组（合作方的组、Google 管理的组等）任何账号都读不到，只能向对方确认成员或判断是否需要列入白名单。
 - 规模参考：每张表读一次 IAM 策略，1000 张表约 1 分钟，10 万张表约 1.5 小时。
 
 **客户审核**：从 CSV 中挑出现存的 SA / user，决定各自进 ReadOnly 还是 Writable Group。
@@ -290,6 +291,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | 报 403 `USER_PROJECT_DENIED` / `serviceusage.services.use` | 执行账号在 quota 项目上缺少 `roles/serviceusage.serviceUsageConsumer`（见 0.2） |
 | 退出码 2，参数错误 | 旧参数（如 `--tables-file`）已删除；表名必须 `project.dataset.table`（不接受冒号写法）；`.csv` 文件不存在 |
 | 某表 `[SKIP] … 不在登记表` | 登记表 `table_name` 与参数中的表名不完全一致（大小写、空格、少了项目名都算不一致） |
+| `[ERROR] BigQuery 报 Group … 不存在，已停止` | `--group` 拼错，或 Group 刚创建 / 刚改过成员、还没同步到 BigQuery：核对拼写，或等几分钟后重跑。第一张表就失败时退出码 2、未做任何变更 |
 | 某表 `[SKIP] … 表不存在（可能已被删除）` | 映射表 / 登记表里还有这张表，但它已被 drop 或表名写错：清理映射表 / 登记表中的记录（其余表不受影响，退出码 1） |
 | Copilot 账号查到 0 行 | 依次检查：在 Copilot Group 里吗？条件表有该账号的行吗（小写裸邮箱）？维度值与业务列的值一致吗？Group 刚变更需等几分钟 |
 | Copilot 账号查询报 Access Denied | Copilot Group 没有条件表读权限（见第 4–6 步第 3 点） |

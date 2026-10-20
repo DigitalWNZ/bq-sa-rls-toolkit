@@ -4,8 +4,8 @@
 
 | 类别 | 位置 | 数量 | 结果 | 环境 |
 |---|---|---|---|---|
-| 1 单体测试 | `tests/unit/` | 638 | ✅ 638 / 638 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity） |
-| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 34 | ✅ 34 / 34（约 13 分钟） | 真实 GCP（Argolis 测试组织） |
+| 1 单体测试 | `tests/unit/` | 666 | ✅ 666 / 666 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
+| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 35 | ✅ 35 / 35（约 14 分钟） | 真实 GCP（Argolis 测试组织） |
 | 3 功能测试 | `tests/functional/test_requirements.py` | 22 | ✅ 22 / 22 | 本地；每条需求另有对应的系统测试用例 |
 | 4 性能测试 | `tests/perf/run_perf.py`、`simulate.py` | 1000 表 × 500 新增 × 100 存量 | ✅ 全部步骤成功，0 重试、0 错误 | 真实 GCP + 本地模拟 |
 | 5 稳定性测试 | `tests/stability/test_stability.py`、`tests/integration/test_zz_stability.py` | 28 + 4 | ✅ 32 / 32 | 本地 + 真实 GCP |
@@ -15,7 +15,7 @@
 ```bash
 pip install -r requirements.txt pytest
 
-# 本地（单体 + 功能 + 稳定性），约 3 秒，不访问 GCP
+# 本地（单体 + 功能 + 稳定性），约 3 秒，不访问 GCP；Python 3.9 与 3.13 均已实测通过
 python -m pytest tests/unit tests/functional tests/stability -q
 
 # 真实环境（系统测试 + 真实稳定性测试），约 15 分钟；会在测试项目中建表、建 SA / Group、设置并删除 RLS 规则
@@ -40,7 +40,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 
 ---
 
-## 1. 单体测试（638）
+## 1. 单体测试（666）
 
 用 `tests/unit/fakes.py` 中的 FakeWorld 模拟 GCP（表、规则、授权对象、登记表 / 条件表 / 映射表、IAM、账号目录、Group），直接调用四个脚本的 `main()`，断言退出码、日志、生成的 DDL 与最终规则状态。
 
@@ -56,11 +56,12 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | `test_scripts.py` | 36 | 四个脚本的主流程 |
 | `test_normal_cases.py` | 28 | 正常系：每条设计决定一个用例，含第 1 → 3 → 7 → 8 步端到端流程 |
 | `test_auth_defaults.py` | 18 | 执行账号 / quota 项目自动确定；确定不了 → 退出码 2 + 提示 |
+| `test_review_fixes.py` | 26 | 独立审查报告的修复项：BigQuery 报 Group 不存在时不重试、第一张表即停止（退出码 2、其余零 DDL）、执行中途出现则停止未开始的表；apply_bypass `--group` 格式检查；映射表列名不区分大小写；rollback 中途失败仍输出已删规则内容；Cloud Identity 403 无权限 / API 未启用 / 429 重试 / 5xx 用尽 / 空组 / 嵌套组读不到（HttpMockSequence） |
 | `test_log_file.py` | 17 | 运行日志文件：四个脚本默认写 `logs/<脚本名>_<时间戳>.log`、内容与屏幕逐字相同、`--log-dir`、目录不可写只 `[WARN]`、同一秒不覆盖、argparse 错误 / `--help` 不写、Ctrl-C 与参数错误也记录、32 线程并发不交错、写盘失败不影响脚本 |
 | `test_gcp_auth.py` | 15 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新 |
 | `test_gcp_ops.py` | 10 | 重试分类、限速、挂载后验证（扮演失败立即失败） |
 
-## 2. 系统测试（34，真实 GCP）
+## 2. 系统测试（35，真实 GCP）
 
 `conftest.py` 在测试项目中准备：业务表（含列名不同、分区表、映射到不存在的列、映射表里没有、登记为未开启、没有 bypass 的表；每张 9 行，含 HK / SG / US × mobile 数据）、条件表 / 映射表 / 登记表（条件表、映射表、登记表自身、备用映射表都登记为 `rls_enabled = 0`；映射表 / 登记表中另有一张实际不存在的 `dropped_t`）、7 个测试 SA（存量读 / 写、通过数据集 ACL 授权、Copilot A / B / N / M）、4 个 Group（ReadOnly、Writable、ACL、Copilot）及其权限。然后按方案文档顺序运行四个脚本，并**以各账号身份实际查表**验证可见性。
 
@@ -68,7 +69,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 |---|---|
 | test_01–04 | list_principals：项目范围列出的 SA 与 IAM API **完全一致**（含没有任何授权的）；组织范围含其它项目的 SA、账号目录全部 user；排除参数；不给账号 / quota 参数时自动确定 |
 | test_10–14 | apply_bypass：首次设置提示、两个白名单 Group、项目范围、登记表筛选 / 错误 / 冲突、重跑 NOOP、实际可见全部、REPLACE 打印旧内容 |
-| test_20–26 | apply_copilot：无 bypass 也照建、演练、执行（**运行日志文件与屏幕输出逐字相同**）；**表已被 drop → `[SKIP] 表不存在`，演练 / 执行都只跳过这一张**；**同一 Group 内 A 只看 HK、M 只看 HK 且 mobile（多维度 AND）、B（维度全空）看全部、user 只看 SG、不在条件表的 0 行；没有校验维度的表 Copilot 成员 0 行**；改条件表不跑脚本即生效；**新增账号不跑脚本即生效**；重跑 NOOP、改坏后 REPLACE |
+| test_20–26 | apply_copilot：无 bypass 也照建、演练、执行（**运行日志文件与屏幕输出逐字相同**；映射表列名 `REGION` 与表中 `region` 大小写不同也正确）；**Group 不存在 → 第一张表即停止、退出码 2、所有表零变更、不再等待重试（test_22c，bypass 与 copilot 各一次）**；**表已被 drop → `[SKIP] 表不存在`，演练 / 执行都只跳过这一张**；**同一 Group 内 A 只看 HK、M 只看 HK 且 mobile（多维度 AND）、B（维度全空）看全部、user 只看 SG、不在条件表的 0 行；没有校验维度的表 Copilot 成员 0 行**；改条件表不跑脚本即生效；**新增账号不跑脚本即生效**；重跑 NOOP、改坏后 REPLACE |
 | test_30–34 | rollback：不给筛选 = 全部（演练）、按 Copilot Group、按 user 与规则名、按 Group、删光不拦 |
 | r01–r07 | 视图不支持 RLS 且被隔离、视图误配进映射表、条件表脏数据（大小写 / 前缀 / 组邮箱 / 乱码 / 特殊列名）、大小写修正后无需重跑、user 执行账号、不可扮演的 `--verify-sa` 立即失败、错误的 gcloud 账号、不存在的数据集 / 表 |
 

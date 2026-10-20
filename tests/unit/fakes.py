@@ -40,6 +40,8 @@ class FakeWorld:
         self.datasets = {}        # "p.d" -> [tables]
         self.ddl_log = []         # 执行过的 DDL
         self.fail_ddl_on = set()  # 这些表执行 DDL 时抛错
+        self.missing_groups = set()       # 这些 Group 不存在：建规则时抛 BigQuery 的「Group … does not exist」
+        self.fail_drop_policies = set()   # 删除这些规则名时抛错（模拟逐条 DROP 中途失败）
         # list_principals（全部权威 API）
         self.crm_children = {}    # "organizations/1" / "folders/2" -> {"folders": [...], "projects": [(id, state)]}
         self.org_customer = {}    # org id -> Cloud Identity customer id
@@ -139,6 +141,10 @@ class FakeWorld:
             if t in self.fail_ddl_on:
                 raise RuntimeError(f"boom on {t}")
             grantees = re.findall(r'"([^"]+)"', m["grant"])
+            for g in grantees:                    # 与真实 BigQuery 报错文本一致（2026-10-20 实测）
+                if g.startswith("group:") and g[6:] in self.missing_groups:
+                    raise RuntimeError(f"400 Failed to create row access policy: IAM setPolicy failed for "
+                                       f"RowAccessPolicy {m['name']} on table {t}: Group {g[6:]} does not exist.")
             pols = self.policies(t)
             pols[:] = [p for p in pols if p["id"] != m["name"]]
             pols.append({"id": m["name"], "filter": m["filter"], "grantees": grantees})
@@ -146,7 +152,7 @@ class FakeWorld:
         m = _DROP_RE.match(ddl.strip())
         if m:
             t = m["table"]
-            if t in self.fail_ddl_on:
+            if t in self.fail_ddl_on or m["name"] in self.fail_drop_policies:
                 raise RuntimeError(f"boom on {t}")
             pols = self.policies(t)
             if len(pols) == 1:
@@ -200,7 +206,7 @@ def install(monkeypatch, world, script_module=None):
     monkeypatch.setattr(ops, "expand_tables", expand_tables)
     monkeypatch.setattr(ops, "list_policies",
                         lambda ctx, t, grantees_for=None, workers=4: world.list_policies(t, grantees_for))
-    monkeypatch.setattr(ops, "run_ddl", lambda ctx, ddl, loc: world.run_ddl(ddl))
+    monkeypatch.setattr(ops, "run_ddl", lambda ctx, ddl, loc, **kw: world.run_ddl(ddl))
     monkeypatch.setattr(ops, "verify_full_access",
                         lambda ctx, t, sa, timeout=300, mode="sample":
                         world.verify_result.get((t, sa), ("ok", "可见数据（0s）")))
@@ -317,7 +323,8 @@ def install(monkeypatch, world, script_module=None):
         def fetch(x):
             world.hit("group")
             return world.groups.get(x)
-        return core.expand_group(g, fetch, max_depth)
+        members, unresolved = core.expand_group(g, fetch, max_depth)
+        return members, unresolved, {}
 
     for name, fn in (("list_org_descendants", list_org_descendants), ("org_directory_customer", org_directory_customer),
                      ("directory_users", directory_users), ("resource_iam_bindings", resource_iam_bindings),

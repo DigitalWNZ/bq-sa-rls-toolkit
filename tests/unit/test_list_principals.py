@@ -83,7 +83,7 @@ def world(monkeypatch):
     w.groups["bi-team@trip.com"] = [("ana@trip.com", "USER"), ("nested@trip.com", "GROUP")]
     w.groups["nested@trip.com"] = [("svc-in-group@p7.iam.gserviceaccount.com", "SERVICE_ACCOUNT")]
     w.groups["acl-g@trip.com"] = [("carol@vendor.com", "USER"), ("ext-g@other.com", "GROUP")]
-    w.groups["ext-g@other.com"] = None
+    w.groups["ext-g@other.com"] = []                  # 空组（读得到、没有成员）；读不到的组见 test_lp_a_08
     install(monkeypatch, w, list_principals)
     return w
 
@@ -284,10 +284,41 @@ class TestAbnormal:
         assert code == 0
 
     def test_lp_a_08_unresolvable_and_cyclic_groups(self, world, tmp_path, capsys):
+        # 读不到的嵌套组：[ERROR] 写明组与原因、结尾汇总、退出码 1；其余主体照常写入 CSV；环不会死循环
+        world.groups["ext-g@other.com"] = None
         world.groups["bi-team@trip.com"].append(("bi-team@trip.com", "GROUP"))
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert code == 0 and "ext-g@other.com" in err and "ana@trip.com" in rows
+        assert code == 1 and "ana@trip.com" in rows and "carol@vendor.com" in rows
+        assert "[ERROR] 展开 group:ext-g@other.com（group:acl-g@trip.com 中的嵌套组） 失败：无权读取" in err
+        assert "[ERROR] 以下 1 个 Group 未能展开，其成员未列入 CSV" in err and "  - ext-g@other.com" in err
+        assert "[WARN]" not in err and "Traceback" not in err
+
+    def test_lp_a_08b_top_level_group_unreadable_vs_empty(self, world, tmp_path, capsys):
+        # 最外层的组读不到 → [ERROR] + 退出码 1；空组（读得到、没有成员）不算错误
+        world.groups["bi-team@trip.com"] = None
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1 and "[ERROR] 展开 group:bi-team@trip.com 失败：无权读取" in err and "carol@vendor.com" in rows
+        world.groups["bi-team@trip.com"] = []
+        code, _, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0 and "[ERROR]" not in err and "全部展开" in err
+
+    def test_lp_a_08c_group_api_error_is_error_not_silent(self, world, tmp_path, capsys, monkeypatch):
+        # API 未启用 / 限流重试用尽等异常：[ERROR] 说明原因、退出码 1，其余结果照常写入
+        real = list_principals.ops.expand_group
+
+        def boom(ctx, g, max_depth=10):
+            if g == "bi-team@trip.com":
+                raise RuntimeError("403 Cloud Identity API has not been used in project fake-quota or it is disabled")
+            return real(ctx, g, max_depth)
+        monkeypatch.setattr(list_principals.ops, "expand_group", boom)
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1 and "carol@vendor.com" in rows
+        assert "[ERROR] 展开 group:bi-team@trip.com 失败: Cloud Identity API 未在 quota 项目启用" in err
+        assert "  - bi-team@trip.com" in err
 
     def test_lp_a_09_csv_formula_injection_neutralized(self, world, tmp_path):
         world.dataset_acl["prod.dw"].append(("READER", "userByEmail", '=HYPERLINK("http://evil")@x.com'))

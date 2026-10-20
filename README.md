@@ -23,6 +23,7 @@
   - [4. rollback_rls.py](#4-rollback_rlspy回退第-8-步)
 - [权限要求汇总](#权限要求汇总)
 - [安全须知（信任边界）](#安全须知信任边界)
+- [限制与注意事项](#限制与注意事项)
 - [审计日志](#审计日志)
 - [环境变量](#环境变量)
 
@@ -72,7 +73,7 @@ flowchart TD
 ## 快速开始
 
 ```bash
-# 1. Python 3.9 以上（实测 3.13）
+# 1. Python 3.9 以上（3.9 与 3.13 均已实测）
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # google-auth, google-api-python-client, google-cloud-bigquery
 
@@ -120,7 +121,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 |---|---|
 | 0 | 成功 |
 | 1 | 部分失败或数据有问题（其余照常处理）：DDL 失败、验证失败、登记表记录冲突、条件表数据不规范、部分范围读取失败等 |
-| 2 | 参数错误 / 登记表不可用 / 无法确定执行账号或 quota 项目 —— **未做任何变更** |
+| 2 | 参数错误 / 登记表不可用 / 无法确定执行账号或 quota 项目 / 执行时第一张表即报 Group 不存在 —— **未做任何变更** |
 | 130 | 被用户中断（Ctrl-C） |
 
 **日志前缀**：`[LOG]` 运行日志文件位置；`[AUTH]` 账号；`[SCAN]` 目标范围；`[CREATE]` / `[NOOP]` / `[REPLACE]` / `[DROP]` 逐表计划；`[SKIP]` 跳过（附原因）；
@@ -348,6 +349,15 @@ gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bi
 - 账号不在条件表中 → 0 行（安全的默认）；条件表 `sa` 大小写不一致 → 0 行（`[WARN]` 提醒）。
 - 规则按名字识别：手工创建 / 改名的规则不在 apply_* 的识别范围内；rollback `--principals` 按授权对象匹配，能覆盖手工规则。
 - 视图不支持 RLS；直接列出视图会在该表上失败（退出码 1），不影响其它表。
+
+## 限制与注意事项
+
+- **Copilot Group 成员能读整张条件表**：规则里的子查询以查询者身份执行，所以 Copilot Group 必须有条件表的读权限，组内每个账号因此都能看到所有账号的可见范围。这是 BigQuery 子查询规则的固有特性（被规则引用的表不能再加 RLS），请知悉。
+- **REPLACE 时有极短的无过滤窗口**：规则内容变化时脚本用 `CREATE OR REPLACE ROW ACCESS POLICY` 覆盖。若该表上只有这一条规则，BigQuery 官方说明替换瞬间可能短暂不过滤。首次设置或 NOOP 不受影响；如需避免，可在业务低峰执行。
+- **rollback 不要与 apply 同时对同一批表运行**：rollback 先读取规则再删除，「这张表的规则将被全部删除」的判断在读取时做出；同时有 apply 在建规则时，判断可能与执行时的实际情况不一致。
+- **list_principals 读不到某个自定义角色的定义时按「能读表数据」处理**：打印 `[WARN]`，其成员照常列入 CSV，退出码不因此变为 1。这是有意的「宁可多列、不可漏列」，与其它读取失败（`[ERROR]` + 退出码 1）不同。
+- **映射表 `col_name` 不区分大小写**：与 BigQuery 列名规则一致（`Region` 与 `region` 视为同一列），生成的过滤条件使用表中的真实写法。
+- **Group 写错或刚创建尚未同步**：执行时 BigQuery 报「Group … does not exist」，脚本不再等待重试——第一张需要变更的表失败即停止，其余表都不执行（退出码 2，未做任何变更）。Group 刚创建或刚改过成员时，等几分钟后重跑即可。演练不执行 DDL，发现不了这类问题。
 
 ## 审计日志
 

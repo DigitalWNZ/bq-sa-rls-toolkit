@@ -58,7 +58,7 @@ def _create_tables():
            STRUCT('{L.T_ALT}', 'market', 'region'),
            STRUCT('{L.T_ALT}', 'ptype', 'prdtype'),
            STRUCT('{L.T_ALT}', 'meta.ref', 'refername'),
-           STRUCT('{L.T_PART}', 'region', 'region'),
+           STRUCT('{L.T_PART}', 'REGION', 'region'),                # 列名大小写与表中不同（表里是 region）
            STRUCT('{L.T_BADMAP}', 'missing_col', 'region'),
            STRUCT('{L.T_DROPPED}', 'region', 'region'),             # 表已被 drop：应 [SKIP] 表不存在
            STRUCT('{L.T_COND}', 'sa', 'region')])""")         # 误配：条件表自身，应被排除

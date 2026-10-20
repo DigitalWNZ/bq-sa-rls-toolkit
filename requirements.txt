@@ -1,3 +1,6 @@
-google-auth
-google-api-python-client
-google-cloud-bigquery
+# 版本下限 = 实测通过的最低版本（Python 3.9 环境下解析到的版本；Python 3.13 环境使用更新版本，同样实测通过）
+google-cloud-bigquery>=3.41
+google-api-python-client>=2.198
+google-auth>=2.50
+google-auth-httplib2>=0.3.1
+httplib2>=0.32

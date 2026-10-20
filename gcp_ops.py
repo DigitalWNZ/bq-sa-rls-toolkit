@@ -5,6 +5,7 @@ DDL 对 IAM / Group 传播延迟做了重试；只读 API 对 429 / 5xx 做指�
 
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -117,6 +118,18 @@ _RATE_LIMIT_HINTS = ("rate limit", "ratelimitexceeded", "quota exceeded", "quota
 def is_rate_limit_error(e):
     msg = str(e).lower()
     return any(h in msg for h in _RATE_LIMIT_HINTS)
+
+
+# 授权对象不存在。BigQuery 实际报错（2026-10-20 实测）:
+#   "Failed to create row access policy: IAM setPolicy failed for RowAccessPolicy <名> on table <表>:
+#    Group <邮箱> does not exist."
+# Group 真不存在（拼错）与刚创建 / 刚改成员尚未同步，报的是同一句话；apply 脚本对此不再重试，立即停止。
+_PRINCIPAL_MISSING_RE = re.compile(
+    r"\b(group|user|serviceaccount|service account)\s+[^\s:]+@[^:]*?\s+does\s+not\s+exist", re.I)
+
+
+def is_principal_missing_error(e):
+    return bool(_PRINCIPAL_MISSING_RE.search(" ".join(str(e).split())))
 
 
 def retry(fn, desc="", timeout=300, interval=10, retry_if=is_propagation_error):
@@ -280,8 +293,17 @@ def run_query(ctx, sql, location, params=None):
     return list(ctx.bq.query(sql, location=location, job_config=cfg).result())
 
 
-def run_ddl(ctx, ddl, location):
-    retry(lambda: ctx.bq.query(ddl, location=location).result(), desc="DDL", timeout=300)
+def run_ddl(ctx, ddl, location, retry_missing_principal=True):
+    """
+    执行一条 DDL。retry_missing_principal=False 时，「授权对象（Group 等）不存在」不按传播延迟重试、立即抛出
+    （apply 脚本使用：Group 写错时不再每张表空等 300 秒）；速率限制、并发修改冲突等仍自动重试。
+    """
+    if retry_missing_principal:
+        retry_if = is_propagation_error
+    else:
+        def retry_if(e):
+            return is_propagation_error(e) and not is_principal_missing_error(e)
+    retry(lambda: ctx.bq.query(ddl, location=location).result(), desc="DDL", timeout=300, retry_if=retry_if)
 
 
 def list_policies(ctx, table, grantees_for=None, workers=4):
@@ -451,23 +473,43 @@ _CONFIG_ERROR_HINTS = ("user_project", "quota project", "service_disabled", "has
                        "is disabled", "serviceusage")
 
 
+def _is_unreadable_group_error(e):
+    """403 / 404 且不是配置问题（API 未启用、quota 项目无权限）→ 该 Group 读不到（无权限 / 外部域 / 不存在）。"""
+    return (isinstance(e, HttpError) and e.resp.status in (403, 404)
+            and not any(h in str(e).lower() for h in _CONFIG_ERROR_HINTS))
+
+
+GROUP_UNREADABLE_REASON = "无权读取（外部域的 Group，或执行账号没有 Group 读取权限；不存在的 Group 也返回同样的错误）"
+
+
 def lookup_group(ctx, email):
+    """Group 的资源名；读不到返回 None。配置错误、限流重试用尽、网络错误等向上抛出。"""
     try:
-        return ctx.ci.groups().lookup(groupKey_id=email).execute()["name"]
+        return execute_with_backoff(ctx.ci.groups().lookup(groupKey_id=email), desc=f"lookup group {email}")["name"]
     except HttpError as e:
-        if e.resp.status in (403, 404) and not any(h in str(e).lower() for h in _CONFIG_ERROR_HINTS):
+        if _is_unreadable_group_error(e):
             return None
         raise
 
 
-def group_members_typed(ctx, group_email):
-    """Group 直接成员 [(email, type)]；type 为 USER / SERVICE_ACCOUNT / GROUP / ...。读不到时返回 None。"""
+def group_members_typed(ctx, group_email, reasons=None):
+    """
+    Group 直接成员 [(email, type)]；type 为 USER / SERVICE_ACCOUNT / GROUP / ...；空组返回 []。
+    读不到（无权限 / 外部域 / 不存在）返回 None，并把原因写入 reasons[group_email]。
+    Cloud Identity API 未启用、quota 项目无权限、限流 / 5xx / 网络错误重试用尽等**向上抛出**，由调用方记 [ERROR]。
+    """
+    def unreadable(e):
+        if reasons is not None:
+            reasons[group_email] = f"{GROUP_UNREADABLE_REASON}: HTTP {e.resp.status}"
+        return None
+
     try:
-        name = lookup_group(ctx, group_email)
-    except Exception:  # noqa: BLE001
-        return None
-    if not name:
-        return None
+        name = execute_with_backoff(ctx.ci.groups().lookup(groupKey_id=group_email),
+                                    desc=f"lookup group {group_email}")["name"]
+    except HttpError as e:
+        if _is_unreadable_group_error(e):
+            return unreadable(e)
+        raise
     out, api = [], ctx.ci.groups().memberships()
     req = api.list(parent=name, pageSize=200, view="FULL")
     try:
@@ -477,21 +519,25 @@ def group_members_typed(ctx, group_email):
                        for m in resp.get("memberships", []))
             req = api.list_next(req, resp)
     except HttpError as e:
-        if e.resp.status in (403, 404):
-            return None
+        if _is_unreadable_group_error(e):
+            return unreadable(e)
         raise
     return out
 
 
 def expand_group(ctx, group_email, max_depth=10):
-    """递归展开 Group（含嵌套组），返回 core.expand_group 的 (members, unresolved)。"""
-    cache = {}
+    """
+    递归展开 Group（含嵌套组）-> (members, unresolved, reasons)。
+    unresolved [(group, via)]：读不到的组（含最外层的组本身，此时 via 为 []）；reasons {group: 原因}。
+    """
+    cache, reasons = {}, {}
 
     def fetch(g):
         if g not in cache:
-            cache[g] = group_members_typed(ctx, g)
+            cache[g] = group_members_typed(ctx, g, reasons)
         return cache[g]
-    return core.expand_group(group_email, fetch, max_depth=max_depth)
+    members, unresolved = core.expand_group(group_email, fetch, max_depth=max_depth)
+    return members, unresolved, reasons
 
 
 # --------------------------------------------------------------------------- #

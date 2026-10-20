@@ -30,12 +30,15 @@
       --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb
   python apply_bypass_rls.py ... --apply --verify-sa reader@prod.iam.gserviceaccount.com
 
-退出码: 0 成功；1 DDL 执行失败 / 验证失败 / 登记表记录冲突；2 参数错误 / 登记表不可用（未做任何变更）
+Group 不存在: 执行时 BigQuery 报「Group … does not exist」→ 不等待重试，立即停止（第一张需要变更的表先单独执行，
+  它失败则其余表都不执行，退出码 2）。Group 刚创建 / 刚改成员时等几分钟后重跑。
+退出码: 0 成功；1 DDL 执行失败 / 验证失败 / 登记表记录冲突；2 参数错误 / 登记表不可用 / 第一张表即报 Group 不存在（未做任何变更）
 """
 
 import argparse
 import os
 import sys
+import threading
 
 import gcp_ops as ops
 import rls_core as core
@@ -108,6 +111,51 @@ def workers(args):
     return max(1, args.parallel)
 
 
+GROUP_MISSING_HINT = "若 Group 刚创建或刚改过成员，同步到 BigQuery 需要几分钟，请稍后重跑；否则请检查 --group 是否拼错"
+
+
+def execute_tables(tables, execute, n_workers, apply, needs_change, on_result):
+    """
+    逐表执行。execute(t) -> (lines, ok, group_missing)；on_result(t, res, err) 负责打印与计数。
+    执行模式下先单独执行第一张需要变更的表：BigQuery 报 Group 不存在 → 立即停止，其余表都不执行
+    （返回 "abort_first"，此时未做任何变更）。并行阶段再出现 Group 不存在 → 尚未开始的表不再执行（"abort_mid"）。
+    返回 (状态, 未执行的表数)。
+    """
+    first = next((t for t in tables if needs_change(t)), None) if apply else None
+    if first is not None:
+        res = execute(first)
+        on_result(first, res, None)
+        if res[2]:
+            return "abort_first", len(tables) - 1
+    rest = [t for t in tables if t != first]
+    stop = threading.Event()
+
+    def guarded(t):
+        if stop.is_set():
+            return None
+        res = execute(t)
+        if res[2]:
+            stop.set()
+        return res
+
+    not_run = 0
+    for t, res, err in ops.parallel_map(guarded, rest, workers=n_workers, desc="ddl"):
+        if res is None and err is None:
+            not_run += 1
+            continue
+        on_result(t, res, err)
+    return ("abort_mid" if stop.is_set() else "ok"), not_run
+
+
+def log_group_abort(status, not_run, group):
+    """execute_tables 中止时的说明；返回该情况下的退出码（abort_first = 2：未做任何变更）。"""
+    if status == "abort_first":
+        ops.log(f"[ERROR] BigQuery 报 Group {group} 不存在，已停止：其余 {not_run} 张表未执行，未做任何变更。{GROUP_MISSING_HINT}")
+        return 2
+    ops.log(f"[ERROR] 执行中 BigQuery 报 Group {group} 不存在，已停止：{not_run} 张表未执行。{GROUP_MISSING_HINT}")
+    return 1
+
+
 def run_main(fn, argv):
     """统一的顶层错误处理：意外异常打印 [ERROR] 并返回 1（RLS_DEBUG=1 时抛出完整堆栈）；结束时关闭本次日志文件。"""
     try:
@@ -146,10 +194,10 @@ def _main(argv):
     if len(groups) != 1:
         ops.log(f"[ERROR] --group 只能指定一个 Group，收到 {len(groups)} 个: {groups}")
         return 2
-    group = core.member_email(groups[0])
-    grantee = f"group:{group}"
-    policy_name = core.bypass_policy_name(group)
     try:
+        group = core.group_email(groups[0])                        # Group 邮箱格式（不能是 SA、不能带 user: 等前缀）
+        grantee = f"group:{group}"
+        policy_name = core.bypass_policy_name(group)
         core.build_policy_ddl("p.d.t", policy_name, [grantee], "TRUE")   # 提前校验 Group 邮箱
         tables, datasets, projects, _ = read_scope(args)
         registry = core.parse_table_arg(args.registry_table)
@@ -199,34 +247,44 @@ def _main(argv):
 
     log_first_policy_tables([t for t, pl in plans.items() if pl.first_policy and pl.action == "create"])
 
-    # 阶段 2：并行执行（每张表一条 DDL）
+    # 阶段 2：执行（每张表一条 DDL；执行模式先单独执行第一张，BigQuery 报 Group 不存在则立即停止）
     def execute(t):
         pl = plans[t]
         lines = []
         if pl.action == "noop":
-            return [f"[NOOP] {t}"], True
+            return [f"[NOOP] {t}"], True, False
         ddl = core.build_policy_ddl(t, policy_name, [grantee], "TRUE")
         lines.append(f"[{pl.action.upper()}] {t}\n{ddl}")
         if pl.action == "replace":
             lines.append(f"  被覆盖的旧内容: grantees={pl.old['grantees']} filter={pl.old['filter']}")
         if args.apply:
             try:
-                ops.run_ddl(ctx, ddl, ctx.table_location(t))
+                ops.run_ddl(ctx, ddl, ctx.table_location(t), retry_missing_principal=False)
             except Exception as e:  # noqa: BLE001
                 lines.append(f"  [ERROR] {e}")
-                return lines, False
-        return lines, True
+                return lines, False, ops.is_principal_missing_error(e)
+        return lines, True, False
 
     counts = {"SKIP": skipped} if skipped else {}
-    for t, res, err in ops.parallel_map(execute, list(plans), workers=workers(args), desc="ddl"):
+
+    def on_result(t, res, err):
+        nonlocal failed
         if err:
             failed = True
             ops.log(f"[ERROR] {t}: {err}")
-            continue
-        lines, ok = res
+            return
+        lines, ok, _ = res
         ops.log("\n".join(lines))
         failed = failed or not ok
         counts[plans[t].action.upper()] = counts.get(plans[t].action.upper(), 0) + 1
+
+    status, not_run = execute_tables(list(plans), execute, workers(args), args.apply,
+                                     lambda t: plans[t].action != "noop", on_result)
+    if status != "ok":
+        code = log_group_abort(status, not_run, group)
+        ops.log(f"===== 中止 ({mode})：" + ("，".join(f"{k} {v}" for k, v in sorted(counts.items())) or "无变更")
+                + f"，未执行 {not_run} =====")
+        return code
 
     # 阶段 3：挂载后验证（并行）
     if args.apply and args.verify_sa:
