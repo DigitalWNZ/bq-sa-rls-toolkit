@@ -1,12 +1,12 @@
 # 测试
 
-> 最新一次完整测试：2026-10-19。**五类测试全部 100% 通过。**
+> 最新一次完整测试：2026-10-20。**五类测试全部 100% 通过。**
 
 | 类别 | 位置 | 数量 | 结果 | 环境 |
 |---|---|---|---|---|
-| 1 单体测试 | `tests/unit/` | 621 | ✅ 621 / 621 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity） |
-| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 33 | ✅ 33 / 33（约 12 分钟） | 真实 GCP（Argolis 测试组织） |
-| 3 功能测试 | `tests/functional/test_requirements.py` | 21 | ✅ 21 / 21 | 本地；每条需求另有对应的系统测试用例 |
+| 1 单体测试 | `tests/unit/` | 638 | ✅ 638 / 638 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity） |
+| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 34 | ✅ 34 / 34（约 13 分钟） | 真实 GCP（Argolis 测试组织） |
+| 3 功能测试 | `tests/functional/test_requirements.py` | 22 | ✅ 22 / 22 | 本地；每条需求另有对应的系统测试用例 |
 | 4 性能测试 | `tests/perf/run_perf.py`、`simulate.py` | 1000 表 × 500 新增 × 100 存量 | ✅ 全部步骤成功，0 重试、0 错误 | 真实 GCP + 本地模拟 |
 | 5 稳定性测试 | `tests/stability/test_stability.py`、`tests/integration/test_zz_stability.py` | 28 + 4 | ✅ 32 / 32 | 本地 + 真实 GCP |
 
@@ -34,11 +34,13 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 |---|---|
 | `RLS_IT=1` | 启用真实环境测试（未设置时 `tests/integration` 全部跳过） |
 | `RLS_IT_PROJECT` / `RLS_IT_ACCOUNT` / `RLS_IT_DOMAIN` / `RLS_IT_ORG` | 测试项目、执行账号（需已 `gcloud auth login`）、Group 所在域名、组织 ID |
+| `RLS_IT_SA_POOL_PROJECT` | 可选：测试项目 SA 已达 100 个上限时，把 Copilot M 这个测试 SA 建在同组织的这个项目里（默认就是测试项目） |
+| `RLS_IT_LOG_DIR` | 可选：被测脚本运行日志的保存目录（默认每次测试会话一个临时目录） |
 | `RLS_IT_CLEANUP=1` | 测试结束后删除测试数据集（默认保留，下次运行会重建表并清掉旧规则） |
 
 ---
 
-## 1. 单体测试（621）
+## 1. 单体测试（638）
 
 用 `tests/unit/fakes.py` 中的 FakeWorld 模拟 GCP（表、规则、授权对象、登记表 / 条件表 / 映射表、IAM、账号目录、Group），直接调用四个脚本的 `main()`，断言退出码、日志、生成的 DDL 与最终规则状态。
 
@@ -54,22 +56,23 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | `test_scripts.py` | 36 | 四个脚本的主流程 |
 | `test_normal_cases.py` | 28 | 正常系：每条设计决定一个用例，含第 1 → 3 → 7 → 8 步端到端流程 |
 | `test_auth_defaults.py` | 18 | 执行账号 / quota 项目自动确定；确定不了 → 退出码 2 + 提示 |
+| `test_log_file.py` | 17 | 运行日志文件：四个脚本默认写 `logs/<脚本名>_<时间戳>.log`、内容与屏幕逐字相同、`--log-dir`、目录不可写只 `[WARN]`、同一秒不覆盖、argparse 错误 / `--help` 不写、Ctrl-C 与参数错误也记录、32 线程并发不交错、写盘失败不影响脚本 |
 | `test_gcp_auth.py` | 15 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新 |
 | `test_gcp_ops.py` | 10 | 重试分类、限速、挂载后验证（扮演失败立即失败） |
 
-## 2. 系统测试（33，真实 GCP）
+## 2. 系统测试（34，真实 GCP）
 
-`conftest.py` 在测试项目中准备：业务表（含列名不同、分区表、映射到不存在的列、映射表里没有、登记为未开启、没有 bypass 的表）、条件表 / 映射表 / 登记表、6 个测试 SA（存量读 / 写、通过数据集 ACL 授权、Copilot A / B / N）、4 个 Group（ReadOnly、Writable、ACL、Copilot）及其权限。然后按方案文档顺序运行四个脚本，并**以各账号身份实际查表**验证可见性。
+`conftest.py` 在测试项目中准备：业务表（含列名不同、分区表、映射到不存在的列、映射表里没有、登记为未开启、没有 bypass 的表；每张 9 行，含 HK / SG / US × mobile 数据）、条件表 / 映射表 / 登记表（条件表、映射表、登记表自身、备用映射表都登记为 `rls_enabled = 0`；映射表 / 登记表中另有一张实际不存在的 `dropped_t`）、7 个测试 SA（存量读 / 写、通过数据集 ACL 授权、Copilot A / B / N / M）、4 个 Group（ReadOnly、Writable、ACL、Copilot）及其权限。然后按方案文档顺序运行四个脚本，并**以各账号身份实际查表**验证可见性。
 
 | 用例 | 验证内容 |
 |---|---|
 | test_01–04 | list_principals：项目范围列出的 SA 与 IAM API **完全一致**（含没有任何授权的）；组织范围含其它项目的 SA、账号目录全部 user；排除参数；不给账号 / quota 参数时自动确定 |
 | test_10–14 | apply_bypass：首次设置提示、两个白名单 Group、项目范围、登记表筛选 / 错误 / 冲突、重跑 NOOP、实际可见全部、REPLACE 打印旧内容 |
-| test_20–26 | apply_copilot：无 bypass 也照建、演练、执行；**同一 Group 内 A 只看 HK、B（维度全空）看全部、user 只看 SG、不在条件表的 0 行**；改条件表不跑脚本即生效；**新增账号不跑脚本即生效**；重跑 NOOP、改坏后 REPLACE |
+| test_20–26 | apply_copilot：无 bypass 也照建、演练、执行（**运行日志文件与屏幕输出逐字相同**）；**表已被 drop → `[SKIP] 表不存在`，演练 / 执行都只跳过这一张**；**同一 Group 内 A 只看 HK、M 只看 HK 且 mobile（多维度 AND）、B（维度全空）看全部、user 只看 SG、不在条件表的 0 行；没有校验维度的表 Copilot 成员 0 行**；改条件表不跑脚本即生效；**新增账号不跑脚本即生效**；重跑 NOOP、改坏后 REPLACE |
 | test_30–34 | rollback：不给筛选 = 全部（演练）、按 Copilot Group、按 user 与规则名、按 Group、删光不拦 |
 | r01–r07 | 视图不支持 RLS 且被隔离、视图误配进映射表、条件表脏数据（大小写 / 前缀 / 组邮箱 / 乱码 / 特殊列名）、大小写修正后无需重跑、user 执行账号、不可扮演的 `--verify-sa` 立即失败、错误的 gcloud 账号、不存在的数据集 / 表 |
 
-## 3. 功能测试（21：客户需求逐条映射）
+## 3. 功能测试（22：客户需求逐条映射）
 
 `REQUIREMENTS` 字典把每条客户需求映射到本地用例和真实环境用例；`test_requirement_table_complete` 保证每条需求都有用例。
 
@@ -85,7 +88,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | F08 | 登记表双重保证：只有 rls_enabled = 1 的表授权；原始字符串精确比较；不看 status；冲突 `[WARN]` 退出码 1 | test_10 / 11c / 11e |
 | F09 | apply_copilot：每张表给 Copilot Group 建一条规则，过滤条件与客户 sample 一致；同组成员按条件表各看各的 | test_22 / 23 |
 | F10 | 维度 = 条件表除 id、sa 外的 ARRAY\<STRING\> 列；表的维度 = 映射表 to_name；多维度 AND；status 不生效 | test_21 / 22 |
-| F11 | 只处理登记表 rls_enabled = 1 的表；没有校验维度的表 `[SKIP]` | test_21 |
+| F11 | 只处理登记表 rls_enabled = 1 的表；没有校验维度的表 `[SKIP]`；表已不存在 `[SKIP]`、其余表照常 | test_21 / 22b |
 | F12 | 新增 Copilot 账号：加入 Group + 条件表加一行即生效，无需重跑脚本 | test_25 |
 | F13 | 457 / 500 个账号也不超过每表 400 条规则上限（每表每 Group 一条） | 性能测试 |
 | F14 | 条件表 / 映射表是否设置 RLS 只由登记表控制 | test_11c / 21 |
@@ -95,6 +98,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | F18 | 参数精简：值或 `.csv`、可重复累加；表名 project.dataset.table（反引号可选、不支持冒号）；旧参数被拒；`--parallel` 默认 16 | test_11 / 32 |
 | F19 | 执行账号 / quota 项目自动确定；确定不了退出码 2 + 提示 | test_04 |
 | F20 | 出错不输出 Python 堆栈；退出码 0 / 1 / 2 语义 | r05 / r06 / r07 |
+| F21 | 每次运行自动保存日志文件（默认 `logs/`、`--log-dir` 可改、内容与屏幕完全一致、建不了只警告、不覆盖不清理） | test_22 |
 
 ## 4. 性能测试
 

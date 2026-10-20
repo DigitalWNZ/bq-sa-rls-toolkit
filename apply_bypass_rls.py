@@ -23,6 +23,7 @@
   这些表会在日志中列出（「将为以下这些表首次设置RLS规则」），只作提示，不拦截。
 --verify-sa: 执行后扮演该 Group 里的一个 SA 查表，300 秒内查到任意一行即通过。
 --parallel: 同时处理的表数（默认 16）；同一张表上的操作始终顺序执行。
+运行日志: 屏幕输出原样另存到 logs/apply_bypass_rls_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录）。
 
 示例:
   python apply_bypass_rls.py --group group_existingsa_read@domain.com --tables tables.csv \\
@@ -108,7 +109,7 @@ def workers(args):
 
 
 def run_main(fn, argv):
-    """统一的顶层错误处理：意外异常打印 [ERROR] 并返回 1（RLS_DEBUG=1 时抛出完整堆栈）。"""
+    """统一的顶层错误处理：意外异常打印 [ERROR] 并返回 1（RLS_DEBUG=1 时抛出完整堆栈）；结束时关闭本次日志文件。"""
     try:
         return fn(argv)
     except SystemExit:
@@ -121,6 +122,8 @@ def run_main(fn, argv):
             raise
         ops.log(f"[ERROR] {type(e).__name__}: {str(e)[:500]}")
         return 1
+    finally:
+        ops.stop_log_file()
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +138,9 @@ def _main(argv):
                    help="挂载后验证用的 SA（在该 Group 中、有表读权限、执行账号可扮演）：300 秒内查到任意一行即通过")
     p.add_argument("--gcloud-account", default=None, help="执行账号（默认 gcloud 当前活动账号，其次 application-default 凭证）")
     p.add_argument("--apply", action="store_true", help="真正执行；默认只演练")
+    ops.add_log_dir_arg(p)
     args = p.parse_args(argv)
+    ops.start_log_file("apply_bypass_rls", args.log_dir)
 
     groups = core.split_items([args.group])
     if len(groups) != 1:

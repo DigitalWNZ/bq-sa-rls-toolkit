@@ -15,7 +15,8 @@
 删光提示: 某张表的规则将被全部删除时（删除后所有有读表权限的账号都能看到全部数据），
   这些表会在日志中列出，只作提示，不拦截。表上规则全部要删时使用 DROP ALL ROW ACCESS POLICIES。
 
-日志: 演练和执行时都逐条打印被删除规则的完整内容（表、规则名、授权对象、过滤条件）和 DDL。
+日志: 演练和执行时都逐条打印被删除规则的完整内容（表、规则名、授权对象、过滤条件）和 DDL；
+  屏幕输出原样另存到 logs/rollback_rls_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录）。
   读取授权对象受 BigQuery 配额限制（IamPolicy 请求 1500 次/分钟），脚本自动限速。
 --verify-sa: 删除后扮演该 SA 逐表查询，打印「可见 N 行 / 表共 M 行」，只报告不判定。
 --parallel: 同时处理的表数（默认 16）；同一张表上的操作始终顺序执行。
@@ -48,7 +49,9 @@ def _main(argv):
     p.add_argument("--quota-project", default=None, help="quota / 运行查询与 DDL 的项目（默认 gcloud 默认项目，其次 application-default 凭证的 quota 项目）")
     p.add_argument("--gcloud-account", default=None, help="执行账号（默认 gcloud 当前活动账号，其次 application-default 凭证）")
     p.add_argument("--apply", action="store_true", help="真正执行；默认只演练")
+    ops.add_log_dir_arg(p)
     args = p.parse_args(argv)
+    ops.start_log_file("rollback_rls", args.log_dir)
 
     try:
         tables, datasets, projects, _ = read_scope(args)

@@ -181,18 +181,20 @@ def test_11b_bypass_projects_scope_union_then_registry_dry_run(world):
         assert re.search(rf"\[(CREATE|NOOP)\] {re.escape(t)}\n", log), t
     for t in (L.T_DISABLED, L.T_COND, L.T_MAPPING, L.T_MAPPING_NB, L.T_REGISTRY):
         assert f"[SKIP] {t}" in log and f"[CREATE] {t}" not in log
-    assert f"[SKIP] {L.T_MAPPING_NB}: 不在登记表 {L.T_REGISTRY} 中，不授权" in log
+    for t in (L.T_MAPPING_NB, L.T_REGISTRY):                                # 登记表自身 / 备用映射表都登记为未开启
+        assert f"[SKIP] {t}: 登记表中 rls_enabled ≠ 1，不授权" in log
+    assert L.T_DROPPED not in log                                          # 项目范围只展开实际存在的表
     assert L.policies(L.T_COND) == {} and L.policies(L.T_NOBYPASS) == {}
 
 
 def test_11c_bypass_auth_tables_follow_registry(world):
-    # 条件表 / 映射表保护已删除：它们与其它表一样只看登记表（这里登记为未开启 / 未登记 → 跳过）
+    # 条件表 / 映射表保护已删除：它们与其它表一样只看登记表（这里全部登记为未开启 → 跳过）
     code, log = bypass("--group", L.G_READ, "--tables", f"{L.T_COND},{L.T_MAPPING},{L.T_ORDERS}",
                        "--datasets", f"{L.PROJECT}.{L.AUTH_DATASET}", "--apply")
     assert code == 0, log
     assert "[EXCLUDE]" not in log and f"[NOOP] {L.T_ORDERS}" in log
     for t in (L.T_COND, L.T_MAPPING, L.T_MAPPING_NB, L.T_REGISTRY):
-        assert f"[SKIP] {t}" in log and L.policies(t) == {}
+        assert f"[SKIP] {t}: 登记表中 rls_enabled ≠ 1，不授权" in log and L.policies(t) == {}
 
 
 def test_11d_bypass_registry_errors(world):
@@ -276,6 +278,8 @@ def test_21_copilot_dry_run_all_tables(world, tmp_path):
     assert f"[SKIP] {L.T_BADMAP}" in log and "not_a_dimension" in log      # 无效 to_name 行被忽略
     assert f"[SKIP] {L.T_COND}: 登记表中 rls_enabled ≠ 1" in log and "[EXCLUDE]" not in log   # 误配的条件表由登记表挡住
     assert f"[SKIP] {L.T_NOMAP}: 映射表中没有该表的校验维度" in log         # 登记为开启但没有维度
+    assert f"[SKIP] {L.T_DROPPED}: {core.TABLE_NOT_FOUND_MSG}" in log       # 映射表 / 登记表里有，但表已被 drop
+    assert "Traceback" not in log
     rows = read_csv(out)
     assert sorted(r["table"] for r in rows) == sorted(COPILOT_TABLES)     # 每张表一行
     assert {r["action"] for r in rows} == {"CREATE"} and {r["policy_name"] for r in rows} == {COP_G}
@@ -296,15 +300,35 @@ def test_22_copilot_apply(world, tmp_path):
     assert "market" in L.policies(L.T_ALT)[COP_G]["filter"]
     assert not any(p.startswith(core.COPILOT_PREFIX) for p in L.policies(L.T_NOMAP))
     assert L.policies(L.T_COND) == {} and L.policies(L.T_MAPPING) == {}
+    # 运行日志：--log-dir 下生成 apply_copilot_rls_<时间戳>.log，内容与屏幕输出完全一致
+    m = re.match(r"\[LOG\] 日志文件: (\S+)\n", log)
+    assert m and os.path.basename(m[1]).startswith("apply_copilot_rls_"), log[:300]
+    with open(m[1], encoding="utf-8") as f:
+        assert f.read() == log
+
+
+def test_22b_copilot_dropped_table_isolated_in_apply(world, tmp_path):
+    # 执行模式下，已被 drop 的表只跳过它自己：其余表照常处理（这里 orders 已建好 → NOOP），退出码 1
+    out = tmp_path / "plan.csv"
+    code, log = copilot("--mapping-table", L.T_MAPPING, "-o", str(out), "--apply",
+                        "--tables", f"{L.T_ORDERS},{L.T_DROPPED}")
+    assert code == 1, log
+    assert f"[SKIP] {L.T_DROPPED}: {core.TABLE_NOT_FOUND_MSG}" in log and f"[NOOP] {L.T_ORDERS}" in log
+    assert "Traceback" not in log and read_csv(out) == []
+    assert COP_G in L.policies(L.T_ORDERS)
 
 
 def test_23_copilot_visibility(world):
     for t in COPILOT_TABLES:
         L.expect_amounts(L.SA_COP_A, t, L.HK)                  # region = ['HK']
         L.expect_amounts(L.SA_COP_B, t, L.ALL_AMOUNTS)         # 全部维度为空 = 全部可见
+    L.expect_amounts(L.SA_COP_M, L.T_ORDERS, L.HK_MOBILE)      # region = ['HK'] 且 prdtype = ['mobile']：两个条件同时满足
+    L.expect_amounts(L.SA_COP_M, L.T_ALT, L.HK_MOBILE)         # 列名不同（market / ptype）也一样
+    L.expect_amounts(L.SA_COP_M, L.T_PART, L.HK)               # orders_part 只映射了 region：HK 全部
     L.expect_amounts(L.ACCOUNT, L.T_ORDERS, L.SG)              # user 主体：region = ['SG']
     L.expect_amounts(L.SA_READER, L.T_ORDERS, L.ALL_AMOUNTS)   # 白名单不受影响
     L.expect_amounts(L.SA_COP_N, L.T_ORDERS, [])               # 在 Group 里但不在条件表：0 行
+    L.expect_amounts(L.SA_COP_B, L.T_NOMAP, [])                # 没有校验维度的表：只有 bypass 规则，Copilot 成员 0 行
 
 
 def test_24_condition_change_takes_effect_without_rerun(world):
@@ -316,7 +340,7 @@ def test_24_condition_change_takes_effect_without_rerun(world):
 def test_25_new_principal_takes_effect_without_rerun(world, tmp_path):
     # Group 级别：新增账号只要在 Group 里、条件表写一行，不跑脚本即可生效
     L.run_sql(f"INSERT INTO `{L.T_COND}` (id, sa, region, prdtype, refername) "
-              f"VALUES ('c4', '{L.SA_COP_N}', [], ['P1'], [])")
+              f"VALUES ('c5', '{L.SA_COP_N}', [], ['P1'], [])")
     L.expect_amounts(L.SA_COP_N, L.T_ORDERS, [1, 4, 6])        # prdtype = ['P1']
     L.expect_amounts(L.SA_COP_N, L.T_PART, L.ALL_AMOUNTS)      # orders_part 只映射了 region：全部可见
     out = tmp_path / "plan.csv"
@@ -360,7 +384,7 @@ def test_31_rollback_copilot_group(world):
                           "--principals", L.G_COPILOT, "--apply", "--verify-sa", L.SA_COP_A)
     assert code == 0, log
     assert f"[DROP] `{COP_G}`" in log and f"group:{L.G_COPILOT}" in log
-    assert "可见 0 行 / 表共 6 行" in log
+    assert f"可见 0 行 / 表共 {len(L.ROWS)} 行" in log
     for t in COPILOT_TABLES:
         pols = L.policies(t)
         assert COP_G not in pols and BYP_R in pols

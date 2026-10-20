@@ -29,7 +29,8 @@ REQUIREMENTS = {
     "F08": ("apply_bypass：登记表双重保证——只有 rls_enabled = 1 的表授权；原始字符串精确比较；不看 status；冲突 [WARN] 退出码 1", "test_e2e::test_10/11c/11e"),
     "F09": ("apply_copilot：每张表给 Copilot Group 建一条规则，过滤条件与客户 sample 一致；同组成员按条件表各看各的", "test_e2e::test_22/23"),
     "F10": ("apply_copilot：维度 = 条件表除 id、sa 外的 ARRAY<STRING> 列；表的维度 = 映射表 to_name；多维度 AND；status 不生效", "test_e2e::test_21/22"),
-    "F11": ("apply_copilot：只处理登记表 rls_enabled = 1 的表；没有校验维度的表 [SKIP]", "test_e2e::test_21"),
+    "F11": ("apply_copilot：只处理登记表 rls_enabled = 1 的表；没有校验维度的表 [SKIP]；表已不存在 [SKIP]、其余表照常",
+            "test_e2e::test_21/22b"),
     "F12": ("新增 Copilot 账号：加入 Group + 条件表加一行即生效，无需重跑脚本", "test_e2e::test_25"),
     "F13": ("457 / 500 个账号也不超过每表 400 条规则上限（每表每 Group 一条）", "perf::run_perf"),
     "F14": ("条件表 / 映射表是否设置 RLS 只由登记表控制（不再有 [EXCLUDE] 保护）", "test_e2e::test_11c/21"),
@@ -39,6 +40,8 @@ REQUIREMENTS = {
     "F18": ("参数精简：值或 .csv 文件、可重复累加；表名 project.dataset.table（反引号可选、不支持冒号）；旧参数被拒；--parallel 默认 16", "test_e2e::test_11/32"),
     "F19": ("执行账号 / quota 项目自动确定（gcloud 活动账号 → ADC；gcloud 默认项目 → ADC quota）；确定不了退出码 2 + 提示", "test_e2e::test_04"),
     "F20": ("出错不输出 Python 堆栈；退出码 0 成功 / 1 部分失败或数据问题 / 2 参数或环境错误（未做任何变更）", "test_z_abnormal::r05/r06/r07"),
+    "F21": ("每次运行自动保存日志文件：默认当前目录 logs/<脚本名>_<时间戳>.log、--log-dir 可改、内容与屏幕完全一致、"
+            "建不了只 [WARN] 照常运行、不覆盖不清理", "test_e2e::test_22"),
 }
 
 P = "trip-prod"
@@ -122,7 +125,7 @@ def copilot(tmp_path, *args):
 
 
 def test_requirement_table_complete():
-    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 21)]
+    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 22)]
 
 
 # --------------------------------------------------------------------------- #
@@ -201,10 +204,15 @@ def test_F10_dimensions_from_condition_and_mapping(world, tmp_path):
 
 
 def test_F11_only_registry_enabled_and_dimensioned_tables(world, tmp_path, capsys):
-    copilot(tmp_path, "--apply")
+    gone = f"{P}.dw.dropped_t"                    # 映射表 / 登记表里有，但表已被 drop
+    world.register(gone, 1)
+    world.mapping_rows[MAP].append({"table_name": gone, "col_name": "region", "to_name": "region"})
+    code, rows = copilot(tmp_path, "--apply")
     err = capsys.readouterr().err
     assert world.policies(T_OFF) == [] and world.policies(T4) == []
     assert f"[SKIP] {T_OFF}" in err and f"[SKIP] {T4}" in err
+    assert code == 1 and f"[SKIP] {gone}: {core.TABLE_NOT_FOUND_MSG}" in err and "Traceback" not in err
+    assert {r["table"] for r in rows} == {T1, T2, T3}                           # 其余表照常建规则
 
 
 def test_F12_new_account_needs_no_rerun(world, tmp_path):
@@ -287,3 +295,27 @@ def test_F20_no_traceback_and_exit_codes(world, tmp_path, monkeypatch, capsys):
     assert bypass(G_R, "--tables", T1, "--apply") == 1                  # 意外异常：[ERROR] 而非堆栈
     err = capsys.readouterr().err
     assert "Traceback" not in err and "[ERROR] RuntimeError: boom" in err
+
+
+def test_F21_run_log_file_saved(world, tmp_path, capsys):
+    import os
+
+    import gcp_ops as ops
+    # 默认：logs/<脚本名>_<时间戳>.log，内容与屏幕完全一致（含被跳过的表及原因）
+    code, _ = copilot(tmp_path, "--apply")
+    err = capsys.readouterr().err
+    files = os.listdir(ops.DEFAULT_LOG_DIR)
+    assert code == 0 and len(files) == 1 and files[0].startswith("apply_copilot_rls_") and files[0].endswith(".log")
+    with open(os.path.join(ops.DEFAULT_LOG_DIR, files[0]), encoding="utf-8") as f:
+        assert f.read() == err
+    assert f"[SKIP] {T4}" in err and err.startswith("[LOG] 日志文件: ")
+    # --log-dir 可改目录；再跑一次是新文件，旧文件不变
+    d = tmp_path / "audit_logs"
+    assert bypass(G_R, "--tables", T1, "--log-dir", str(d)) == 0
+    assert len(os.listdir(d)) == 1 and len(os.listdir(ops.DEFAULT_LOG_DIR)) == 1
+    capsys.readouterr()
+    # 建不了：只 [WARN]，照常运行
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    assert rollback_rls.main(["--tables", T1, "--log-dir", str(blocker)]) == 0
+    assert "[WARN] 无法创建日志文件" in capsys.readouterr().err

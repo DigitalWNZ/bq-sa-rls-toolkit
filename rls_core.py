@@ -14,6 +14,7 @@ BYPASS_PREFIX = "rls_bypass_full_access_"
 COPILOT_PREFIX = "rls_copilot_"
 RLS_GRANTEE_ROLE = "roles/bigquery.filteredDataViewer"
 MAX_POLICIES_PER_TABLE = 400          # BigQuery：每张表最多 400 条 RLS 规则
+TABLE_NOT_FOUND_MSG = "表不存在（可能已被删除），请检查映射表 / 登记表"
 POLICY_NAME_MAX = 256                 # BigQuery：规则名最长 256 字符
 
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]*$")

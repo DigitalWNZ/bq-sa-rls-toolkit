@@ -25,6 +25,7 @@
   任何项目 / 文件夹 / 数据集 / 表 / 账号目录读取失败都打印 [ERROR] 并以退出码 1 结束（其余结果照常写入 CSV），绝不悄悄跳过。
 
 输出: CSV（UTF-8 BOM，默认 principals.csv），列 email, principal_type, home_project（三列都由邮箱推算）。
+运行日志: 屏幕输出原样另存到 logs/list_principals_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录；四个脚本相同）。
 文件参数均为单列、无表头的 .csv。
 
 示例:
@@ -68,6 +69,7 @@ def build_parser():
     p.add_argument("--quota-project", default=None, help="quota / 运行查询与 DDL 的项目（默认 gcloud 默认项目，其次 application-default 凭证的 quota 项目）")
     p.add_argument("--parallel", type=int, default=16, help="并行读取的并发数（默认 16）")
     p.add_argument("--gcloud-account", default=None, help="执行账号（默认 gcloud 当前活动账号，其次 application-default 凭证）")
+    ops.add_log_dir_arg(p)
     return p
 
 
@@ -102,6 +104,7 @@ class RoleChecker:
 def _main(argv):
     p = build_parser()
     args = p.parse_args(argv)
+    ops.start_log_file("list_principals", args.log_dir)
     try:
         orgs = list(dict.fromkeys(core.org_scope(o).split("/", 1)[1] for o in core.collect_values(args.organizations)))
         projects_arg = list(dict.fromkeys(core.project_scope(x).split("/", 1)[1] for x in core.collect_values(args.projects)))

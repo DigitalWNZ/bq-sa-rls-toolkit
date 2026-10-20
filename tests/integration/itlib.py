@@ -8,11 +8,14 @@
   RLS_IT_DOMAIN            Cloud Identity 域名（Group 邮箱后缀）
   RLS_IT_ORG               可选，组织 ID；设置后运行组织范围的 list_principals 用例（需组织级 roles/browser、roles/iam.securityReviewer、roles/bigquery.metadataViewer，及 Workspace 读用户权限）
   RLS_IT_CLEANUP           可选，=1 时测试结束删除测试数据集（默认保留；SA 与 Group 始终保留）
+  RLS_IT_SA_POOL_PROJECT   可选，测试项目 SA 已满 100 个时，Copilot M 测试 SA 建在这个同组织项目里
+  RLS_IT_LOG_DIR           可选，被测脚本的运行日志目录（默认每次测试会话一个临时目录）
 """
 
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -25,6 +28,7 @@ from gcp_auth import GcloudCredentials
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+LOG_DIR = os.environ.get("RLS_IT_LOG_DIR") or tempfile.mkdtemp(prefix="rls_it_logs_")
 
 ENABLED = os.environ.get("RLS_IT") == "1"
 PROJECT = os.environ.get("RLS_IT_PROJECT", "")
@@ -43,6 +47,11 @@ def sa(account_id):
     return f"{account_id}@{PROJECT}.iam.gserviceaccount.com"
 
 
+def sa_project(email):
+    """SA 邮箱 -> 所属项目（xxx@<project>.iam.gserviceaccount.com）。"""
+    return email.split("@", 1)[1].split(".", 1)[0]
+
+
 def grp(name):
     return f"{PREFIX}-{name}@{DOMAIN}"
 
@@ -58,7 +67,10 @@ SA_ACL = sa(f"{PREFIX}-acl")            # 只通过数据集 ACL 里的 Group �
 SA_COP_A = sa(f"{PREFIX}-cop-a")        # Copilot：region = ['HK']
 SA_COP_B = sa(f"{PREFIX}-cop-b")        # Copilot：全部维度为空（全部可见）
 SA_COP_N = sa(f"{PREFIX}-cop-n")        # Copilot：一开始不在条件表中
-ALL_SAS = [SA_ETL, SA_READER, SA_ACL, SA_COP_A, SA_COP_B, SA_COP_N]
+# 主项目 SA 数量已到上限（每项目 100）时，可用 RLS_IT_SA_POOL_PROJECT 把新增的测试 SA 放到同组织的其它项目
+SA_POOL_PROJECT = os.environ.get("RLS_IT_SA_POOL_PROJECT", "") or PROJECT
+SA_COP_M = f"{PREFIX}-cop-m@{SA_POOL_PROJECT}.iam.gserviceaccount.com"   # Copilot：region = ['HK'] 且 prdtype = ['mobile']
+ALL_SAS = [SA_ETL, SA_READER, SA_ACL, SA_COP_A, SA_COP_B, SA_COP_N, SA_COP_M]
 
 G_READ = grp("existingsa-read")
 G_WRITE = grp("existingsa-write")
@@ -70,6 +82,7 @@ T_ALT = tbl("orders_alt")               # 列名不同：market, ptype, meta.ref
 T_PART = tbl("orders_part")             # 按 dt 分区且必须带分区过滤
 T_BADMAP = tbl("bad_mapping_t")         # 映射到不存在的列
 T_NOMAP = tbl("no_mapping_t")           # 映射表里没有（Copilot 不处理）
+T_DROPPED = tbl("dropped_t")            # 映射表 / 登记表里有，但表实际不存在（已被 drop）
 T_NOBYPASS = tbl("no_bypass_t", NB_DATASET)
 TARGET_TABLES = [T_ORDERS, T_ALT, T_PART, T_BADMAP, T_NOMAP]
 T_COND = tbl("adm_user_mem_copilot_condition", AUTH_DATASET)
@@ -80,9 +93,11 @@ T_DISABLED = tbl("rls_disabled_t")      # 登记表中 rls_enabled = 0：apply_b
 
 # region, prd_type, refername, amount
 ROWS = [("HK", "P1", "REF_A", 1), ("HK", "P2", "REF_B", 2), ("SG", "P2", "REF_A", 3),
-        ("US", "P1", "REF_A", 4), ("US", "P3", "REF_C", 5), ("SG", "P1", "REF_C", 6)]
+        ("US", "P1", "REF_A", 4), ("US", "P3", "REF_C", 5), ("SG", "P1", "REF_C", 6),
+        ("HK", "mobile", "REF_A", 7), ("SG", "mobile", "REF_B", 8), ("US", "mobile", "REF_C", 9)]
 ALL_AMOUNTS = sorted(r[3] for r in ROWS)
-HK, SG, US = [1, 2], [3, 6], [4, 5]
+HK, SG, US = [1, 2, 7], [3, 6, 8], [4, 5, 9]
+HK_MOBILE = [7]                         # region = HK 且 prd_type = mobile
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +186,8 @@ def run_cli(script, *args, timeout=1800, env=None, auto_auth=False):
     auto_auth=True 时两者都不传，验证脚本按 gcloud 当前活动账号 / 默认项目自动确定。
     """
     extra = [] if auto_auth else ["--gcloud-account", ACCOUNT] + ([] if "--quota-project" in args else ["--quota-project", PROJECT])
+    if "--log-dir" not in args:
+        extra += ["--log-dir", LOG_DIR]                       # 运行日志写到本次测试会话的临时目录，不在仓库里留文件
     cmd = [sys.executable, os.path.join(ROOT, script), *extra, *args]
     print("\n$ " + " ".join(cmd), file=sys.stderr)
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=timeout,

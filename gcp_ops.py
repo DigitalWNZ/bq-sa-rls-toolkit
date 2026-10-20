@@ -26,7 +26,69 @@ HTTP_TIMEOUT = int(os.environ.get("RLS_HTTP_TIMEOUT", "120"))   # googleapiclien
 
 
 def log(msg):
-    print(msg, file=sys.stderr, flush=True)
+    """打印到屏幕（stderr）；已开启日志文件时原样写入一份（多线程加锁，行不交错）。"""
+    with _log_lock:
+        print(msg, file=sys.stderr, flush=True)
+        if _log_file is not None:
+            try:
+                _log_file.write(f"{msg}\n")
+                _log_file.flush()
+            except (OSError, ValueError):
+                pass                      # 写盘失败（如磁盘满）不影响脚本本身
+
+
+# --------------------------------------------------------------------------- #
+# 运行日志文件：屏幕输出原样另存一份（默认当前目录下的 logs/）
+# --------------------------------------------------------------------------- #
+DEFAULT_LOG_DIR = "logs"
+_log_lock = threading.RLock()
+_log_file = None
+
+
+def add_log_dir_arg(parser):
+    parser.add_argument("--log-dir", default=None,
+                        help=f"运行日志保存目录（默认当前目录下的 {DEFAULT_LOG_DIR}/；每次运行一个新文件，内容与屏幕输出相同）")
+
+
+def start_log_file(script, log_dir=None):
+    """
+    创建 <log_dir>/<script>_<YYYYMMDD_HHMMSS>.log（同名已存在则加 _2、_3 …，绝不覆盖），之后 log() 同时写入该文件。
+    创建失败只打印 [WARN]，脚本照常运行。返回文件路径或 None。
+    """
+    global _log_file
+    stop_log_file()
+    d = log_dir or DEFAULT_LOG_DIR
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    f = path = None
+    try:
+        os.makedirs(d, exist_ok=True)
+        for n in range(1, 1000):
+            path = os.path.join(d, f"{script}_{stamp}{'' if n == 1 else f'_{n}'}.log")
+            try:
+                f = open(path, "x", encoding="utf-8")       # 'x'：已存在就换名
+                break
+            except FileExistsError:
+                continue
+        if f is None:
+            raise OSError(f"{d} 中同名日志文件过多")
+    except OSError as e:
+        log(f"[WARN] 无法创建日志文件（目录 {d}）: {e}；本次只输出到屏幕")
+        return None
+    with _log_lock:
+        _log_file = f
+    log(f"[LOG] 日志文件: {path}")
+    return path
+
+
+def stop_log_file():
+    global _log_file
+    with _log_lock:
+        if _log_file is not None:
+            try:
+                _log_file.close()
+            except OSError:
+                pass
+            _log_file = None
 
 
 # --------------------------------------------------------------------------- #

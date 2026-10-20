@@ -6,6 +6,8 @@ install(monkeypatch, world) 会把 gcp_ops 里被业务脚本调用的函数替�
 
 import re
 
+from google.api_core.exceptions import NotFound
+
 import gcp_ops as ops
 import rls_core as core
 
@@ -206,7 +208,10 @@ def install(monkeypatch, world, script_module=None):
                         lambda ctx, t, sa: world.visible.get((t, sa), (0, world.tables[t]["rows"])))
     def table_schema(ctx, t):
         world.hit("get_table")
-        return world.tables[core.fq(t)]["schema"]
+        t = core.fq(t)
+        if t not in world.tables:                 # 与真实 BigQuery 客户端一致：表不存在抛 NotFound（404）
+            raise NotFound(f"Not found: Table {t}")
+        return world.tables[t]["schema"]
 
     monkeypatch.setattr(ops, "table_schema", table_schema)
     monkeypatch.setattr(ops, "table_exists",

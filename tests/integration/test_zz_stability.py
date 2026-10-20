@@ -36,7 +36,8 @@ def copilot_args(out, *extra):
 
 
 def popen(script, *args):
-    cmd = [sys.executable, os.path.join(L.ROOT, script), "--gcloud-account", L.ACCOUNT, "--quota-project", L.PROJECT, *args]
+    cmd = [sys.executable, os.path.join(L.ROOT, script), "--gcloud-account", L.ACCOUNT, "--quota-project", L.PROJECT,
+           "--log-dir", L.LOG_DIR, *args]
     print("\n$ " + " ".join(cmd), file=sys.stderr)
     return subprocess.Popen(cmd, cwd=L.ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 

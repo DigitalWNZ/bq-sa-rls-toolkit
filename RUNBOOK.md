@@ -68,7 +68,7 @@ gcloud config set project trip-bq-admin           # 之后所有脚本都不用�
 ```
 
 > [!TIP]
-> 每次运行开头都会打印 `[AUTH] 执行账号: …；quota 项目: …`，先确认这一行再继续。
+> 每次运行开头都会打印 `[LOG] 日志文件: logs/<脚本名>_<时间戳>.log`（屏幕输出会原样另存到这个文件，便于留档和事后排查）和 `[AUTH] 执行账号: …；quota 项目: …`，先确认这两行再继续。日志默认保存在当前目录的 `logs/`，可用 `--log-dir` 改到别处（需对该目录有写权限）。
 
 ---
 
@@ -154,7 +154,7 @@ python apply_copilot_rls.py --group group_copilot@trip.com $AUTH --apply    # �
 演练时检查：
 - `[DIM] 维度: …`：条件表识别出的维度列；
 - `[MAP] <表>: 列->维度`：每张表的映射是否正确；
-- `[SKIP]`：未登记 / 未开启 / 没有维度 / 映射列不存在的表；
+- `[SKIP]`：未登记 / 未开启 / 没有维度 / 映射列不存在 / 表不存在（已被删除）的表；
 - `[WARN]`：条件表 `sa` 值不规范（大写、空白、带前缀、非邮箱 → 这些账号查到 0 行）或同一 `sa` 多行；
 - 审核 CSV `copilot_rls_plan.csv`：每张表一行，含 `action`（CREATE / REPLACE）、`dimensions`、`filter`。
 
@@ -237,6 +237,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | 退出码 2，`[ERROR] … gcloud config set project` | 没有默认项目：`gcloud config set project <项目ID>`，或加 `--quota-project` |
 | 退出码 2，参数错误 | 旧参数（如 `--tables-file`）已删除；表名必须 `project.dataset.table`（不接受冒号写法）；`.csv` 文件不存在 |
 | 某表 `[SKIP] … 不在登记表` | 登记表 `table_name` 与参数中的表名不完全一致（大小写、空格、少了项目名都算不一致） |
+| 某表 `[SKIP] … 表不存在（可能已被删除）` | 映射表 / 登记表里还有这张表，但它已被 drop 或表名写错：清理映射表 / 登记表中的记录（其余表不受影响，退出码 1） |
 | Copilot 账号查到 0 行 | 依次检查：在 Copilot Group 里吗？条件表有该账号的行吗（小写裸邮箱）？维度值与业务列的值一致吗？Group 刚变更需等几分钟 |
 | Copilot 账号查询报 Access Denied | Copilot Group 没有条件表读权限（见第 4–6 步第 3 点） |
 | 现存账号突然查到 0 行 | 该表上有规则但没有它所在 Group 的 bypass 规则：用第 3 步补上（重跑只会 CREATE 缺的表） |
@@ -244,6 +245,8 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | 视图上 `[ERROR]` | BigQuery 视图不支持 RLS；从 `--tables` / 映射表 / 登记表中去掉视图 |
 | 大量 `[retry]` | BigQuery 速率限制；脚本会自动退避重试。持续出现时降低 `--parallel`（建议不超过 32） |
 | 组织范围 `[ERROR] 账号目录` | 执行账号不是有「用户 → 读取」权限的 Workspace 管理员；其余结果已写入 CSV |
+| `[WARN] 无法创建日志文件` | 当前目录（或 `--log-dir`）不可写：换到有写权限的目录运行，或用 `--log-dir` 指定；脚本本身照常执行，只是这次没有日志文件 |
+| 事后想查某次运行跳过了哪些表 | 打开 `logs/` 中对应时间的日志文件，搜索 `[SKIP]`（审核 CSV 只记录要变更的表） |
 
 ---
 
@@ -258,6 +261,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 
 | 日志 | 含义 |
 |---|---|
+| `[LOG]` | 运行日志文件位置（内容与屏幕输出完全相同） |
 | `[CREATE]` / `[REPLACE]` / `[NOOP]` | 新建 / 覆盖（打印旧内容）/ 已正确无需改动 |
 | `[DROP]` | rollback 将删除的规则 |
 | `[SKIP]` | 跳过（附原因） |

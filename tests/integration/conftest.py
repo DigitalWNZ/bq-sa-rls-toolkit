@@ -36,6 +36,7 @@ def _create_tables():
     # CREATE OR REPLACE 会同时清掉旧的 RLS，保证每次从干净状态开始
     for t in (L.T_ORDERS, L.T_BADMAP, L.T_NOMAP, L.T_NOBYPASS, L.T_DISABLED):
         _q(f"CREATE OR REPLACE TABLE `{t}` AS SELECT * FROM UNNEST([{_values_sql()}])")
+    _q(f"DROP TABLE IF EXISTS `{L.T_DROPPED}`")         # 映射表 / 登记表里有它，但表不存在
     _q(f"""CREATE OR REPLACE TABLE `{L.T_ALT}` AS
            SELECT region AS market, prd_type AS ptype, STRUCT(refername AS ref) AS meta, amount
            FROM UNNEST([{_values_sql()}])""")
@@ -47,7 +48,8 @@ def _create_tables():
     _q(f"""INSERT INTO `{L.T_COND}` (id, sa, region, prdtype, refername) VALUES
            ('c1', '{L.SA_COP_A}', ['HK'], [], []),
            ('c2', '{L.SA_COP_B}', [], [], []),
-           ('c3', '{L.ACCOUNT}', ['SG'], [], [])""")
+           ('c3', '{L.ACCOUNT}', ['SG'], [], []),
+           ('c4', '{L.SA_COP_M}', ['HK'], ['mobile'], [])""")
     _q(f"""CREATE OR REPLACE TABLE `{L.T_MAPPING}` AS SELECT * FROM UNNEST([
            STRUCT('{L.T_ORDERS}' AS table_name, 'region' AS col_name, 'region' AS to_name),
            STRUCT('{L.T_ORDERS}', 'prd_type', 'prdtype'),
@@ -58,6 +60,7 @@ def _create_tables():
            STRUCT('{L.T_ALT}', 'meta.ref', 'refername'),
            STRUCT('{L.T_PART}', 'region', 'region'),
            STRUCT('{L.T_BADMAP}', 'missing_col', 'region'),
+           STRUCT('{L.T_DROPPED}', 'region', 'region'),             # 表已被 drop：应 [SKIP] 表不存在
            STRUCT('{L.T_COND}', 'sa', 'region')])""")         # 误配：条件表自身，应被排除
     _q(f"""CREATE OR REPLACE TABLE `{L.T_MAPPING_NB}` AS SELECT * FROM UNNEST([
            STRUCT('{L.T_NOBYPASS}' AS table_name, 'region' AS col_name, 'region' AS to_name)])""")
@@ -65,11 +68,12 @@ def _create_tables():
     _q(f"""CREATE OR REPLACE TABLE `{L.T_REGISTRY}` (
            id STRING NOT NULL, table_name STRING NOT NULL, rls_enabled INT64 NOT NULL, status INT64 NOT NULL,
            create_time TIMESTAMP NOT NULL, update_time TIMESTAMP NOT NULL)""")
-    enabled = [L.T_ORDERS, L.T_ALT, L.T_PART, L.T_BADMAP, L.T_NOMAP, L.T_NOBYPASS]
+    enabled = [L.T_ORDERS, L.T_ALT, L.T_PART, L.T_BADMAP, L.T_NOMAP, L.T_NOBYPASS, L.T_DROPPED]
     rows = [(t, 1, 1) for t in enabled] + [
         (L.T_NOMAP, 1, 0),                       # 软删除的重复行（rls_enabled 相同）：不看 status，仍为开启
         (L.T_DISABLED, 0, 1),                    # 未开启
-        (L.T_COND, 0, 1), (L.T_MAPPING, 0, 1),   # 客户把条件表 / 映射表登记为未开启（T_MAPPING_NB、登记表自身未登记）
+        (L.T_COND, 0, 1), (L.T_MAPPING, 0, 1),   # 客户把条件表 / 映射表 / 登记表自身登记为未开启
+        (L.T_REGISTRY, 0, 1), (L.T_MAPPING_NB, 0, 1),
     ]
     values = ",\n".join(f"(GENERATE_UUID(), '{t}', {on}, {st}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"
                         for t, on, st in rows)
@@ -78,8 +82,9 @@ def _create_tables():
 
 def _ensure_sa(email):
     iam = L.api("iam", "v1")
+    project = L.sa_project(email)
     try:
-        iam.projects().serviceAccounts().get(name=f"projects/{L.PROJECT}/serviceAccounts/{email}").execute()
+        iam.projects().serviceAccounts().get(name=f"projects/{project}/serviceAccounts/{email}").execute()
         return
     except HttpError as e:
         if e.resp.status != 404:
@@ -87,7 +92,7 @@ def _ensure_sa(email):
     for attempt in range(8):
         try:
             iam.projects().serviceAccounts().create(
-                name=f"projects/{L.PROJECT}",
+                name=f"projects/{project}",
                 body={"accountId": email.split("@")[0], "serviceAccount": {"displayName": email.split("@")[0]}}).execute()
             _log(f"创建 SA {email}")
             return
@@ -117,7 +122,7 @@ def _add_binding(get, set_, role, member):
 
 def _sa_binding(sa_email, role, member):
     iam = L.api("iam", "v1").projects().serviceAccounts()
-    res = f"projects/{L.PROJECT}/serviceAccounts/{sa_email}"
+    res = f"projects/{L.sa_project(sa_email)}/serviceAccounts/{sa_email}"
     _add_binding(lambda: iam.getIamPolicy(resource=res).execute(),
                  lambda pol: iam.setIamPolicy(resource=res, body={"policy": pol}).execute(), role, member)
 
@@ -156,16 +161,16 @@ def world():
     for g in (L.G_READ, L.G_WRITE, L.G_ACL, L.G_COPILOT):
         L.ensure_group(g, customer)
     members = [(L.G_READ, L.SA_READER), (L.G_WRITE, L.SA_ETL), (L.G_ACL, L.SA_ACL)]
-    members += [(L.G_COPILOT, m) for m in (L.SA_COP_A, L.SA_COP_B, L.SA_COP_N, L.ACCOUNT)]
+    members += [(L.G_COPILOT, m) for m in (L.SA_COP_A, L.SA_COP_B, L.SA_COP_N, L.SA_COP_M, L.ACCOUNT)]
     for g, m in members:
         L.eventually(lambda g=g, m=m: L.set_group_member(g, m), timeout=300, interval=15, desc=f"member {m}")
     # 业务数据集：存量读 / 写账号、Copilot 账号的读权限；ACL 里授权一个 Group（list_principals 要展开它）
-    readers = [L.SA_READER, L.SA_COP_A, L.SA_COP_B, L.SA_COP_N]
+    readers = [L.SA_READER, L.SA_COP_A, L.SA_COP_B, L.SA_COP_N, L.SA_COP_M]
     _dataset_access(L.DATASET, [("READER", "userByEmail", e) for e in readers]
                     + [("WRITER", "userByEmail", L.SA_ETL), ("READER", "groupByEmail", L.G_ACL)])
     # 条件表所在数据集：Copilot Group 需要读条件表（RLS 子查询以查询者身份执行）
     _dataset_access(L.AUTH_DATASET, [("READER", "groupByEmail", L.G_COPILOT)])
-    for who in (L.SA_READER, L.SA_ETL, L.SA_COP_A):
+    for who in (L.SA_READER, L.SA_ETL, L.SA_COP_A, L.SA_COP_M):
         L.eventually(lambda who=who: L.amounts(who, L.T_ORDERS), desc=f"{who} ready")
     _log("环境就绪")
     yield {}

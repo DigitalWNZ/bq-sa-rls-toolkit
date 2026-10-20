@@ -104,7 +104,7 @@ def test_r06_bad_gcloud_account_is_clean_error():
     assert code == 0
     import subprocess, sys, os
     p = subprocess.run([sys.executable, os.path.join(L.ROOT, "list_principals.py"), "--gcloud-account",
-                        "nobody@example.invalid", "--projects", L.PROJECT, "-o", "/tmp/x.csv"],
+                        "nobody@example.invalid", "--projects", L.PROJECT, "-o", "/tmp/x.csv", "--log-dir", L.LOG_DIR],
                        capture_output=True, text=True, cwd=L.ROOT, timeout=120)
     assert p.returncode == 2 and "[ERROR]" in p.stderr and "nobody@example.invalid" in p.stderr, p.stderr
     assert "gcloud auth login" in p.stderr and "Traceback" not in p.stderr

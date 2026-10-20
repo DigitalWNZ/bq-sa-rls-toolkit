@@ -35,6 +35,7 @@
   - 同名规则：内容相同 -> NOOP；授权对象或过滤条件不同 -> REPLACE（审核 CSV 的 note 记录旧内容）
   - 每张表最多 400 条规则：已满且需要新建 -> [SKIP]，退出码 1
   - 映射列不存在 / REPEATED / RECORD / 类型不支持 -> 跳过该表
+  - 映射表 / 登记表里有、但表实际不存在（如已被 drop）-> [SKIP] 表不存在，其余表照常，退出码 1
   - 条件表 / 映射表是否设置 RLS 只看登记表：客户应把它们登记为 rls_enabled = 0
   - 表上原本没有任何 RLS 时只在日志中提示（[NOTE]）；现存账号会查到 0 行，可用 apply_bypass_rls.py 为其 Group 补上
 
@@ -42,6 +43,7 @@
   table, policy_name, action, dimensions, filter, note（执行模式另加 result）
 --tables: 只处理这些表（值或单列无表头的 .csv 文件，可混用）。
 --parallel: 同时处理的表数（默认 16）。
+运行日志: 屏幕输出原样另存到 logs/apply_copilot_rls_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录）。
 
 示例:
   python apply_copilot_rls.py --group group_copilot@trip.com \\
@@ -56,6 +58,8 @@
 import argparse
 import csv
 import sys
+
+from google.api_core.exceptions import NotFound
 
 import gcp_ops as ops
 import rls_core as core
@@ -112,7 +116,9 @@ def _main(argv):
                    help="quota / 运行查询与 DDL 的项目（默认 gcloud 默认项目，其次 application-default 凭证的 quota 项目）")
     p.add_argument("--gcloud-account", default=None, help="执行账号（默认 gcloud 当前活动账号，其次 application-default 凭证）")
     p.add_argument("--apply", action="store_true", help="真正执行；默认只演练")
+    ops.add_log_dir_arg(p)
     args = p.parse_args(argv)
+    ops.start_log_file("apply_copilot_rls", args.log_dir)
     workers = max(1, args.parallel)
 
     groups = core.split_items([args.group])
@@ -207,7 +213,10 @@ def _main(argv):
     # 4. 逐表规划（并行；只读取本规则名的授权对象）
     def plan_table(table):
         cols = mapping[table]
-        schema = ops.table_schema(ctx, table)
+        try:
+            schema = ops.table_schema(ctx, table)
+        except NotFound:
+            return {"skip": core.TABLE_NOT_FOUND_MSG}
         errors = core.validate_mapping_against_schema(cols, schema)
         if errors:
             return {"skip": "; ".join(errors)}

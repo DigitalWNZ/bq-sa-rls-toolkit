@@ -375,6 +375,7 @@ class TestSafetyAndFailures:
         code, rows = self.copilot(tmp_path, "--apply")
         err = capsys.readouterr().err
         assert code == 1 and f"[SKIP] {T2}" in err and "Traceback" not in err
+        assert f"[SKIP] {T2}: {core.TABLE_NOT_FOUND_MSG}" in err              # 友好提示，不输出原始 404
         assert {r["table"] for r in rows} == {T1}
 
     def test_a_safe_16_bypass_ddl_failure_isolated(self, world, capsys):

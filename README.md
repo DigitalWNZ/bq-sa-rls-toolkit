@@ -112,6 +112,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 | 错误输出 | 不输出 Python 堆栈，打印 `[ERROR] <类型>: <信息>`（设 `RLS_DEBUG=1` 可看完整堆栈） |
 | 暂时性错误 | 速率限制 / 后端错误 / 网络超时自动指数退避重试（总计 300 秒内） |
 | 输出 CSV | UTF-8 BOM（Excel 可直接打开）；单元格做公式注入防护 |
+| 运行日志 | 四个脚本每次运行都把屏幕输出**原样**另存到 **当前目录下的 `logs/<脚本名>_<YYYYMMDD_HHMMSS>.log`**（目录不存在自动创建；同一秒重名加 `_2`；永不覆盖、不自动清理）。`--log-dir <目录>` 可改保存位置。第一行 `[LOG] 日志文件: …` 提示文件位置；日志文件建不了时只打印 `[WARN]`，脚本照常运行。参数写错导致 argparse 报错、或 `--help` 时不生成。日志含账号邮箱 / 表名，`.gitignore` 已忽略 |
 
 **退出码**（四个脚本相同）：
 
@@ -122,7 +123,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 | 2 | 参数错误 / 登记表不可用 / 无法确定执行账号或 quota 项目 —— **未做任何变更** |
 | 130 | 被用户中断（Ctrl-C） |
 
-**日志前缀**：`[AUTH]` 账号；`[SCAN]` 目标范围；`[CREATE]` / `[NOOP]` / `[REPLACE]` / `[DROP]` 逐表计划；`[SKIP]` 跳过（附原因）；
+**日志前缀**：`[LOG]` 运行日志文件位置；`[AUTH]` 账号；`[SCAN]` 目标范围；`[CREATE]` / `[NOOP]` / `[REPLACE]` / `[DROP]` 逐表计划；`[SKIP]` 跳过（附原因）；
 `[NOTE]` 提示（不影响退出码）；`[WARN]` 数据问题（退出码 1）；`[ERROR]` 失败；`[VERIFY-OK]` / `[VERIFY-FAIL]` 挂载后验证；`[VISIBLE]` 回退后可见行数；`[retry]` 自动重试；结尾 `=====` 之间为汇总。
 
 **规则命名**（脚本按名字识别自己建的规则）：
@@ -254,7 +255,7 @@ python apply_bypass_rls.py --group group_existingsa_write@trip.com --datasets tr
 **处理逻辑**
 
 1. **维度** = 条件表中除 `id`、`sa` 外的 `ARRAY<STRING>` 列。
-2. **选表**：映射表中 `to_name` 属于维度的行（一张表多行 = 多个维度）∩ 登记表 `rls_enabled = 1`；未开启 / 未登记的表 `[SKIP]`；登记为开启但没有任何校验维度的表 `[SKIP]`。映射列不存在 / 是数组 / 是 RECORD → 跳过该表。
+2. **选表**：映射表中 `to_name` 属于维度的行（一张表多行 = 多个维度）∩ 登记表 `rls_enabled = 1`；未开启 / 未登记的表 `[SKIP]`；登记为开启但没有任何校验维度的表 `[SKIP]`。映射列不存在 / 是数组 / 是 RECORD → 跳过该表；表本身不存在（如已被 drop）→ `[SKIP] 表不存在`，其余表照常，退出码 1。
 3. **每张表一条规则**，`GRANT TO ("group:<group>")`，过滤条件与客户 sample 写法相同——每个维度一段、多段 AND：
 
 ```sql
@@ -349,7 +350,7 @@ gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bi
 
 ## 审计日志
 
-脚本不另写日志文件；所有规则变更都记录在 BigQuery 自带的 Cloud Audit Logs（管理活动日志，始终开启、免费、保留 400 天）。
+脚本自己的运行过程（含被跳过的表及原因）保存在运行日志 `logs/*.log`（见[通用约定](#通用约定)）；**实际执行的**规则变更另由 BigQuery 自带的 Cloud Audit Logs 记录（管理活动日志，始终开启、免费、保留 400 天）。
 在 Logs Explorer（表所在项目）中查询：
 
 ```
