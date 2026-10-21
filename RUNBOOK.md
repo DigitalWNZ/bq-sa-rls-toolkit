@@ -70,15 +70,19 @@ gcloud config set project trip-bq-admin           # 之后所有脚本都不用�
 
 ```bash
 python list_principals.py --organizations 123456789012 -o existing.csv
-# 或只看部分项目（不读账号目录，项目范围不含组织 / 文件夹继承的授权）
+# 或只看部分项目（不读账号目录；含从组织 / 文件夹继承的授权）
 python list_principals.py --projects trip-prod,trip-etl -o existing.csv
 # 已知的新增 / Copilot 账号可直接排除
 python list_principals.py --organizations 123456789012 --exclude-patterns 'copilot-*@*' -o existing.csv
 ```
 
-- 输出 `existing.csv`：`email, principal_type, home_project`。
-- 退出码 1 = 部分读取失败（日志里的 `[ERROR]` 说明是哪个项目 / 数据集 / 表 / 账号目录 / Group），其余结果已写入；修好权限后重跑。
-- **Group 未能展开**：日志结尾的 `[ERROR] 以下 N 个 Group 未能展开` 列出了这些组，组内成员**没有**列入 CSV。用有 Group 读取权限的账号重跑，或在 Admin 控制台手工核对这些组的成员（其中的 SA / user 同样要加入白名单 Group）。外部域的组（合作方的组、Google 管理的组等）任何账号都读不到，只能向对方确认成员或判断是否需要列入白名单。
+- 输出 `existing.csv`：`email, principal_type, home_project`；`principal_type` 为 `serviceAccount` / `user` / `serviceAgent` / `group`。
+- 退出码 1 = 部分读取失败（日志里的 `[ERROR]` 说明是哪个项目 / 文件夹 / 组织 / 数据集 / 表 / 账号目录 / Group），其余结果已写入；修好权限后重跑。
+- 只指定 `--projects` 时，同样读取这些项目的上级文件夹 / 组织的策略（日志 `[ANCESTOR]` 行），不漏从组织 / 文件夹继承的授权。
+- **`group` 行 = 展不开的 Group**，组内成员**没有**列入 CSV：
+  - **外部域的组**（合作方的组、Google 管理的组等，日志 `[NOTE]`）：任何账号都读不到，不算错误。由客户判断是否需要列入白名单、如何处理（如向对方确认组内成员）。
+  - **本组织域名的组**（日志 `[ERROR]`，退出码 1）：本应能读，多半是跑脚本的 user / SA 缺「群组 → 读取」权限（见 0.2 第 2 条）。修好后重跑，或在 Admin 控制台手工核对成员（其中的 SA / user 同样要加入白名单 Group）。
+  - 本组织域名见日志 `[DOMAIN]` 行；只指定 `--projects` 时不读账号目录，辅助域名（如 `ctrip.com`）的组会被当作外部域（照样写入 CSV）。
 - 规模参考：每张表读一次 IAM 策略，1000 张表约 1 分钟，10 万张表约 1.5 小时。
 
 **客户审核**：从 CSV 中挑出现存的 SA / user，决定各自进 ReadOnly 还是 Writable Group。
@@ -268,7 +272,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | `[CREATE]` / `[REPLACE]` / `[NOOP]` | 新建 / 覆盖（打印旧内容）/ 已正确无需改动 |
 | `[DROP]` | rollback 将删除的规则 |
 | `[SKIP]` | 跳过（附原因） |
-| `[NOTE]` | 提示，不影响退出码（首次设置 RLS、将被全部删除的表、条件表为空、条件表中的非数组列不作为维度） |
+| `[NOTE]` | 提示，不影响退出码（首次设置 RLS、将被全部删除的表、条件表为空、条件表中的非数组列不作为维度、展不开的外部域 Group） |
 | `[WARN]` | 数据问题，多数情况退出码 1（登记表冲突、条件表 sa 不规范 / 重复）；读不到自定义角色定义、条件表列名含特殊字符这两种不影响退出码 |
 | `[ERROR]` | 失败 |
 | `[VERIFY-OK]` / `[VERIFY-FAIL]` | 挂载后验证结果 |

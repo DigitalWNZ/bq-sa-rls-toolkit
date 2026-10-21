@@ -45,6 +45,7 @@ class FakeWorld:
         # list_principals（全部权威 API）
         self.crm_children = {}    # "organizations/1" / "folders/2" -> {"folders": [...], "projects": [(id, state)]}
         self.org_customer = {}    # org id -> Cloud Identity customer id
+        self.org_domain = {}      # org id -> 主域名（组织显示名称）
         self.directory = {}       # customer id -> [user email]
         self.directory_error = None
         self.directory_calls = []  # [customer]
@@ -70,7 +71,7 @@ class FakeWorld:
         # API 调用计数（性能测量用）
         self.calls = {"list_policies": 0, "policy_iam": 0, "ddl": 0, "get_table": 0, "list_tables": 0,
                       "dataset_acl": 0, "group": 0, "query": 0, "crm": 0, "iam_policy": 0, "sa_list": 0,
-                      "datasets": 0, "table_iam": 0, "role": 0, "directory": 0}
+                      "datasets": 0, "table_iam": 0, "role": 0, "directory": 0, "ancestry": 0, "org_info": 0}
         self.latency = {}         # 可选：每类调用的模拟耗时（秒），用于估算
         import threading
         self._lock = threading.Lock()
@@ -273,6 +274,27 @@ def install(monkeypatch, world, script_module=None):
         guard(f"customer:{org_id}")
         return world.org_customer[org_id]
 
+    def org_info(ctx, org_id):
+        guard(f"customer:{org_id}")
+        world.hit("org_info")
+        return world.org_customer.get(org_id, ""), world.org_domain.get(org_id, "")
+
+    def project_ancestors(ctx, project):
+        """由 crm_children 反推：项目 → 文件夹 …… → 组织（由近到远）；不在任何组织 / 文件夹下时为 []。"""
+        guard(f"ancestry:{project}")
+        world.hit("ancestry")
+        parent_of = {}
+        for parent, node in world.crm_children.items():
+            for f in node.get("folders", []):
+                parent_of[f] = parent
+            for pid, _ in node.get("projects", []):
+                parent_of[pid] = parent
+        out, cur = [], parent_of.get(project)
+        while cur:
+            out.append(cur)
+            cur = parent_of.get(cur)
+        return out
+
     def directory_users(ctx, customer):
         world.hit("directory")
         with world._lock:
@@ -327,6 +349,7 @@ def install(monkeypatch, world, script_module=None):
         return members, unresolved, {}
 
     for name, fn in (("list_org_descendants", list_org_descendants), ("org_directory_customer", org_directory_customer),
+                     ("org_info", org_info), ("project_ancestors", project_ancestors),
                      ("directory_users", directory_users), ("resource_iam_bindings", resource_iam_bindings),
                      ("project_service_accounts", project_service_accounts), ("project_datasets", project_datasets),
                      ("dataset_access", dataset_access), ("dataset_tables", dataset_tables),

@@ -165,3 +165,56 @@ def test_verify_retries_transient_zero_rows_until_visible(monkeypatch, no_sleep)
     monkeypatch.setattr(ops, "impersonate", lambda creds, sa: object())
     status, _ = ops.verify_full_access(_Ctx(), "p.d.t", "r@p.iam.gserviceaccount.com", timeout=300)
     assert status == "ok" and len(no_sleep) == 2
+
+
+
+class _CrmCtx:
+    """只实现 _build：v1 projects().getAncestry、v3 organizations().get。"""
+
+    def __init__(self, ancestry=None, org=None):
+        self.ancestry, self.org, self.calls = ancestry, org, []
+
+    def _build(self, name, version):
+        ctx = self
+
+        class _Projects:
+            def getAncestry(self, projectId, body):
+                ctx.calls.append(("getAncestry", projectId))
+                return _Req([ctx.ancestry])
+
+        class _Orgs:
+            def get(self, name):
+                ctx.calls.append(("orgs.get", name))
+                return _Req([ctx.org])
+
+        class _Svc:
+            def projects(self):
+                return _Projects()
+
+            def organizations(self):
+                return _Orgs()
+        return _Svc()
+
+
+def test_project_ancestors_keeps_folders_and_org_in_order():
+    ctx = _CrmCtx(ancestry={"ancestor": [
+        {"resourceId": {"type": "project", "id": "p1"}},
+        {"resourceId": {"type": "folder", "id": "20"}},
+        {"resourceId": {"type": "folder", "id": "10"}},
+        {"resourceId": {"type": "organization", "id": "9"}}]})
+    assert ops.project_ancestors(ctx, "123456789012") == ["folders/20", "folders/10", "organizations/9"]
+    assert ctx.calls == [("getAncestry", "123456789012")]
+
+
+def test_project_ancestors_no_org():
+    assert ops.project_ancestors(_CrmCtx(ancestry={"ancestor": [{"resourceId": {"type": "project", "id": "p"}}]}),
+                                 "p") == []
+    assert ops.project_ancestors(_CrmCtx(ancestry={}), "p") == []
+
+
+def test_org_info_and_customer():
+    ctx = _CrmCtx(org={"name": "organizations/9", "displayName": " Trip.com ", "directoryCustomerId": "C0x"})
+    assert ops.org_info(ctx, "9") == ("C0x", "trip.com")
+    assert ops.org_directory_customer(ctx, "9") == "C0x"
+    with pytest.raises(RuntimeError):
+        ops.org_directory_customer(_CrmCtx(org={"displayName": "x.com"}), "9")

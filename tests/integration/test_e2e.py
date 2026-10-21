@@ -77,6 +77,35 @@ def test_01_list_principals_project_scope(world, tmp_path):
     for tag in ("[SA] 项目", "[IAM]", "[ACL]", "[TABLE]", "[GROUP]"):
         assert tag in log, tag
     assert "[DIR]" not in log                                          # 只指定项目时不读账号目录
+    # 读上级（组织）策略；组织 IAM 中的外部域 Group 只 [NOTE] 并写入 CSV，退出码仍为 0
+    assert "[ANCESTOR] --projects 指定的 1 个项目的上级" in log and "[ERROR]" not in log, log
+    _check_group_rows(log, rows)
+
+
+def _check_group_rows(log, rows):
+    """展不开的 Group：只允许外部域（[NOTE] + CSV 中的 group 行）；本域（L.DOMAIN）的 Group 必须全部展开。"""
+    dom_line = next(ln for ln in log.splitlines() if ln.startswith("[DOMAIN]"))
+    assert L.DOMAIN in dom_line, dom_line
+    groups = {e for e, r in rows.items() if r["principal_type"] == "group"}
+    assert not any(e.endswith("@" + L.DOMAIN) for e in groups), groups
+    notes = set(re.findall(r"^\[NOTE\] group:([^\s（]+)", log, re.M))
+    assert notes == groups, (notes, groups)
+
+
+@pytest.mark.skipif(not L.ORG or L.SA_POOL_PROJECT == L.PROJECT, reason="需要 RLS_IT_ORG 和 RLS_IT_SA_POOL_PROJECT")
+def test_01c_list_principals_project_scope_org_inherited(world, tmp_path):
+    # 项目外的 SA 只在组织上被授予 BigQuery Data Viewer（继承到测试项目）：只指定项目时也必须列出
+    L.ensure_sa(L.SA_ANC)
+    member = f"serviceAccount:{L.SA_ANC}"
+    L.org_binding("roles/bigquery.dataViewer", member)                 # SA 刚建好时可能暂时报不存在：自动重试
+    try:
+        code, log, rows = _list(tmp_path, "--projects", L.PROJECT)
+        assert code == 0, log
+        assert rows.get(L.SA_ANC, {}).get("principal_type") == "serviceAccount", log
+        assert f"organizations/{L.ORG}" in next(ln for ln in log.splitlines() if ln.startswith("[ANCESTOR]"))
+    finally:
+        L.org_binding("roles/bigquery.dataViewer", member, add=False)
+    assert member not in L.org_members("roles/bigquery.dataViewer")
 
 
 @pytest.mark.skipif(not L.ORG, reason="未设置 RLS_IT_ORG")
@@ -85,13 +114,11 @@ def test_02_list_principals_org_scope(world, tmp_path):
     code, log, rows = _list(tmp_path, "--organizations", L.ORG)
     assert "Traceback" not in log, log
     # Argolis 组织 IAM 里授权给了 Google 内部的外部域 Group（…@twosync-src.google.com 等），任何客户账号都读不到：
-    # 这些组必须 [ERROR] + 汇总 + 退出码 1（不再静默跳过）；除此之外不应有其它错误
+    # 这些组作为 group 写入 CSV 并 [NOTE]，不影响退出码；本域的 Group 全部展开；不应有任何 [ERROR]
     errors = [ln for ln in log.splitlines() if ln.startswith("[ERROR]")]
-    external = [ln for ln in errors if ln.startswith("[ERROR] 展开 group:") and f"@{L.DOMAIN}" not in ln]
-    assert errors == external + ([f"[ERROR] 以下 {len(external)} 个 Group 未能展开，其成员未列入 CSV，"
-                                  "请用有 Group 读取权限的账号重跑或手工核对："] if external else []), errors
-    assert code == (1 if external else 0), log
-    assert not any(f"group:rlsit-" in ln for ln in errors)               # 本域的测试 Group 全部展开
+    assert errors == [] and code == 0, log
+    _check_group_rows(log, rows)
+    assert any(r["principal_type"] == "group" for r in rows.values())   # 外部域 Group 已写入 CSV
     assert "[ORG] organizations/" in log and "[DIR] 账号目录" in log
     for prj in ("rls-sapool-harrishe-1", "rls-sapool-harrishe-5"):    # 组织下其它项目的 SA（没有任何授权）也列出
         assert _iam_project_sas(prj) <= set(rows), prj

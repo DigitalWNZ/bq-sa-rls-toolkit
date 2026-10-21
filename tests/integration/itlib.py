@@ -249,3 +249,54 @@ def customer_id():
     org = [a for a in crm.projects().getAncestry(projectId=PROJECT, body={}).execute()["ancestor"]
            if a["resourceId"]["type"] == "organization"][0]["resourceId"]["id"]
     return crm.organizations().get(name=f"organizations/{org}").execute()["owner"]["directoryCustomerId"]
+
+
+# --------------------------------------------------------------------------- #
+# 组织层授权（list_principals --projects 读上级策略的用例）
+# --------------------------------------------------------------------------- #
+SA_ANC = f"{PREFIX}-anc@{SA_POOL_PROJECT}.iam.gserviceaccount.com"   # 只在组织上被授权（继承到测试项目）
+
+
+def ensure_sa(email):
+    """确保 SA 存在（已存在 409 忽略）；与其它测试 SA 一样保留。"""
+    account_id, project = email.split("@", 1)[0], sa_project(email)
+    try:
+        api("iam", "v1").projects().serviceAccounts().create(
+            name=f"projects/{project}", body={"accountId": account_id,
+                                              "serviceAccount": {"displayName": "rlsit org-inherited probe"}}).execute()
+    except HttpError as e:
+        if e.resp.status != 409:
+            raise
+
+
+def org_binding(role, member, add=True):
+    """组织 IAM 策略中增加 / 删除一条 (role, member)（读-改-写，带 etag；并发冲突 409 自动重试）。"""
+    crm = api("cloudresourcemanager", "v3")
+    res = f"organizations/{ORG}"
+
+    def once():
+        pol = crm.organizations().getIamPolicy(resource=res, body={"options": {"requestedPolicyVersion": 3}}).execute()
+        bindings = pol.setdefault("bindings", [])
+        b = next((x for x in bindings if x["role"] == role and "condition" not in x), None)
+        if add:
+            if b is None:
+                bindings.append({"role": role, "members": [member]})
+            elif member not in b["members"]:
+                b["members"].append(member)
+            else:
+                return
+        else:
+            if b is None or member not in b["members"]:
+                return
+            b["members"].remove(member)
+            if not b["members"]:
+                bindings.remove(b)
+        pol["version"] = 3
+        crm.organizations().setIamPolicy(resource=res, body={"policy": pol}).execute()
+    eventually(once, timeout=300, interval=10, desc=f"org binding {role} {member} add={add}")
+
+
+def org_members(role):
+    pol = api("cloudresourcemanager", "v3").organizations().getIamPolicy(
+        resource=f"organizations/{ORG}", body={"options": {"requestedPolicyVersion": 3}}).execute()
+    return {m for b in pol.get("bindings", []) if b["role"] == role for m in b["members"]}

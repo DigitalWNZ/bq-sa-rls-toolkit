@@ -574,11 +574,38 @@ def list_org_descendants(ctx, org_id):
     return folders, active, inactive
 
 
-def org_directory_customer(ctx, org_id):
-    """组织对应的 Cloud Identity / Workspace customer ID（organizations.get 的 directoryCustomerId）。"""
+def org_info(ctx, org_id):
+    """
+    组织的 (Cloud Identity / Workspace customer ID, 主域名)：一次 organizations.get（组织层 Browser 已含）。
+    主域名即组织的显示名称（displayName），用来判断 Group 是否属于本组织。
+    """
     crm = ctx._build("cloudresourcemanager", "v3")
     org = execute_with_backoff(crm.organizations().get(name=f"organizations/{org_id}"), desc=f"get org {org_id}")
-    return org["directoryCustomerId"]
+    return org.get("directoryCustomerId", ""), (org.get("displayName") or "").strip().lower()
+
+
+def org_directory_customer(ctx, org_id):
+    """组织对应的 Cloud Identity / Workspace customer ID（organizations.get 的 directoryCustomerId）。"""
+    customer = org_info(ctx, org_id)[0]
+    if not customer:
+        raise RuntimeError(f"组织 {org_id} 没有 directoryCustomerId")
+    return customer
+
+
+def project_ancestors(ctx, project):
+    """
+    项目往上的文件夹 / 组织（由近到远），如 ["folders/2", "folders/1", "organizations/9"]；不在任何组织下时为 []。
+    Resource Manager v1 getAncestry（需要 resourcemanager.projects.get，组织层 Browser 已含）；Project ID 或项目编号均可。
+    """
+    crm = ctx._build("cloudresourcemanager", "v1")
+    resp = execute_with_backoff(crm.projects().getAncestry(projectId=project, body={}), desc=f"getAncestry {project}")
+    kinds = {"folder": "folders", "organization": "organizations"}
+    out = []
+    for a in resp.get("ancestor", []):
+        rid = a.get("resourceId") or {}
+        if rid.get("type") in kinds and rid.get("id"):
+            out.append(f"{kinds[rid['type']]}/{rid['id']}")
+    return out
 
 
 def directory_users(ctx, customer):

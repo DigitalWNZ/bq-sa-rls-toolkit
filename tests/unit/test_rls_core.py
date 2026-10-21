@@ -287,6 +287,26 @@ class TestPrincipalRows:
         assert [r["email"] for r in rows] == ["keep@x.com"]
 
 
+    def test_group_rows_typed_group_and_excludable(self):
+        rows = core.build_principal_rows({"a@x.com", "g@other.com"}, groups={"G@Other.com", "ext@vendor.com"},
+                                         exclude_patterns=["*@vendor.com"])
+        assert rows == [{"email": "a@x.com", "principal_type": "user", "home_project": ""},
+                        {"email": "g@other.com", "principal_type": "group", "home_project": ""}]
+
+
+class TestOwnDomain:
+    def test_email_domain(self):
+        assert core.email_domain("User@Trip.COM") == "trip.com"
+        assert core.email_domain("group:bi@ctrip.com") == "ctrip.com"
+        assert core.email_domain("nodomain") == ""
+
+    def test_is_own_domain_exact_match_only(self):
+        own = {"trip.com", "ctrip.com"}
+        assert core.is_own_domain("bi@TRIP.com", own) and core.is_own_domain("x@ctrip.com", own)
+        assert not core.is_own_domain("x@sub.trip.com", own)          # 子域名不算
+        assert not core.is_own_domain("x@nottrip.com", own)
+        assert not core.is_own_domain("x@trip.com", set()) and not core.is_own_domain("", own)
+
 class TestPrincipalColumns:
     def test_three_columns(self):
         assert core.PRINCIPAL_COLUMNS == ["email", "principal_type", "home_project"]   # 不再输出 display_name / disabled

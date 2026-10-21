@@ -42,6 +42,9 @@ REQUIREMENTS = {
     "F20": ("出错不输出 Python 堆栈；退出码 0 成功 / 1 部分失败或数据问题 / 2 参数或环境错误（未做任何变更）", "test_z_abnormal::r05/r06/r07"),
     "F21": ("每次运行自动保存日志文件：默认当前目录 logs/<脚本名>_<时间戳>.log、--log-dir 可改、内容与屏幕完全一致、"
             "建不了只 [WARN] 照常运行、不覆盖不清理", "test_e2e::test_22"),
+    "F22": ("list_principals 项目范围：含从组织 / 文件夹继承的能读表数据的授权（读项目全部上级的策略）", "test_e2e::test_01c"),
+    "F23": ("list_principals：展不开的 Group 作为 group 写入 CSV；外部域 [NOTE] 不影响退出码，本组织域名的 [ERROR] 退出码 1",
+            "test_e2e::test_02"),
 }
 
 P = "trip-prod"
@@ -88,6 +91,7 @@ def world(monkeypatch):
     w.crm_children["organizations/111"] = {"folders": ["folders/1"], "projects": [(P, "ACTIVE"), ("old", "DELETE_REQUESTED")]}
     w.crm_children["folders/1"] = {"folders": [], "projects": [("dev", "ACTIVE")]}
     w.org_customer["111"] = "C0trip"
+    w.org_domain["111"] = "trip.com"
     w.directory["C0trip"] = ["alice@trip.com", "idle-user@trip.com", "suspended@trip.com", "x@ctrip.com"]
     w.project_sas[P] = [SA_A, SA_B, "idle@trip-prod.iam.gserviceaccount.com", "disabled@trip-prod.iam.gserviceaccount.com"]
     w.project_sas["dev"] = ["dev-sa@dev.iam.gserviceaccount.com"]
@@ -125,7 +129,7 @@ def copilot(tmp_path, *args):
 
 
 def test_requirement_table_complete():
-    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 22)]
+    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 24)]
 
 
 # --------------------------------------------------------------------------- #
@@ -319,3 +323,24 @@ def test_F21_run_log_file_saved(world, tmp_path, capsys):
     blocker.write_text("x")
     assert rollback_rls.main(["--tables", T1, "--log-dir", str(blocker)]) == 0
     assert "[WARN] 无法创建日志文件" in capsys.readouterr().err
+
+
+def test_F22_project_scope_includes_inherited_grants(world, tmp_path, capsys):
+    world.iam_policies["organizations/111"] = [{"role": "roles/bigquery.dataViewer", "members": ["user:org-reader@partner.com"]}]
+    world.iam_policies["folders/1"] = [{"role": "roles/viewer", "members": ["serviceAccount:f@x.iam.gserviceaccount.com"]}]
+    code, rows, _ = lp(tmp_path, "--projects", "dev")                # dev 在 组织 111 → folders/1 下
+    assert code == 0 and {"org-reader@partner.com", "f@x.iam.gserviceaccount.com"} <= set(rows)
+    assert "[ANCESTOR]" in capsys.readouterr().err
+
+
+def test_F23_unexpandable_groups_written_to_csv(world, tmp_path, capsys):
+    world.iam_policies[f"projects/{P}"].append(
+        {"role": "roles/bigquery.dataViewer", "members": ["group:partner-team@vendor.com"]})
+    world.groups["partner-team@vendor.com"] = None                   # 外部域
+    code, rows, _ = lp(tmp_path, "--projects", P)
+    err = capsys.readouterr().err
+    assert code == 0 and rows["partner-team@vendor.com"]["principal_type"] == "group" and "[NOTE]" in err
+    world.groups["nested@trip.com"] = None                           # 本组织域名
+    code, rows, _ = lp(tmp_path, "--projects", P)
+    err = capsys.readouterr().err
+    assert code == 1 and rows["nested@trip.com"]["principal_type"] == "group" and "群组 → 读取" in err

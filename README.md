@@ -192,11 +192,20 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 
 1. **SA 清单**：范围内每个 ACTIVE 项目用 IAM `serviceAccounts.list` 列出全部 SA（含已禁用、没有任何授权的）。组织范围先用 Resource Manager 递归列出全部文件夹和项目；待删除的项目跳过并 `[NOTE]`。
 2. **账号目录**（只在指定 `--organizations` 时）：Admin SDK Directory API 列出组织账号目录里的全部 user（含暂停 / 归档、所有域名）。
-3. **BigQuery 相关授权**：组织 / 文件夹 / 项目 IAM 策略（只指定项目时只读该项目，不含上层继承）、每个数据集的 ACL、每张表 / 视图的 IAM 策略；只纳入含 `bigquery.tables.getData`（能读表数据）的角色。用于找出其它项目的 SA、外部域的 user、Google 服务代理。其中的 Group 递归展开。
+3. **BigQuery 相关授权**：组织 / 文件夹 / 项目 IAM 策略（只指定项目时，同样读取该项目全部上级文件夹 / 组织的策略，不漏继承的授权；效果同 Console 项目 IAM 页面的「继承」行）、每个数据集的 ACL、每张表 / 视图的 IAM 策略；只纳入含 `bigquery.tables.getData`（能读表数据）的角色。用于找出其它项目的 SA、外部域的 user、Google 服务代理。其中的 Group 递归展开。
 
 跳过 `deleted:`、`domain:`、`allUsers`、`allAuthenticatedUsers`、授权视图 / 例程 / 数据集等非具体账号。任何读取失败都 `[ERROR]` 并以退出码 1 结束（其余结果照常写入），绝不悄悄跳过。
 
-**输出**：CSV 三列 `email, principal_type, home_project`；`principal_type` ∈ `serviceAccount` / `user` / `serviceAgent`；`home_project` 由 SA 邮箱反推（user / 服务代理为空）。
+**展不开的 Group**：一律作为 `principal_type = group` 写入 CSV（成员未展开），按域名分两类：
+
+| Group | 处理 | 退出码 |
+|---|---|---|
+| 外部域（不属于本组织域名）：Cloud Identity 不允许读取其它组织的 Group，超级管理员也读不到 | `[NOTE]` | 不影响 |
+| 本组织域名的 Group 读不到（多半缺「群组 → 读取」权限），或展开出错（API 未启用、限流重试用尽等） | `[ERROR]` | 1 |
+
+本组织域名 = 组织的主域名（组织显示名称）+ 账号目录里 user 的域名（只在组织范围）+ 跑脚本账号的域名（SA 除外），日志 `[DOMAIN]` 行列出。只指定项目时不读账号目录，辅助域名（如 `ctrip.com`）的 Group 会按外部域处理（照样写入 CSV）。
+
+**输出**：CSV 三列 `email, principal_type, home_project`；`principal_type` ∈ `serviceAccount` / `user` / `serviceAgent` / `group`（展不开的 Group）；`home_project` 由 SA 邮箱反推（user / 服务代理 / group 为空）。
 
 ```bash
 python list_principals.py --organizations 123456789012

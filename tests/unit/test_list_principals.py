@@ -39,6 +39,7 @@ def world(monkeypatch):
     w.crm_children[F1] = {"folders": [F2], "projects": [(P2, "ACTIVE")]}
     w.crm_children[F2] = {"folders": [], "projects": [(P3, "ACTIVE")]}
     w.org_customer[ORG] = CUST
+    w.org_domain[ORG] = "trip.com"                    # 组织主域名（组织显示名称）
     # 来源 1：各项目自己的 SA（含没有任何授权的）
     w.project_sas[P1] = ["etl@prod.iam.gserviceaccount.com", "idle@prod.iam.gserviceaccount.com",
                          "disabled-sa@prod.iam.gserviceaccount.com"]
@@ -128,16 +129,18 @@ class TestNormal:
         for u in ("dave@trip.com", "suspended@trip.com", "archived@trip.com", "eve@ctrip.com"):
             assert rows[u]["principal_type"] == "user"
 
-    def test_lp_n_04_project_scope_no_directory_no_ancestors(self, world, tmp_path):
+    def test_lp_n_04_project_scope_no_directory_reads_ancestors(self, world, tmp_path, capsys):
         code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
         assert code == 0
         assert "dave@trip.com" not in rows                           # 不读账号目录
-        assert "orgreader@partner.com" not in rows                   # 不读组织层授权
-        assert "folder-sa@other.iam.gserviceaccount.com" not in rows
+        assert "orgreader@partner.com" in rows                       # 读上级（组织层）的授权：prod 直接挂在组织下
+        assert "folder-sa@other.iam.gserviceaccount.com" not in rows  # folders/10 不是 prod 的上级
         assert "dev-sa@dev.iam.gserviceaccount.com" not in rows      # 其它项目的 SA 不在范围
         assert {"ext@partner-proj.iam.gserviceaccount.com", "acl-reader@partner.com", "table-reader@vendor.com",
                 "ana@trip.com"} <= set(rows)
         assert world.calls["directory"] == 0
+        assert f"[ANCESTOR] --projects 指定的 1 个项目的上级 1 个：organizations/{ORG}" in err
 
     def test_lp_n_05_role_filter_get_data_only(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
@@ -284,33 +287,40 @@ class TestAbnormal:
         assert code == 0
 
     def test_lp_a_08_unresolvable_and_cyclic_groups(self, world, tmp_path, capsys):
-        # 读不到的嵌套组：[ERROR] 写明组与原因、结尾汇总、退出码 1；其余主体照常写入 CSV；环不会死循环
+        # 读不到的外部域嵌套组：[NOTE]、作为 group 写入 CSV、结尾汇总、不影响退出码；其余主体照常写入；环不会死循环
         world.groups["ext-g@other.com"] = None
         world.groups["bi-team@trip.com"].append(("bi-team@trip.com", "GROUP"))
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert code == 1 and "ana@trip.com" in rows and "carol@vendor.com" in rows
-        assert "[ERROR] 展开 group:ext-g@other.com（group:acl-g@trip.com 中的嵌套组） 失败：无权读取" in err
-        assert "[ERROR] 以下 1 个 Group 未能展开，其成员未列入 CSV" in err and "  - ext-g@other.com" in err
-        assert "[WARN]" not in err and "Traceback" not in err
+        assert code == 0 and "ana@trip.com" in rows and "carol@vendor.com" in rows
+        assert rows["ext-g@other.com"] == {"email": "ext-g@other.com", "principal_type": "group", "home_project": ""}
+        assert "[NOTE] group:ext-g@other.com（group:acl-g@trip.com 中的嵌套组） 是外部域的 Group" in err
+        assert "[NOTE] 以下 1 个外部域 Group 已作为 group 写入 CSV" in err and "  - ext-g@other.com" in err
+        assert "[GROUP] 共 2 个 Group，外部域 1 个（已写入 CSV）" in err
+        assert "[ERROR]" not in err and "[WARN]" not in err and "Traceback" not in err
 
     def test_lp_a_08b_top_level_group_unreadable_vs_empty(self, world, tmp_path, capsys):
-        # 最外层的组读不到 → [ERROR] + 退出码 1；空组（读得到、没有成员）不算错误
+        # 本组织域名的组读不到 → [ERROR]（提示群组读取权限）+ group 写入 CSV + 退出码 1；空组（读得到、没有成员）不算错误
         world.groups["bi-team@trip.com"] = None
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
         assert code == 1 and "[ERROR] 展开 group:bi-team@trip.com 失败：无权读取" in err and "carol@vendor.com" in rows
+        assert "该 Group 属于本组织域名" in err and "群组 → 读取" in err
+        assert rows["bi-team@trip.com"]["principal_type"] == "group"
+        assert "[ERROR] 以下 1 个 Group 未能展开（Group 本身已写入 CSV）" in err and "  - bi-team@trip.com" in err
         world.groups["bi-team@trip.com"] = []
-        code, _, _ = run(tmp_path, "--projects", P1)
+        code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
         assert code == 0 and "[ERROR]" not in err and "全部展开" in err
+        assert "bi-team@trip.com" not in rows                          # 能展开的组本身不写入 CSV
 
     def test_lp_a_08c_group_api_error_is_error_not_silent(self, world, tmp_path, capsys, monkeypatch):
-        # API 未启用 / 限流重试用尽等异常：[ERROR] 说明原因、退出码 1，其余结果照常写入
+        # API 未启用 / 限流重试用尽等异常：[ERROR] 说明原因、退出码 1，其余结果照常写入；与域名无关（外部域同样算错误）
         real = list_principals.ops.expand_group
+        world.dataset_acl["prod.dw"].append(("READER", "groupByEmail", "partner-g@other.com"))
 
         def boom(ctx, g, max_depth=10):
-            if g == "bi-team@trip.com":
+            if g in ("bi-team@trip.com", "partner-g@other.com"):
                 raise RuntimeError("403 Cloud Identity API has not been used in project fake-quota or it is disabled")
             return real(ctx, g, max_depth)
         monkeypatch.setattr(list_principals.ops, "expand_group", boom)
@@ -318,7 +328,9 @@ class TestAbnormal:
         err = capsys.readouterr().err
         assert code == 1 and "carol@vendor.com" in rows
         assert "[ERROR] 展开 group:bi-team@trip.com 失败: Cloud Identity API 未在 quota 项目启用" in err
-        assert "  - bi-team@trip.com" in err
+        assert "[ERROR] 展开 group:partner-g@other.com 失败: Cloud Identity API 未在 quota 项目启用" in err
+        assert "  - bi-team@trip.com" in err and "  - partner-g@other.com" in err
+        assert rows["bi-team@trip.com"]["principal_type"] == rows["partner-g@other.com"]["principal_type"] == "group"
 
     def test_lp_a_09_csv_formula_injection_neutralized(self, world, tmp_path):
         world.dataset_acl["prod.dw"].append(("READER", "userByEmail", '=HYPERLINK("http://evil")@x.com'))
@@ -373,3 +385,119 @@ class TestDirectoryWithOwnCredentials:
         world.org_customer[ORG2] = CUST                         # 两个组织属于同一个账号目录
         run(tmp_path, "--organizations", f"{ORG},{ORG2}", "--quota-project", "q")
         assert world.directory_calls == [CUST]
+
+
+# =========================================================================== #
+# --projects 读上级策略（继承的授权）；展不开的 Group 写入 CSV（外部域 [NOTE] / 本域 [ERROR]）
+# =========================================================================== #
+class TestAncestorsAndGroups:
+    def test_lp_anc_01_deep_project_reads_all_folders_and_org(self, world, tmp_path, capsys):
+        # deep 在 组织 111 → folders/10 → folders/20 下：三层的授权都要列出
+        world.iam_policies[F2] = [b("roles/bigquery.dataViewer", "user:f2reader@partner.com")]
+        code, rows, _ = run(tmp_path, "--projects", P3)
+        err = capsys.readouterr().err
+        assert code == 0
+        assert {"orgreader@partner.com", "folder-sa@other.iam.gserviceaccount.com", "f2reader@partner.com",
+                "deep-sa@deep.iam.gserviceaccount.com"} <= set(rows)
+        assert "gcs-only@partner.com" not in rows                      # 上级中不能读数据的角色同样不算
+        assert f"[ANCESTOR] --projects 指定的 1 个项目的上级 3 个：{F2}, {F1}, organizations/{ORG}" in err
+        assert "[IAM] 4 个组织 / 文件夹 / 项目" in err
+
+    def test_lp_anc_02_ancestry_failure_is_error_rest_written(self, world, tmp_path, capsys):
+        world.fail_resources.add(f"ancestry:{P1}")
+        code, rows, out = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1 and out.exists()
+        assert f"[ERROR] 项目 {P1}: 读取上级文件夹 / 组织失败（需要组织层 Browser）" in err
+        assert "ext@partner-proj.iam.gserviceaccount.com" in rows      # 项目自身的授权照常
+        assert "orgreader@partner.com" not in rows
+
+    def test_lp_anc_03_ancestor_policy_failure_hints_security_reviewer(self, world, tmp_path, capsys):
+        world.fail_resources.add(f"iam:{F1}")
+        code, rows, _ = run(tmp_path, "--projects", P2)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert f"[ERROR] {F1}: 读取 IAM 策略失败（读取文件夹 / 组织的 IAM 策略需要组织层 Security Reviewer）" in err
+        assert "orgreader@partner.com" in rows                          # 其它上级照常
+
+    def test_lp_anc_04_projects_covered_by_org_not_reread(self, world, tmp_path):
+        run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="a.csv")
+        org_only = world.calls["iam_policy"]
+        world.calls["iam_policy"] = 0
+        _, rows, _ = run(tmp_path, "--organizations", ORG, "--projects", P2, name="b.csv")
+        assert world.calls["ancestry"] == 0 and world.calls["iam_policy"] == org_only
+
+    def test_lp_anc_05_project_without_ancestors(self, world, tmp_path, capsys):
+        code, rows, _ = run(tmp_path, "--projects", P_OUT)              # 不在任何组织 / 文件夹下
+        err = capsys.readouterr().err
+        assert code == 0 and "[ANCESTOR]" not in err and "[ERROR]" not in err
+        assert "outsider@outside.iam.gserviceaccount.com" in rows and "orgreader@partner.com" not in rows
+
+    def test_lp_anc_06_shared_ancestors_read_once(self, world, tmp_path, capsys):
+        code, _, _ = run(tmp_path, "--projects", f"{P2},{P3}")
+        err = capsys.readouterr().err
+        assert code == 0 and world.calls["ancestry"] == 2
+        assert world.calls["iam_policy"] == 5                            # dev、deep + folders/10、folders/20、组织
+        assert "上级 3 个" in err and world.calls["org_info"] == 1
+
+    def test_lp_anc_07_ancestor_org_info_failure_is_error(self, world, tmp_path, capsys):
+        world.fail_resources.add(f"customer:{ORG}")
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1 and f"[ERROR] organizations/{ORG}: 读取组织信息" in err
+        assert "orgreader@partner.com" in rows                          # 组织策略照常读取
+
+    def test_lp_grp_01_external_top_level_group_note_exit_0(self, world, tmp_path, capsys):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/bigquery.dataViewer", "group:vendor-team@vendor.com"))
+        world.groups["vendor-team@vendor.com"] = None
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0 and rows["vendor-team@vendor.com"]["principal_type"] == "group"
+        assert "[NOTE] group:vendor-team@vendor.com 是外部域的 Group" in err and "[ERROR]" not in err
+        assert "[DOMAIN] 本组织域名（用于判断读不到的 Group 是否外部域）: trip.com, x.com" in err
+
+    def test_lp_grp_02_directory_secondary_domain_is_own_in_org_scope(self, world, tmp_path, capsys):
+        # eve@ctrip.com 在账号目录中 → 组织范围 ctrip.com 算本域：读不到 → [ERROR]、退出码 1
+        world.iam_policies[f"projects/{P1}"].append(b("roles/bigquery.dataViewer", "group:bi@ctrip.com"))
+        world.groups["bi@ctrip.com"] = None
+        code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="org.csv")
+        err = capsys.readouterr().err
+        assert code == 1 and "[ERROR] 展开 group:bi@ctrip.com 失败" in err and rows["bi@ctrip.com"]["principal_type"] == "group"
+        # 只指定项目时不读账号目录：ctrip.com 不在本域名中，按外部域处理（照样写入 CSV）
+        code, rows, _ = run(tmp_path, "--projects", P1, name="prj.csv")
+        err = capsys.readouterr().err
+        assert code == 0 and "[NOTE] group:bi@ctrip.com 是外部域的 Group" in err and "bi@ctrip.com" in rows
+
+    def test_lp_grp_03_runner_domain_counts_but_not_sa(self, world, tmp_path, capsys):
+        del world.org_domain[ORG]                                       # 组织没有主域名时
+        world.groups["bi-team@trip.com"] = None
+        code, _, _ = run(tmp_path, "--projects", P1, "--gcloud-account", "runner@trip.com", name="u.csv")
+        assert code == 1 and "[ERROR] 展开 group:bi-team@trip.com 失败" in capsys.readouterr().err
+        code, _, _ = run(tmp_path, "--projects", P1, "--gcloud-account", "exec@ops.iam.gserviceaccount.com",
+                         name="sa.csv")
+        err = capsys.readouterr().err
+        assert code == 0 and "[NOTE] group:bi-team@trip.com 是外部域的 Group" in err
+        assert "gserviceaccount.com" not in err.split("[DOMAIN]")[1].splitlines()[0]
+
+    def test_lp_grp_04_exclusions_apply_to_group_rows(self, world, tmp_path):
+        world.groups["ext-g@other.com"] = None
+        _, rows, _ = run(tmp_path, "--projects", P1, "--exclude-patterns", "*@other.com")
+        assert "ext-g@other.com" not in rows
+
+    def test_lp_grp_05_same_unreadable_group_nested_twice_reported_once(self, world, tmp_path, capsys):
+        world.groups["ext-g@other.com"] = None
+        world.groups["bi-team@trip.com"].append(("ext-g@other.com", "GROUP"))
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0 and err.count("[NOTE] group:ext-g@other.com") == 1
+        assert "[NOTE] 以下 1 个外部域 Group" in err
+
+    def test_lp_grp_06_external_and_own_mixed(self, world, tmp_path, capsys):
+        world.groups["ext-g@other.com"] = None
+        world.groups["nested@trip.com"] = None
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "[GROUP] 共 2 个 Group，外部域 1 个（已写入 CSV）、本域未能展开 1 个" in err
+        assert {r for r, v in rows.items() if v["principal_type"] == "group"} == {"ext-g@other.com", "nested@trip.com"}
+        assert "ana@trip.com" in rows and "svc-in-group@p7.iam.gserviceaccount.com" not in rows

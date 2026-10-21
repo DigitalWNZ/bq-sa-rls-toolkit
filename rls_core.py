@@ -335,17 +335,34 @@ def is_excluded(email, members=(), patterns=()):
     return e in {member_email(m) for m in members} or any(fnmatch.fnmatch(e, p.lower()) for p in patterns)
 
 
-def build_principal_rows(emails, exclude_members=(), exclude_patterns=()):
+def build_principal_rows(emails, exclude_members=(), exclude_patterns=(), groups=()):
     """
     主体邮箱集合 -> CSV 行（PRINCIPAL_COLUMNS，按邮箱排序）。三列都由邮箱本身推算：
     principal_type 看邮箱后缀，home_project 从 SA 邮箱反推（user / 服务代理为空）。
+    groups：展不开的 Group（多为外部域），principal_type 为 group、home_project 为空；与 emails 重复时以 group 为准。
     """
+    group_set = {member_email(g) for g in groups}
     rows = []
-    for email in sorted({member_email(e) for e in emails}):
+    for email in sorted({member_email(e) for e in emails} | group_set):
         if is_excluded(email, exclude_members, exclude_patterns):
             continue
-        rows.append({"email": email, "principal_type": principal_type(email), "home_project": sa_home_project(email)})
+        if email in group_set:
+            rows.append({"email": email, "principal_type": "group", "home_project": ""})
+        else:
+            rows.append({"email": email, "principal_type": principal_type(email), "home_project": sa_home_project(email)})
     return rows
+
+
+def email_domain(email):
+    """邮箱的域名（小写）；没有 @ 时为空串。"""
+    e = member_email(email)
+    return e.rsplit("@", 1)[1] if "@" in e else ""
+
+
+def is_own_domain(email, own_domains):
+    """邮箱域名是否属于本组织（own_domains 为小写域名集合；精确匹配，不含子域名）。"""
+    d = email_domain(email)
+    return bool(d) and d in own_domains
 
 
 # --------------------------------------------------------------------------- #
