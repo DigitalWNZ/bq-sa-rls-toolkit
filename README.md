@@ -192,7 +192,8 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 
 1. **SA 清单**：范围内每个 ACTIVE 项目用 IAM `serviceAccounts.list` 列出全部 SA（含已禁用、没有任何授权的）。组织范围先用 Resource Manager 递归列出全部文件夹和项目；待删除的项目跳过并 `[NOTE]`。
 2. **账号目录**（只在指定 `--organizations` 时）：Admin SDK Directory API 列出组织账号目录里的全部 user（含暂停 / 归档、所有域名）。
-3. **BigQuery 相关授权**：组织 / 文件夹 / 项目 IAM 策略（只指定项目时，同样读取该项目全部上级文件夹 / 组织的策略，不漏继承的授权；效果同 Console 项目 IAM 页面的「继承」行）、每个数据集的 ACL、每张表 / 视图的 IAM 策略；只纳入含 `bigquery.tables.getData`（能读表数据）的角色。用于找出其它项目的 SA、外部域的 user、Google 服务代理。其中的 Group 递归展开。
+3. **BigQuery 相关授权**：组织 / 文件夹 / 项目 IAM 策略（只指定项目时，同样读取该项目全部上级文件夹 / 组织的策略，不漏继承的授权；效果同 Console 项目 IAM 页面的「继承」行）、每个数据集的 ACL、每张表 / 视图的 IAM 策略；只纳入能读表数据的角色：含 `bigquery.tables.getData` 的角色，以及**基本角色 Owner / Editor / Viewer**（它们的 IAM 权限里没有这一项，但每个数据集的 ACL 默认带特殊组 `projectOwners` / `projectWriters` / `projectReaders`，项目的基本角色持有者借此能读表，所以一律按能读表处理，不管授在项目、文件夹还是组织上）。用于找出其它项目的 SA、外部域的 user、Google 服务代理（如默认在每个项目上有 Editor 的 `<项目编号>@cloudservices.gserviceaccount.com`）。其中的 Group 递归展开。
+4. **授权视图 / 数据集 / 例程**（只提示）：数据集 ACL 中授权了其它项目的视图 / 数据集 / 例程读取本数据集时，能查询它们的人也能间接读到数据；这些项目不在本次扫描范围内时打印 `[NOTE]` 列出，需要的话把它们加入 `--projects` 重跑。
 
 跳过 `deleted:`、`domain:`、`allUsers`、`allAuthenticatedUsers`、授权视图 / 例程 / 数据集等非具体账号。任何读取失败都 `[ERROR]` 并以退出码 1 结束（其余结果照常写入），绝不悄悄跳过。
 
@@ -365,6 +366,7 @@ python rollback_rls.py --tables tables.csv --apply                              
 - **Copilot Group 成员能读整张条件表**：规则里的子查询以查询者身份执行，所以 Copilot Group 必须有条件表的读权限，组内每个账号因此都能看到所有账号的可见范围。这是 BigQuery 子查询规则的固有特性（被规则引用的表不能再加 RLS），请知悉。
 - **REPLACE 时有极短的无过滤窗口**：规则内容变化时脚本用 `CREATE OR REPLACE ROW ACCESS POLICY` 覆盖。若该表上只有这一条规则，BigQuery 官方说明替换瞬间可能短暂不过滤。首次设置或 NOOP 不受影响；如需避免，可在业务低峰执行。
 - **rollback 不要与 apply 同时对同一批表运行**：rollback 先读取规则再删除，「这张表的规则将被全部删除」的判断在读取时做出；同时有 apply 在建规则时，判断可能与执行时的实际情况不一致。
+- **list_principals 的覆盖范围**：不列出 `domain:`（整个域）、`allUsers` / `allAuthenticatedUsers`（公开）、`principal://` / `principalSet://`（Workforce / Workload Identity Federation）这类非具体账号的授权；不扫描 Analytics Hub 订阅（linked dataset）和其它组织中的授权视图。基本角色一律按能读表处理，个别数据集若删掉了默认特殊组，会多列几个其实读不到这些表的人（宁可多列）。
 - **list_principals 读不到某个自定义角色的定义时按「能读表数据」处理**：打印 `[WARN]`，其成员照常列入 CSV，退出码不因此变为 1。这是有意的「宁可多列、不可漏列」，与其它读取失败（`[ERROR]` + 退出码 1）不同。
 - **映射表 `col_name` 不区分大小写**：与 BigQuery 列名规则一致（`Region` 与 `region` 视为同一列），生成的过滤条件使用表中的真实写法。
 - **Group 写错或刚创建尚未同步**：执行时 BigQuery 报「Group … does not exist」，脚本不再等待重试——第一张需要变更的表失败即停止，其余表都不执行（退出码 2，未做任何变更）。Group 刚创建或刚改过成员时，等几分钟后重跑即可。演练不执行 DDL，发现不了这类问题。

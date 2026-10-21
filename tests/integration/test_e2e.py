@@ -108,6 +108,22 @@ def test_01c_list_principals_project_scope_org_inherited(world, tmp_path):
     assert member not in L.org_members("roles/bigquery.dataViewer")
 
 
+@pytest.mark.skipif(L.SA_POOL_PROJECT == L.PROJECT, reason="需要 RLS_IT_SA_POOL_PROJECT")
+def test_01d_list_principals_basic_role_only(world, tmp_path):
+    # 其它项目的 SA 在测试项目上只有基本角色 Viewer（IAM 权限里没有 getData，靠数据集默认的 projectReaders 读表）：
+    # 只指定项目时也必须列出
+    L.ensure_sa(L.SA_BASIC)
+    member, res = f"serviceAccount:{L.SA_BASIC}", f"projects/{L.PROJECT}"
+    L.iam_binding(res, "roles/viewer", member)
+    try:
+        code, log, rows = _list(tmp_path, "--projects", L.PROJECT)
+        assert code == 0, log
+        assert rows.get(L.SA_BASIC, {}).get("principal_type") == "serviceAccount", log
+    finally:
+        L.iam_binding(res, "roles/viewer", member, add=False)
+    assert member not in L.iam_members(res, "roles/viewer")
+
+
 @pytest.mark.skipif(not L.ORG, reason="未设置 RLS_IT_ORG")
 def test_02_list_principals_org_scope(world, tmp_path):
     # 执行账号（Argolis 的 admin@）是 Workspace 超级管理员：用它自己的 gcloud 凭证读账号目录

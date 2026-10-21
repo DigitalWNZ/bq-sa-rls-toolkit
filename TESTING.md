@@ -4,9 +4,9 @@
 
 | 类别 | 位置 | 数量 | 结果 | 环境 |
 |---|---|---|---|---|
-| 1 单体测试 | `tests/unit/` | 690 | ✅ 690 / 690 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
-| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 36 | ✅ 36 / 36（约 18 分钟） | 真实 GCP（Argolis 测试组织） |
-| 3 功能测试 | `tests/functional/test_requirements.py` | 24 | ✅ 24 / 24 | 本地；每条需求另有对应的系统测试用例 |
+| 1 单体测试 | `tests/unit/` | 701 | ✅ 701 / 701 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
+| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 37 | ✅ 37 / 37（约 20 分钟） | 真实 GCP（Argolis 测试组织） |
+| 3 功能测试 | `tests/functional/test_requirements.py` | 26 | ✅ 26 / 26 | 本地；每条需求另有对应的系统测试用例 |
 | 4 性能测试 | `tests/perf/run_perf.py`、`simulate.py` | 1000 表 × 500 新增 × 100 存量 | ✅ 全部步骤成功，0 重试、0 错误 | 真实 GCP + 本地模拟 |
 | 5 稳定性测试 | `tests/stability/test_stability.py`、`tests/integration/test_zz_stability.py` | 28 + 4 | ✅ 32 / 32 | 本地 + 真实 GCP |
 
@@ -18,7 +18,7 @@ pip install -r requirements.txt pytest
 # 本地（单体 + 功能 + 稳定性），约 3 秒，不访问 GCP；Python 3.9 与 3.13 均已实测通过
 python -m pytest tests/unit tests/functional tests/stability -q
 
-# 真实环境（系统测试 + 真实稳定性测试），约 18 分钟；会在测试项目中建表、建 SA / Group、设置并删除 RLS 规则
+# 真实环境（系统测试 + 真实稳定性测试），约 20 分钟；会在测试项目中建表、建 SA / Group、设置并删除 RLS 规则
 RLS_IT=1 RLS_IT_PROJECT=<测试项目> RLS_IT_ACCOUNT=<执行账号> RLS_IT_DOMAIN=<域名> RLS_IT_ORG=<组织ID> \
   python -m pytest tests/integration -v
 
@@ -40,18 +40,18 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 
 ---
 
-## 1. 单体测试（690）
+## 1. 单体测试（701）
 
 用 `tests/unit/fakes.py` 中的 FakeWorld 模拟 GCP（表、规则、授权对象、登记表 / 条件表 / 映射表、IAM、账号目录、Group），直接调用四个脚本的 `main()`，断言退出码、日志、生成的 DDL 与最终规则状态。
 
 | 文件 | 数量 | 内容 |
 |---|---|---|
-| `test_rls_core.py` | 107 | 纯逻辑：表名 / 主体解析、规则命名、DDL 生成与注入防护、过滤条件规范化、计划（CREATE / NOOP / REPLACE）、登记表判定、CSV（含 group 行）、本组织域名判断 |
+| `test_rls_core.py` | 109 | 纯逻辑：表名 / 主体解析、规则命名、DDL 生成与注入防护、过滤条件规范化、计划（CREATE / NOOP / REPLACE）、登记表判定、CSV（含 group 行）、本组织域名判断、授权视图 / 例程 / 数据集引用 |
 | `test_params_simplified.py` | 82 | 参数：值 / `.csv` / 混用 / 去重 / BOM / CRLF / 多列报错 / 文件不存在；重复参数累加；表名格式（反引号可选、拒绝冒号写法与非三段）；被删除的旧参数 → 退出码 2；`--parallel` 默认 16 |
 | `test_abnormal_cases.py` | 129 | 异常系：参数误用、注入（表名、Group 邮箱、映射表、条件表列名与 sa 值、CSV 公式）、脏数据、部分失败隔离、并发一致性 |
 | `test_bypass_registry.py` | 59 | apply_bypass 登记表双重保证：范围 ∩ `rls_enabled = 1`、精确比较、冲突、登记表不可用 |
 | `test_copilot_group.py` | 54 | apply_copilot Group 级别：每表一条规则、精确 DDL、多维度 AND、status 不生效、新增账号无需重跑、改映射 REPLACE、400 条上限、sa 校验 |
-| `test_list_principals.py` | 71 | list_principals：无授权 SA / user、多层文件夹、待删除项目、角色筛选、条件授权、服务代理、账号目录、读取失败报错、Group 展开；`--projects` 读上级文件夹 / 组织策略（多层、读取失败、去重、无上级）；展不开的 Group 写入 CSV（外部域 `[NOTE]` / 本域 `[ERROR]`、辅助域名、跑脚本账号域名、嵌套、排除） |
+| `test_list_principals.py` | 80 | list_principals：无授权 SA / user、多层文件夹、待删除项目、角色筛选、条件授权、服务代理、账号目录、读取失败报错、Group 展开；`--projects` 读上级文件夹 / 组织策略（多层、读取失败、去重、无上级）；展不开的 Group 写入 CSV（外部域 `[NOTE]` / 本域 `[ERROR]`、辅助域名、跑脚本账号域名、嵌套、排除）；**基本角色 Owner / Editor / Viewer 按能读表处理**（组织外 user / SA、`--projects` 下的 user 与其它项目的 SA、继承、Group、不查角色定义）；范围外授权视图 `[NOTE]` |
 | `test_gate_removal.py` | 31 | 已去掉的「闸门」：只提示不拦截；旧参数被拒 |
 | `test_scripts.py` | 36 | 四个脚本的主流程 |
 | `test_normal_cases.py` | 28 | 正常系：每条设计决定一个用例，含第 1 → 3 → 7 → 8 步端到端流程 |
@@ -61,7 +61,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | `test_gcp_auth.py` | 19 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新；通过 gcloud 扮演 SA 时 `[AUTH]` 显示实际执行的 SA 与登录账号、扮演失败的提示 |
 | `test_gcp_ops.py` | 13 | 重试分类、限速、挂载后验证（扮演失败立即失败）、getAncestry 解析、组织信息（customer ID、主域名） |
 
-## 2. 系统测试（36，真实 GCP）
+## 2. 系统测试（37，真实 GCP）
 
 `conftest.py` 在测试项目中准备：业务表（含列名不同、分区表、映射到不存在的列、映射表里没有、登记为未开启、没有 bypass 的表；每张 9 行，含 HK / SG / US × mobile 数据）、条件表 / 映射表 / 登记表（条件表、映射表、登记表自身、备用映射表都登记为 `rls_enabled = 0`；映射表 / 登记表中另有一张实际不存在的 `dropped_t`）、7 个测试 SA（存量读 / 写、通过数据集 ACL 授权、Copilot A / B / N / M）、4 个 Group（ReadOnly、Writable、ACL、Copilot）及其权限。然后按方案文档顺序运行四个脚本，并**以各账号身份实际查表**验证可见性。
 
@@ -69,12 +69,13 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 |---|---|
 | test_01–04 | list_principals：项目范围列出的 SA 与 IAM API **完全一致**（含没有任何授权的）；组织范围含其它项目的 SA、账号目录全部 user；排除参数；不给账号 / quota 参数时自动确定；Argolis 组织 IAM 中的外部域 Group 只 `[NOTE]` 并作为 group 写入 CSV、退出码 0 |
 | test_01c | list_principals 项目范围：项目外的 SA **只在组织上**被授予 BigQuery Data Viewer（继承）→ 也被列出；结束后撤销组织授权 |
+| test_01d | list_principals 项目范围：其它项目的 SA 在测试项目上**只有基本角色 Viewer** → 也被列出；结束后撤销 |
 | test_10–14 | apply_bypass：首次设置提示、两个白名单 Group、项目范围、登记表筛选 / 错误 / 冲突、重跑 NOOP、实际可见全部、REPLACE 打印旧内容 |
 | test_20–26 | apply_copilot：无 bypass 也照建、演练、执行（**运行日志文件与屏幕输出逐字相同**；映射表列名 `REGION` 与表中 `region` 大小写不同也正确）；**Group 不存在 → 第一张表即停止、退出码 2、所有表零变更、不再等待重试（test_22c，bypass 与 copilot 各一次）**；**表已被 drop → `[SKIP] 表不存在`，演练 / 执行都只跳过这一张**；**同一 Group 内 A 只看 HK、M 只看 HK 且 mobile（多维度 AND）、B（维度全空）看全部、user 只看 SG、不在条件表的 0 行；没有校验维度的表 Copilot 成员 0 行**；改条件表不跑脚本即生效；**新增账号不跑脚本即生效**；重跑 NOOP、改坏后 REPLACE |
 | test_30–34 | rollback：不给筛选 = 全部（演练）、按 Copilot Group、按 user 与规则名、按 Group、删光不拦 |
 | r01–r07 | 视图不支持 RLS 且被隔离、视图误配进映射表、条件表脏数据（大小写 / 前缀 / 组邮箱 / 乱码 / 特殊列名）、大小写修正后无需重跑、user 执行账号、不可扮演的 `--verify-sa` 立即失败、错误的 gcloud 账号、不存在的数据集 / 表 |
 
-## 3. 功能测试（24：客户需求逐条映射）
+## 3. 功能测试（26：客户需求逐条映射）
 
 `REQUIREMENTS` 字典把每条客户需求映射到本地用例和真实环境用例；`test_requirement_table_complete` 保证每条需求都有用例。
 
@@ -103,6 +104,8 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | F21 | 每次运行自动保存日志文件（默认 `logs/`、`--log-dir` 可改、内容与屏幕完全一致、建不了只警告、不覆盖不清理） | test_22 |
 | F22 | list_principals 项目范围：含从组织 / 文件夹继承的能读表数据的授权 | test_01c |
 | F23 | 展不开的 Group 作为 group 写入 CSV；外部域 `[NOTE]` 不影响退出码，本组织域名的 `[ERROR]` 退出码 1 | test_02 |
+| F24 | 只有基本角色（Owner / Editor / Viewer）的 user / SA 也列出 | test_01d |
+| F25 | 授权视图 / 数据集 / 例程所在项目不在扫描范围时 `[NOTE]` 列出 | 本地 |
 
 ## 4. 性能测试
 

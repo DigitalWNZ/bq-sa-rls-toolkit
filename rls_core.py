@@ -248,6 +248,9 @@ def split_iam_members(members):
 
 
 GET_DATA_PERMISSION = "bigquery.tables.getData"
+# 基本角色：IAM 权限里没有 bigquery.tables.getData，但每个数据集的 ACL 默认带特殊组 projectOwners / projectWriters /
+# projectReaders，项目的 Owner / Editor / Viewer 借此能读表 → list_principals 一律按「能读表数据」处理（宁可多列）
+BASIC_ROLES = {"roles/owner", "roles/editor", "roles/viewer"}
 # 数据集旧式 ACL 角色 -> 对应的预定义角色（三者都含 bigquery.tables.getData）
 LEGACY_DATASET_ROLES = {"READER": "roles/bigquery.dataViewer", "WRITER": "roles/bigquery.dataEditor",
                         "OWNER": "roles/bigquery.dataOwner"}
@@ -277,7 +280,7 @@ def acl_members(entries, role_ok):
     """
     数据集 ACL 条目 [(role, entity_type, entity_id)] -> (principals, groups)，只取 role_ok(角色) 为真的条目。
     userByEmail（含 SA 邮箱）-> principal；groupByEmail -> group；iamMember 按前缀；
-    specialGroup（projectReaders 等，已由项目 IAM 覆盖）/ domain / view / routine / dataset 跳过。
+    specialGroup（projectReaders 等：基本角色已在 IAM 策略中直接按能读表计入）/ domain / view / routine / dataset 跳过。
     """
     principals, groups = set(), set()
     for role, etype, eid in entries:
@@ -294,6 +297,33 @@ def acl_members(entries, role_ok):
             principals |= p
             groups |= g
     return principals, groups
+
+
+def authorized_refs(entries):
+    """
+    数据集 ACL 中的授权视图 / 例程 / 数据集 -> [(类型, "p.d.x" 或 "p.d", 所在项目)]（按出现顺序）。
+    能查询这些视图 / 例程（或该数据集中的视图）的人，能间接读到本数据集的数据。
+      view    -> {"projectId", "datasetId", "tableId"}
+      routine -> {"projectId", "datasetId", "routineId"}
+      dataset -> {"dataset": {"projectId", "datasetId"}, "targetTypes": [...]}
+    """
+    out = []
+    for _, etype, eid in entries:
+        if not isinstance(eid, dict):
+            continue
+        if etype == "view":
+            ids, kind, leaf = eid, "授权视图", eid.get("tableId")
+        elif etype == "routine":
+            ids, kind, leaf = eid, "授权例程", eid.get("routineId")
+        elif etype == "dataset":
+            ids, kind, leaf = eid.get("dataset") or {}, "授权数据集", None
+        else:
+            continue
+        p, d = ids.get("projectId"), ids.get("datasetId")
+        if not p or not d or (etype != "dataset" and not leaf):
+            continue
+        out.append((kind, f"{p}.{d}" + (f".{leaf}" if leaf else ""), p))
+    return out
 
 
 def _member_type(email, mtype):

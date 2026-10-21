@@ -294,6 +294,20 @@ class TestPrincipalRows:
                         {"email": "g@other.com", "principal_type": "group", "home_project": ""}]
 
 
+class TestAuthorizedRefs:
+    def test_view_routine_dataset_refs(self):
+        entries = [("READER", "userByEmail", "a@x.com"),
+                   ("READER", "specialGroup", "projectReaders"),
+                   (None, "view", {"projectId": "p2", "datasetId": "d2", "tableId": "v"}),
+                   (None, "routine", {"projectId": "p3", "datasetId": "d3", "routineId": "r"}),
+                   (None, "dataset", {"dataset": {"projectId": "p4", "datasetId": "d4"}, "targetTypes": ["VIEWS"]}),
+                   (None, "view", "not-a-dict"), (None, "view", {"datasetId": "x"})]
+        assert core.authorized_refs(entries) == [("授权视图", "p2.d2.v", "p2"), ("授权例程", "p3.d3.r", "p3"),
+                                                 ("授权数据集", "p4.d4", "p4")]
+
+    def test_basic_roles(self):
+        assert core.BASIC_ROLES == {"roles/owner", "roles/editor", "roles/viewer"}
+
 class TestOwnDomain:
     def test_email_domain(self):
         assert core.email_domain("User@Trip.COM") == "trip.com"

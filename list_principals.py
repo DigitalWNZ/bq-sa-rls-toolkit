@@ -18,11 +18,15 @@
        策略（getAncestry 找上级），不漏从组织 / 文件夹继承的授权（效果同 Console 项目 IAM 页面的「继承」行）
      - 每个数据集的 ACL（BigQuery datasets.list + datasets.get）
      - 每张表 / 视图的 IAM 策略（BigQuery tables.getIamPolicy）
-     只纳入含 bigquery.tables.getData（能读表数据）的角色：基本角色 Owner / Editor / Viewer、BigQuery 数据角色、
-     数据集旧式 ACL 的 READER / WRITER / OWNER 都算；自定义角色读取其权限列表判断；读不到角色定义时宁可多列并 [WARN]。
+     只纳入能读表数据的角色：含 bigquery.tables.getData 的角色（BigQuery 数据角色、数据集旧式 ACL 的 READER / WRITER /
+     OWNER 等；自定义角色读取其权限列表判断，读不到角色定义时宁可多列并 [WARN]），以及基本角色 Owner / Editor / Viewer
+     （它们的 IAM 权限里没有 getData，但每个数据集的 ACL 默认带特殊组 projectOwners / projectWriters / projectReaders，
+     项目的基本角色持有者借此能读表，所以一律按能读处理，不管授在项目、文件夹还是组织上）。
      带条件的授权同样纳入。其中出现的 Group 用 Cloud Identity 递归展开。
      GCS、Pub/Sub 等非 BigQuery 资源上的授权不纳入。
-  跳过：deleted:、domain:、allUsers、allAuthenticatedUsers、principalSet:// 、specialGroup、授权视图 / 例程 / 数据集等非具体账号。
+  4. 授权视图 / 数据集 / 例程（只提示）：数据集 ACL 授权了其它项目的视图 / 数据集 / 例程时，能查询它们的人也能间接读到数据；
+     这些项目不在本次扫描范围内时 [NOTE] 列出（不影响退出码），需要的话把它们加入 --projects 重跑。
+  跳过：deleted:、domain:、allUsers、allAuthenticatedUsers、principal:// / principalSet://、specialGroup 等非具体账号。
   任何项目 / 文件夹 / 数据集 / 表 / 账号目录读取失败都打印 [ERROR] 并以退出码 1 结束（其余结果照常写入 CSV），绝不悄悄跳过。
   展不开的 Group 一律作为 principal_type = group 写入 CSV（成员未展开），按域名分两类：
     - 外部域（不属于本组织域名）：Cloud Identity 不允许读取其它组织的 Group → [NOTE]，不影响退出码；
@@ -94,6 +98,8 @@ class RoleChecker:
     def __call__(self, role):
         if not role:
             return False
+        if role in core.BASIC_ROLES:          # 基本角色：IAM 权限里没有 getData，但数据集默认 ACL 的特殊组
+            return True                       # projectOwners / Writers / Readers 让它们能读表 → 按能读处理，不查定义
         with self._lock:
             if role in self._cache:
                 return self._cache[role]
@@ -249,13 +255,23 @@ def _main(argv):
         datasets += res
 
     n = 0
+    scanned = set(projects)
+    outside_refs = {}                                 # 范围外的项目 -> ["授权视图 p.d.v → 数据集 x.y", ...]
     for ds, res, err in ops.parallel_map(lambda d: ops.dataset_access(ctx, d), datasets, workers=workers, desc="acl"):
         if err:
             failed = True
             ops.log(f"[ERROR] 数据集 {ds}: 读取 ACL 失败: {err}")
             continue
         n += take(core.acl_members(res, has_get_data))
+        for kind, ref, prj in core.authorized_refs(res):
+            if prj not in scanned:
+                outside_refs.setdefault(prj, []).append(f"{kind} {ref} → 数据集 {ds}")
     ops.log(f"[ACL] {len(datasets)} 个数据集：能读表数据的授权对象 {n} 个")
+    if outside_refs:
+        ops.log(f"[NOTE] 以下 {len(outside_refs)} 个项目中的视图 / 数据集 / 例程被授权读取本次范围内的数据集，"
+                "但这些项目不在本次扫描范围内；能查询它们的 user / SA 也能间接读到数据，需要的话请把这些项目加入 "
+                "--projects 重跑（或改用 --organizations）：\n"
+                + "\n".join(f"  - {p}：" + "；".join(sorted(set(v))) for p, v in sorted(outside_refs.items())))
 
     tables = []
     for ds, res, err in ops.parallel_map(lambda d: ops.dataset_tables(ctx, d), datasets, workers=workers,

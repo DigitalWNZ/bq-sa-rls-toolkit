@@ -501,3 +501,71 @@ class TestAncestorsAndGroups:
         assert "[GROUP] 共 2 个 Group，外部域 1 个（已写入 CSV）、本域未能展开 1 个" in err
         assert {r for r, v in rows.items() if v["principal_type"] == "group"} == {"ext-g@other.com", "nested@trip.com"}
         assert "ana@trip.com" in rows and "svc-in-group@p7.iam.gserviceaccount.com" not in rows
+
+
+# =========================================================================== #
+# 基本角色（Owner / Editor / Viewer）：IAM 权限里没有 getData，但数据集默认 ACL 的特殊组让它们能读表 → 按能读处理
+# =========================================================================== #
+class TestBasicRoles:
+    def test_lp_basic_01_counted_without_role_lookup(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "user:viewer-only@partner.com"))
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        assert code == 0 and "viewer-only@partner.com" in rows
+        assert not {"roles/owner", "roles/editor", "roles/viewer"} & set(world.role_lookups)   # 不查角色定义
+
+    def test_lp_basic_02_org_scope_external_user_with_project_viewer(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "user:viewer-only@partner.com"))
+        _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
+        assert rows["viewer-only@partner.com"]["principal_type"] == "user"
+
+    def test_lp_basic_03_org_scope_external_sa_with_folder_editor(self, world, tmp_path):
+        world.iam_policies[F1].append(b("roles/editor", "serviceAccount:ext-editor@other-org.iam.gserviceaccount.com"))
+        _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
+        assert rows["ext-editor@other-org.iam.gserviceaccount.com"]["home_project"] == "other-org"
+
+    def test_lp_basic_04_project_scope_internal_user_with_viewer_only(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "user:dave@trip.com"))
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert "dave@trip.com" in rows                                  # 以前漏：不读账号目录、基本角色又被筛掉
+
+    def test_lp_basic_05_project_scope_other_project_sa_with_editor(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/editor", "serviceAccount:dev-sa@dev.iam.gserviceaccount.com"))
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert "dev-sa@dev.iam.gserviceaccount.com" in rows
+
+    def test_lp_basic_06_project_scope_inherited_org_viewer(self, world, tmp_path):
+        world.iam_policies[f"organizations/{ORG}"].append(b("roles/viewer", "user:org-viewer@trip.com"))
+        world.iam_policies[F1].append(b("roles/owner", "serviceAccount:f-owner@x.iam.gserviceaccount.com"))
+        _, rows, _ = run(tmp_path, "--projects", P2)                    # dev 在 组织 → folders/10 下
+        assert {"org-viewer@trip.com", "f-owner@x.iam.gserviceaccount.com",
+                "folder-sa@other.iam.gserviceaccount.com"} <= set(rows)
+
+    def test_lp_basic_07_group_with_basic_role_expanded(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/owner", "group:owners@trip.com"))
+        world.groups["owners@trip.com"] = [("bob@trip.com", "USER")]
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert "bob@trip.com" in rows and "owners@trip.com" not in rows
+
+    def test_lp_basic_08_non_bigquery_roles_still_filtered(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/storage.admin", "user:gcs2@partner.com"))
+        world.iam_policies[f"projects/{P1}"].append(b("roles/browser", "user:browser@partner.com"))
+        world.role_perms["roles/browser"] = {"resourcemanager.projects.get"}
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert "gcs2@partner.com" not in rows and "browser@partner.com" not in rows
+
+    def test_lp_basic_09_authorized_refs_outside_scope_noted(self, world, tmp_path, capsys):
+        world.dataset_acl["prod.dw"] += [
+            (None, "view", {"projectId": "rpt-proj", "datasetId": "share", "tableId": "v_orders"}),
+            (None, "routine", {"projectId": "udf-proj", "datasetId": "fn", "routineId": "mask"}),
+            (None, "dataset", {"dataset": {"projectId": P1, "datasetId": "views"}, "targetTypes": ["VIEWS"]})]
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0
+        note = err[err.index("[NOTE] 以下 2 个项目中的视图"):]
+        assert "rpt-proj" in note and "授权视图 rpt-proj.share.v_orders → 数据集 prod.dw" in note
+        assert "udf-proj" in note and "授权例程 udf-proj.fn.mask → 数据集 prod.dw" in note
+        assert f"授权数据集 {P1}.views" not in err                       # 范围内的项目不提示
+        # 组织范围：rpt-proj 不在组织内，同样提示；组织内的项目不提示
+        code, _, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="org.csv")
+        err = capsys.readouterr().err
+        assert code == 0 and "rpt-proj" in err and f"授权数据集 {P1}.views" not in err

@@ -20,7 +20,9 @@ _DROP_ALL_RE = re.compile(r"DROP ALL ROW ACCESS POLICIES ON `(?P<table>[^`]+)`")
 # list_principals：常见角色的权限（只列与判断相关的；未列出的角色视为「读不到角色定义」）
 GET_DATA = "bigquery.tables.getData"
 DEFAULT_ROLE_PERMS = {
-    "roles/owner": {GET_DATA, "resourcemanager.projects.get"}, "roles/editor": {GET_DATA}, "roles/viewer": {GET_DATA},
+    # 与实际一致：基本角色的 IAM 权限里没有 bigquery.tables.getData（读表靠数据集 ACL 默认的特殊组）
+    "roles/owner": {"resourcemanager.projects.get", "bigquery.datasets.get"}, "roles/editor": {"bigquery.datasets.get"},
+    "roles/viewer": {"bigquery.datasets.get"},
     "roles/bigquery.admin": {GET_DATA}, "roles/bigquery.dataOwner": {GET_DATA}, "roles/bigquery.dataEditor": {GET_DATA},
     "roles/bigquery.dataViewer": {GET_DATA}, "roles/bigquery.metadataViewer": {"bigquery.tables.get"},
     "roles/bigquery.jobUser": {"bigquery.jobs.create"}, "roles/bigquery.user": {"bigquery.jobs.create"},

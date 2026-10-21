@@ -83,6 +83,8 @@ python list_principals.py --organizations 123456789012 --exclude-patterns 'copil
   - **外部域的组**（合作方的组、Google 管理的组等，日志 `[NOTE]`）：任何账号都读不到，不算错误。由客户判断是否需要列入白名单、如何处理（如向对方确认组内成员）。
   - **本组织域名的组**（日志 `[ERROR]`，退出码 1）：本应能读，多半是跑脚本的 user / SA 缺「群组 → 读取」权限（见 0.2 第 2 条）。修好后重跑，或在 Admin 控制台手工核对成员（其中的 SA / user 同样要加入白名单 Group）。
   - 本组织域名见日志 `[DOMAIN]` 行；只指定 `--projects` 时不读账号目录，辅助域名（如 `ctrip.com`）的组会被当作外部域（照样写入 CSV）。
+- 只有基本角色（Owner / Editor / Viewer）的 user / SA 也会列出（它们通过数据集默认的特殊组读表）。CSV 中会出现 Google 服务代理（`serviceAgent`，如每个项目默认有 Editor 的 `<项目编号>@cloudservices.gserviceaccount.com`），由客户判断是否加入白名单。
+- **`[NOTE] 以下 N 个项目中的视图 / 数据集 / 例程被授权读取本次范围内的数据集`**：能查询这些视图的人也能间接读到数据。需要的话把列出的项目加入 `--projects` 重跑，或改用 `--organizations`。
 - 规模参考：每张表读一次 IAM 策略，1000 张表约 1 分钟，10 万张表约 1.5 小时。
 
 **客户审核**：从 CSV 中挑出现存的 SA / user，决定各自进 ReadOnly 还是 Writable Group。

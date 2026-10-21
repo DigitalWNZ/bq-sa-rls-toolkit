@@ -45,6 +45,9 @@ REQUIREMENTS = {
     "F22": ("list_principals 项目范围：含从组织 / 文件夹继承的能读表数据的授权（读项目全部上级的策略）", "test_e2e::test_01c"),
     "F23": ("list_principals：展不开的 Group 作为 group 写入 CSV；外部域 [NOTE] 不影响退出码，本组织域名的 [ERROR] 退出码 1",
             "test_e2e::test_02"),
+    "F24": ("list_principals：只有基本角色（Owner / Editor / Viewer）的 user / SA 也列出（组织外的；--projects 时含 user 与其它项目的 SA）",
+            "test_e2e::test_01d"),
+    "F25": ("list_principals：授权视图 / 数据集 / 例程所在项目不在扫描范围时 [NOTE] 列出这些项目", "（本地）"),
 }
 
 P = "trip-prod"
@@ -129,7 +132,7 @@ def copilot(tmp_path, *args):
 
 
 def test_requirement_table_complete():
-    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 24)]
+    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 26)]
 
 
 # --------------------------------------------------------------------------- #
@@ -344,3 +347,18 @@ def test_F23_unexpandable_groups_written_to_csv(world, tmp_path, capsys):
     code, rows, _ = lp(tmp_path, "--projects", P)
     err = capsys.readouterr().err
     assert code == 1 and rows["nested@trip.com"]["principal_type"] == "group" and "群组 → 读取" in err
+
+
+def test_F24_basic_role_holders_listed(world, tmp_path):
+    world.iam_policies[f"projects/{P}"].append({"role": "roles/viewer", "members": ["user:viewer@partner.com"]})
+    world.iam_policies["organizations/111"] = [{"role": "roles/editor", "members": ["user:carol2@trip.com"]}]
+    world.iam_policies[f"projects/{P}"].append(
+        {"role": "roles/owner", "members": ["serviceAccount:dev-sa@dev.iam.gserviceaccount.com"]})
+    code, rows, _ = lp(tmp_path, "--projects", P)
+    assert code == 0 and {"viewer@partner.com", "carol2@trip.com", "dev-sa@dev.iam.gserviceaccount.com"} <= set(rows)
+
+
+def test_F25_authorized_view_outside_scope_noted(world, tmp_path, capsys):
+    world.dataset_acl[f"{P}.dw"].append((None, "view", {"projectId": "rpt", "datasetId": "s", "tableId": "v"}))
+    code, _, _ = lp(tmp_path, "--projects", P)
+    assert code == 0 and "授权视图 rpt.s.v" in capsys.readouterr().err

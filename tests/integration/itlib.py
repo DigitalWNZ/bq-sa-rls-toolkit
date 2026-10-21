@@ -255,6 +255,7 @@ def customer_id():
 # 组织层授权（list_principals --projects 读上级策略的用例）
 # --------------------------------------------------------------------------- #
 SA_ANC = f"{PREFIX}-anc@{SA_POOL_PROJECT}.iam.gserviceaccount.com"   # 只在组织上被授权（继承到测试项目）
+SA_BASIC = f"{PREFIX}-basic@{SA_POOL_PROJECT}.iam.gserviceaccount.com"  # 在测试项目上只有基本角色 Viewer
 
 
 def ensure_sa(email):
@@ -269,13 +270,13 @@ def ensure_sa(email):
             raise
 
 
-def org_binding(role, member, add=True):
-    """组织 IAM 策略中增加 / 删除一条 (role, member)（读-改-写，带 etag；并发冲突 409 自动重试）。"""
+def iam_binding(resource, role, member, add=True):
+    """organizations/<id> 或 projects/<id> 的 IAM 策略中增加 / 删除一条 (role, member)（读-改-写，带 etag；冲突自动重试）。"""
     crm = api("cloudresourcemanager", "v3")
-    res = f"organizations/{ORG}"
+    api_res = crm.organizations() if resource.startswith("organizations/") else crm.projects()
 
     def once():
-        pol = crm.organizations().getIamPolicy(resource=res, body={"options": {"requestedPolicyVersion": 3}}).execute()
+        pol = api_res.getIamPolicy(resource=resource, body={"options": {"requestedPolicyVersion": 3}}).execute()
         bindings = pol.setdefault("bindings", [])
         b = next((x for x in bindings if x["role"] == role and "condition" not in x), None)
         if add:
@@ -292,8 +293,19 @@ def org_binding(role, member, add=True):
             if not b["members"]:
                 bindings.remove(b)
         pol["version"] = 3
-        crm.organizations().setIamPolicy(resource=res, body={"policy": pol}).execute()
-    eventually(once, timeout=300, interval=10, desc=f"org binding {role} {member} add={add}")
+        api_res.setIamPolicy(resource=resource, body={"policy": pol}).execute()
+    eventually(once, timeout=300, interval=10, desc=f"iam binding {resource} {role} {member} add={add}")
+
+
+def org_binding(role, member, add=True):
+    iam_binding(f"organizations/{ORG}", role, member, add)
+
+
+def iam_members(resource, role):
+    crm = api("cloudresourcemanager", "v3")
+    api_res = crm.organizations() if resource.startswith("organizations/") else crm.projects()
+    pol = api_res.getIamPolicy(resource=resource, body={"options": {"requestedPolicyVersion": 3}}).execute()
+    return {m for b in pol.get("bindings", []) if b["role"] == role for m in b["members"]}
 
 
 def org_members(role):
