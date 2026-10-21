@@ -119,19 +119,19 @@ def execute_tables(tables, execute, n_workers, apply, needs_change, on_result):
     逐表执行。execute(t) -> (lines, ok, group_missing)；on_result(t, res, err) 负责打印与计数。
     执行模式下先单独执行第一张需要变更的表：BigQuery 报 Group 不存在 → 立即停止，其余表都不执行
     （返回 "abort_first"，此时未做任何变更）。并行阶段再出现 Group 不存在 → 尚未开始的表不再执行（"abort_mid"）。
-    返回 (状态, 未执行的表数)。
+    返回 (状态, 未执行的需要变更的表数)——NOOP 的表本来就不需要执行，不计入。
     """
     first = next((t for t in tables if needs_change(t)), None) if apply else None
     if first is not None:
         res = execute(first)
         on_result(first, res, None)
         if res[2]:
-            return "abort_first", len(tables) - 1
+            return "abort_first", sum(1 for t in tables if t != first and needs_change(t))
     rest = [t for t in tables if t != first]
     stop = threading.Event()
 
     def guarded(t):
-        if stop.is_set():
+        if stop.is_set() and needs_change(t):
             return None
         res = execute(t)
         if res[2]:
@@ -150,10 +150,19 @@ def execute_tables(tables, execute, n_workers, apply, needs_change, on_result):
 def log_group_abort(status, not_run, group):
     """execute_tables 中止时的说明；返回该情况下的退出码（abort_first = 2：未做任何变更）。"""
     if status == "abort_first":
-        ops.log(f"[ERROR] BigQuery 报 Group {group} 不存在，已停止：其余 {not_run} 张表未执行，未做任何变更。{GROUP_MISSING_HINT}")
+        ops.log(f"[ERROR] BigQuery 报 Group {group} 不存在，已停止：其余 {not_run} 张需要变更的表未执行，未做任何变更。"
+                f"{GROUP_MISSING_HINT}")
         return 2
-    ops.log(f"[ERROR] 执行中 BigQuery 报 Group {group} 不存在，已停止：{not_run} 张表未执行。{GROUP_MISSING_HINT}")
+    ops.log(f"[ERROR] 执行中 BigQuery 报 Group {group} 不存在，已停止：{not_run} 张需要变更的表未执行。{GROUP_MISSING_HINT}")
     return 1
+
+
+def abort_summary(mode, status, not_run, counts):
+    """中止时的汇总行：第一张即失败 → 未做任何变更；中途失败 → 已完成的计数 + 未执行数。"""
+    if status == "abort_first":
+        return f"===== 中止 ({mode})：未做任何变更，{not_run} 张需要变更的表未执行 ====="
+    done = "，".join(f"{k} {v}" for k, v in sorted(counts.items())) or "无"
+    return f"===== 中止 ({mode})：{done}；{not_run} 张需要变更的表未执行 ====="
 
 
 def run_main(fn, argv):
@@ -276,14 +285,14 @@ def _main(argv):
         lines, ok, _ = res
         ops.log("\n".join(lines))
         failed = failed or not ok
-        counts[plans[t].action.upper()] = counts.get(plans[t].action.upper(), 0) + 1
+        key = plans[t].action.upper() if ok else "ERROR"         # 执行失败的表计入 ERROR，不计入其计划动作
+        counts[key] = counts.get(key, 0) + 1
 
     status, not_run = execute_tables(list(plans), execute, workers(args), args.apply,
                                      lambda t: plans[t].action != "noop", on_result)
     if status != "ok":
         code = log_group_abort(status, not_run, group)
-        ops.log(f"===== 中止 ({mode})：" + ("，".join(f"{k} {v}" for k, v in sorted(counts.items())) or "无变更")
-                + f"，未执行 {not_run} =====")
+        ops.log(abort_summary(mode, status, not_run, counts))
         return code
 
     # 阶段 3：挂载后验证（并行）

@@ -90,7 +90,16 @@ class AuthConfigError(Exception):
 LOGIN_HINT = "请先执行 gcloud auth login <账号> 登录一次（或用 --gcloud-account 指定已登录的账号）"
 PROJECT_HINT = "请执行 gcloud config set project <项目ID> 设置一次默认项目（或用 --quota-project 指定）"
 
-Auth = namedtuple("Auth", "creds account account_source project project_source")
+Auth = namedtuple("Auth", "creds account account_source project project_source impersonated", defaults=(None,))
+
+
+def _gcloud_impersonated_sa(account=None):
+    """
+    gcloud 的扮演设置（gcloud config set auth/impersonate_service_account，或环境变量
+    CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT）。有委托链 "a,b,c" 时实际身份是最后一个。没有设置时返回 None。
+    """
+    v = _gcloud_config_value("auth/impersonate_service_account", account)
+    return v.split(",")[-1].strip() if v else None
 
 
 def resolve_auth(gcloud_account=None, quota_project=None):
@@ -118,18 +127,28 @@ def resolve_auth(gcloud_account=None, quota_project=None):
     if not project:
         raise AuthConfigError(f"无法确定 quota 项目（未指定 --quota-project，gcloud 也没有默认项目）。{PROJECT_HINT}")
 
+    impersonated = None
     if account:
+        impersonated = _gcloud_impersonated_sa(account)    # 通过 gcloud 扮演 SA 时，所有调用实际以该 SA 身份执行
         creds = GcloudCredentials(account, quota_project_id=project)
         try:
             creds.refresh(None)                  # 立即取一次 token，尽早暴露登录问题
         except Exception as e:  # noqa: BLE001
+            if impersonated:
+                raise AuthConfigError(
+                    f"登录账号 {account} 无法扮演 {impersonated}（{str(e)[:200]}）：登录账号需要对该 SA 有 "
+                    f"Service Account Token Creator 权限，并确认该 SA 存在") from e
             raise AuthConfigError(f"无法获取账号 {account} 的访问令牌（{str(e)[:200]}）。{LOGIN_HINT}") from e
     else:
         creds = adc.with_quota_project(project) if hasattr(adc, "with_quota_project") else adc
-    return Auth(creds, account or "（application-default 凭证的账号）", account_source, project, project_source)
+    return Auth(creds, account or "（application-default 凭证的账号）", account_source, project, project_source,
+                impersonated)
 
 
 def describe_auth(auth):
+    if auth.impersonated:
+        return (f"[AUTH] 执行账号: {auth.impersonated}（gcloud 扮演；登录账号 {auth.account}）；"
+                f"quota 项目: {auth.project}（{auth.project_source}）")
     return f"[AUTH] 执行账号: {auth.account}（{auth.account_source}）；quota 项目: {auth.project}（{auth.project_source}）"
 
 

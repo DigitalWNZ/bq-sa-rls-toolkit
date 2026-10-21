@@ -416,13 +416,14 @@ _CONDITION_KEYS = {"id", "sa"}
 
 def condition_dimensions(fields):
     """
-    条件表字段 [(name, type, mode)] -> (维度列表, 警告)。
-    维度 = 除 id、sa 外的列；只有 REPEATED STRING（ARRAY<STRING>）列可用作维度，其他列给警告并忽略。
+    条件表字段 [(name, type, mode)] -> (维度列表, 警告, 提示)。
+    维度 = 除 id、sa 外的列；只有 REPEATED STRING（ARRAY<STRING>）列可用作维度。
+    列名含特殊字符 -> 警告（数据问题）；普通的非数组列（如 status）-> 提示（正常情况，不是维度，不参与过滤）。
     """
     names = {n.lower() for n, _, _ in fields}
     if "sa" not in names:
         raise ValueError("条件表缺少 sa 列")
-    dims, warns = [], []
+    dims, warns, notes = [], [], []
     for name, ftype, mode in fields:
         if name.lower() in _CONDITION_KEYS:
             continue
@@ -431,8 +432,8 @@ def condition_dimensions(fields):
         elif _TYPE_ALIASES.get(ftype, ftype) == "STRING" and (mode or "").upper() == "REPEATED":
             dims.append(name.lower())
         else:
-            warns.append(f"条件表列 {name}（{ftype} {mode}）不是 ARRAY<STRING>，不作为维度")
-    return dims, warns
+            notes.append(f"条件表列 {name}（{ftype} {mode}）不是 ARRAY<STRING>，不作为维度")
+    return dims, warns, notes
 
 
 def _validate_column_path(col):

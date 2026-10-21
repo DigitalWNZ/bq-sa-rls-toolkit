@@ -25,7 +25,7 @@
 
 | 项 | 示例 |
 |---|---|
-| 执行账号（运行脚本的人或 SA） | `rls-admin@trip.com` |
+| 跑脚本的 user / SA | `rls-admin@trip.com`（user）或 `rls-runner@trip-bq-admin.iam.gserviceaccount.com`（SA） |
 | quota 项目（运行查询 / DDL、计配额的项目） | `trip-bq-admin` |
 | 现存账号白名单 Group（只读 / 可写各一个） | `group_existingsa_read@trip.com`、`group_existingsa_write@trip.com` |
 | Copilot Group（新增 SA / user 都加入它） | `group_copilot@trip.com` |
@@ -34,93 +34,35 @@
 
 三张表的结构见 [README：客户维护的三张表](README.md#客户维护的三张表)。
 
-### 0.2 授予执行账号权限（一次）
+### 0.2 授予跑脚本的 user / SA 权限（一次）
 
-先确定执行账号（之后运行四个脚本的账号）属于哪种情况，再按对应小节操作：
-
-| 情况 | 判断标准 | 要做的 |
-|---|---|---|
-| **A** | 执行账号已是以下**每一个**项目的 Owner：业务表所在的项目、quota 项目、三张控制表所在的项目 | 0.2.1 → 0.2.2 → 0.2.4 |
-| **B** | 不满足 A（例如客户安全规范要求用专门的、最小权限的执行账号） | 0.2.1 → 0.2.3 → 0.2.4 |
-
-> [!NOTE]
-> 本节命令是**给执行账号授权**，通常由客户的管理员执行一次（所需权限见 [0.2.5](#025-执行本节命令的人需要的权限)）；执行账号自己权限足够时也可自己执行。
-
-#### 0.2.1 两种情况都要做：设置变量、在 quota 项目启用 API
-
-```bash
-# ORG：客户的 GCP 组织 ID（数字）
-# ME ：执行账号，即之后运行脚本的那个账号（人写 user:邮箱；SA 写 serviceAccount:邮箱）
-# QP ：quota 项目，脚本的查询 / DDL 作业在这里运行，配额和费用也记在这里
-ORG=123456789012; ME=user:rls-admin@trip.com; QP=trip-bq-admin
-
-# quota 项目启用 API（已启用的会自动跳过；放在最前面，后面的 bq 命令也要用到 BigQuery API）
-gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bigquery.googleapis.com \
-    cloudidentity.googleapis.com admin.googleapis.com iamcredentials.googleapis.com --project $QP
-```
-
-#### 0.2.2 情况 A：执行账号已是相关项目的 Owner
-
-项目 Owner 已包含 BigQuery Data Owner、Job User、Service Usage Consumer 以及读取项目内全部数据集的权限，**第 3 / 7 / 8 步不需要再授权**。只有第 1 步用 `--organizations` 扫描整个组织时，还需要组织级的 3 个只读角色（项目 Owner 看不到组织、文件夹和其它项目）：
-
-```bash
-# 只在第 1 步使用 --organizations 时需要；只用 --projects 扫描自己是 Owner 的项目则跳过
-for r in roles/browser roles/iam.securityReviewer roles/bigquery.metadataViewer; do
-  gcloud organizations add-iam-policy-binding $ORG --member=$ME --role=$r
-done
-```
-
-#### 0.2.3 情况 B：最小权限的执行账号
-
-```bash
-# 第 1 步（list_principals，只读）：组织上授予 3 个只读角色
-#   只用 --projects 时，把 organizations $ORG 换成 projects <项目ID>，对每个要扫描的项目授予即可
-for r in roles/browser roles/iam.securityReviewer roles/bigquery.metadataViewer; do
-  gcloud organizations add-iam-policy-binding $ORG --member=$ME --role=$r
-done
-
-# 第 3 / 7 / 8 步（管理行级规则）：在业务表所在项目（或数据集）上授予 BigQuery Data Owner
-gcloud projects add-iam-policy-binding trip-prod --member=$ME --role=roles/bigquery.dataOwner
-# 运行查询 / DDL
-gcloud projects add-iam-policy-binding $QP --member=$ME --role=roles/bigquery.jobUser
-# 允许把 QP 当作 quota 项目调用各 API（缺少时四个脚本的所有 API 调用都会报 403 USER_PROJECT_DENIED）
-gcloud projects add-iam-policy-binding $QP --member=$ME --role=roles/serviceusage.serviceUsageConsumer
-# 若执行账号还没有 condition/mapping/copilot_tb 三张表的读权限，则直接在三张表所在的数据集上开通
-bq query --project_id=$QP --use_legacy_sql=false \
-  "GRANT \`roles/bigquery.dataViewer\` ON SCHEMA \`trip-bq-admin.bq_auth\` TO \"$ME\""
-```
-
-业务表分布在多个项目时，对每个项目重复 Data Owner 那一行。
-
-#### 0.2.4 两种情况都要确认：Workspace 管理员角色（第 1 步组织范围）
-
-组织范围运行 list_principals 时，执行账号还需是 Workspace / Cloud Identity 中有「用户 → 读取」「群组 → 读取」权限的管理员（超级管理员 / 用户管理管理员已包含；否则请超级管理员在 Admin 控制台分配一次）。GCP 的组织管理员、项目 Owner 等 IAM 角色**都不能**读取账号目录。只指定项目时，若授权中出现 Group，展开其成员同样需要「群组 → 读取」（否则打印 `[WARN]`，该组成员不列出）。
-
-#### 0.2.5 执行本节命令的人需要的权限
-
-本节命令是给执行账号授权，执行者需要能修改相应资源的权限：
-
-| 命令 | 执行者需要 | 常见对应角色 |
-|---|---|---|
-| `gcloud services enable … --project $QP` | 在 QP 上启用 API | QP 的 Owner / Editor，或 Service Usage Admin |
-| `gcloud organizations add-iam-policy-binding` | 修改组织 IAM 策略 | 组织上的 Organization Administrator 或 Security Admin |
-| `gcloud projects add-iam-policy-binding` | 修改项目 IAM 策略 | 该项目 Owner 或 Project IAM Admin（组织上的上述两个角色也覆盖） |
-| `bq query … GRANT … ON SCHEMA` | 修改该数据集的权限，并在 QP 中运行查询 | 该数据集的 BigQuery Data Owner / Admin，加上 QP 上的 BigQuery Job User |
-| Workspace 管理员角色（0.2.4） | 在 Admin 控制台分配管理员角色 | Workspace 超级管理员 |
-
-实际操作中通常由客户的 GCP 组织管理员 + quota 项目 Owner 执行，Workspace 部分由超级管理员完成。
+1. 在 Google Cloud Console / APIs & Services，quota 项目上，开启以下 6 个 API：
+   `cloudresourcemanager.googleapis.com`, `iam.googleapis.com`, `bigquery.googleapis.com`, `cloudidentity.googleapis.com`, `admin.googleapis.com`, `iamcredentials.googleapis.com`
+   或使用命令行方式：
+   ```bash
+   gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bigquery.googleapis.com \
+       cloudidentity.googleapis.com admin.googleapis.com iamcredentials.googleapis.com --project <quota项目>
+   ```
+2. 在 admin.google.com 新建一个管理员角色，只勾选 **Users → Read** 和 **Groups → Read**，然后将这个角色分配给跑脚本的 user / SA。（目的：列出组织下所有的 user，并展开 Group 成员）
+3. 在 Google Cloud Console / IAM，组织层级，给跑脚本的 user / SA 授权：**Browser**、**Security Reviewer**、**BigQuery Metadata Viewer**。（目的：列出组织下所有项目和 SA，并读取各层级的 IAM 授权与 BigQuery 授权）
+4. 在 Google Cloud Console / IAM，quota 项目上，给跑脚本的 user / SA 授权：**Service Usage Consumer**。（目的：允许以 quota 项目的名义调用 API）
+5. 在 Google Cloud Console / IAM：
+   - quota 项目上，授权 **BigQuery Job User**；（目的：运行 BigQuery 查询和 DDL）
+   - 需要设 RLS 的业务表所在项目（或数据集）上，授权 **BigQuery Data Owner**；（目的：创建、修改、删除 RLS 规则）
+   - 三张控制表（condition、mapping、copilot_tb）所在的项目（或数据集）上，授权 **BigQuery Data Viewer**。（目的：读取控制表）
+6. （user 跑脚本时）在执行脚本的机器上执行一次 `gcloud auth login`；（SA 跑脚本时）由运维人员扮演该 SA（运维人员需对该 SA 有 Service Account Token Creator，并执行 `gcloud config set auth/impersonate_service_account <SA 邮箱>`），或在挂载了该 SA 的 GCE 虚拟机 / Cloud Run 上运行。
 
 ### 0.3 本地环境（一次）
 
 ```bash
 git clone https://github.com/DigitalWNZ/bq-sa-rls-toolkit.git && cd bq-sa-rls-toolkit
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-gcloud auth login rls-admin@trip.com
+gcloud auth login rls-admin@trip.com              # user 跑脚本时；SA 跑脚本时见 0.2 第 6 条
 gcloud config set project trip-bq-admin           # 之后所有脚本都不用写 --gcloud-account / --quota-project
 ```
 
 > [!TIP]
-> 每次运行开头都会打印 `[LOG] 日志文件: logs/<脚本名>_<时间戳>.log`（屏幕输出会原样另存到这个文件，便于留档和事后排查）和 `[AUTH] 执行账号: …；quota 项目: …`，先确认这两行再继续。日志默认保存在当前目录的 `logs/`，可用 `--log-dir` 改到别处（需对该目录有写权限）。
+> 每次运行开头都会打印 `[LOG] 日志文件: logs/<脚本名>_<时间戳>.log`（屏幕输出会原样另存到这个文件，便于留档和事后排查）和 `[AUTH] 执行账号: …；quota 项目: …`（SA 跑脚本、通过 gcloud 扮演登录时显示为 `执行账号: <SA>（gcloud 扮演；登录账号 <登录人>）`），先确认这两行再继续。日志默认保存在当前目录的 `logs/`，可用 `--log-dir` 改到别处（需对该目录有写权限）。
 
 ---
 
@@ -145,10 +87,11 @@ python list_principals.py --organizations 123456789012 --exclude-patterns 'copil
 
 ```bash
 gcloud identity groups memberships add --group-email=group_existingsa_read@trip.com \
-    --member-email=etl-reader@trip-prod.iam.gserviceaccount.com
+    --member-email=etl-reader@trip-prod.iam.gserviceaccount.com --billing-project=<quota项目>
 ```
 
-成员变更在 BigQuery 生效通常需要几分钟。
+- `--billing-project`：用 quota 项目（0.2 第 1 条已启用 Cloud Identity API）调用该 API；不加时 gcloud 会用执行命令者的默认项目，若该项目没启用 Cloud Identity API 会报 `SERVICE_DISABLED`。
+- 成员变更在 BigQuery 生效通常需要几分钟。
 
 ## 第 3 步：为白名单 Group 设置 FILTER TRUE 规则
 
@@ -167,7 +110,9 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --datasets tri
 - `[NOTE] 将为以下这些表首次设置RLS规则`：这些表上还没有任何规则，建第一条后**未被授权的账号会查到 0 行**——确认现存账号都已在两个白名单 Group 里；
 - `[WARN]`：登记表同一表名多行且 `rls_enabled` 不一致（这张表跳过，退出码 1）。
 
-**3.3 执行**，ReadOnly、Writable 各一次（建议用 `--verify-sa` 指定组内一个有读表权限的 SA 做挂载后验证）：
+**3.3 执行**，ReadOnly、Writable 各一次。建议用 `--verify-sa` 指定组内一个有读表权限的 SA，执行后扮演它查表做挂载后验证（可选）。
+
+- **前提**：在要扮演的 SA 上（Google Cloud Console / IAM & Admin → Service Accounts → 该 SA → Permissions），给跑脚本的 user / SA 授权：**Service Account Token Creator**。否则规则照常建好，但会报 `[VERIFY-FAIL] … 无法扮演`、退出码 1。
 
 ```bash
 python apply_bypass_rls.py --group group_existingsa_read@trip.com  --datasets trip-prod.dw --registry-table $REG --apply \
@@ -175,7 +120,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com  --datasets tr
 python apply_bypass_rls.py --group group_existingsa_write@trip.com --datasets trip-prod.dw --registry-table $REG --apply
 ```
 
-- `--verify-sa` 需要执行账号对该 SA 有 `roles/iam.serviceAccountTokenCreator`；`[VERIFY-OK]` = 通过；`[VERIFY-FAIL]` = 300 秒内查不到数据或无法扮演（退出码 1）。
+- `[VERIFY-OK]` = 通过；`[VERIFY-FAIL]` = 300 秒内查不到数据或无法扮演（退出码 1）。
 - 重跑安全：已正确的表全部 `[NOOP]`。
 
 ## 第 4–6 步：新增账号、Copilot Group、条件表（客户）
@@ -185,8 +130,8 @@ python apply_bypass_rls.py --group group_existingsa_write@trip.com --datasets tr
 3. **给 Copilot Group 授予条件表读权限**（必需：规则里的子查询以查询者身份读条件表，否则查询业务表报 Access Denied）：
 
    ```bash
-   bq add-iam-policy-binding --member=group:group_copilot@trip.com --role=roles/bigquery.dataViewer \
-       trip-bq-admin:bq_auth.adm_user_mem_copilot_condition
+   bq query --project_id=<quota项目> --use_legacy_sql=false \
+     "GRANT \`roles/bigquery.dataViewer\` ON TABLE \`trip-bq-admin.bq_auth.adm_user_mem_copilot_condition\` TO \"group:group_copilot@trip.com\""
    ```
 
    注意：组内成员因此能读到整张条件表。
@@ -215,14 +160,17 @@ python apply_copilot_rls.py --group group_copilot@trip.com $AUTH --apply    # �
 
 ## 验收
 
-以具体账号身份查询业务表，确认各自看到的数据：
+以具体账号身份查询业务表，确认各自看到的数据。**前提**：在要扮演的 SA 上（Google Cloud Console / IAM & Admin → Service Accounts → 该 SA → Permissions），给跑脚本的 user / SA 授权：**Service Account Token Creator**。
 
 ```bash
-# 以 SA 身份查询（执行账号需对该 SA 有 roles/iam.serviceAccountTokenCreator）
+# 以 SA 身份查询
 CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=copilot-a@trip-ai.iam.gserviceaccount.com \
   bq --project_id=trip-bq-admin query --use_legacy_sql=false \
   'SELECT SESSION_USER() AS me, region, COUNT(*) AS n FROM `trip-prod.dw.orders` GROUP BY 1, 2'
 ```
+
+> [!NOTE]
+> 跑脚本的是 SA、且通过 gcloud 扮演登录（0.2 第 6 条）时，上面的环境变量会**替换**掉对该 SA 的扮演，变成登录人直接扮演目标 SA。此时要写成委托链 `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=<跑脚本的 SA>,<目标 SA>`，前提改为在目标 SA 上给跑脚本的 SA 授 Service Account Token Creator。
 
 | 账号 | 预期 |
 |---|---|
@@ -269,7 +217,7 @@ python rollback_rls.py --tables tables.csv --policy-names rls_copilot_group_copi
 # D. 删除目标表上的全部规则（表恢复为没有 RLS：所有有读表权限的账号都看到全部数据）
 python rollback_rls.py --datasets trip-prod.dw --apply
 
-# 删除后验证某 SA 的可见行数（只报告）
+# 删除后验证某 SA 的可见行数（只报告；前提同 3.3 的 --verify-sa）
 python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.com --apply \
     --verify-sa copilot-a@trip-ai.iam.gserviceaccount.com
 ```
@@ -288,7 +236,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 |---|---|
 | 退出码 2，`[ERROR] … gcloud auth login` | 没有登录或登录过期：`gcloud auth login <账号>` |
 | 退出码 2，`[ERROR] … gcloud config set project` | 没有默认项目：`gcloud config set project <项目ID>`，或加 `--quota-project` |
-| 报 403 `USER_PROJECT_DENIED` / `serviceusage.services.use` | 执行账号在 quota 项目上缺少 `roles/serviceusage.serviceUsageConsumer`（见 0.2） |
+| 报 403 `USER_PROJECT_DENIED` / `serviceusage.services.use` | 跑脚本的 user / SA 在 quota 项目上缺少 Service Usage Consumer（见 0.2 第 4 条） |
 | 退出码 2，参数错误 | 旧参数（如 `--tables-file`）已删除；表名必须 `project.dataset.table`（不接受冒号写法）；`.csv` 文件不存在 |
 | 某表 `[SKIP] … 不在登记表` | 登记表 `table_name` 与参数中的表名不完全一致（大小写、空格、少了项目名都算不一致） |
 | `[ERROR] BigQuery 报 Group … 不存在，已停止` | `--group` 拼错，或 Group 刚创建 / 刚改过成员、还没同步到 BigQuery：核对拼写，或等几分钟后重跑。第一张表就失败时退出码 2、未做任何变更 |
@@ -296,10 +244,10 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | Copilot 账号查到 0 行 | 依次检查：在 Copilot Group 里吗？条件表有该账号的行吗（小写裸邮箱）？维度值与业务列的值一致吗？Group 刚变更需等几分钟 |
 | Copilot 账号查询报 Access Denied | Copilot Group 没有条件表读权限（见第 4–6 步第 3 点） |
 | 现存账号突然查到 0 行 | 该表上有规则但没有它所在 Group 的 bypass 规则：用第 3 步补上（重跑只会 CREATE 缺的表） |
-| `[VERIFY-FAIL] … 无法扮演` | 执行账号对 `--verify-sa` 没有 Token Creator 权限，或该 SA 不存在 |
+| `[VERIFY-FAIL] … 无法扮演` | 跑脚本的 user / SA 对 `--verify-sa` 指定的 SA 没有 Service Account Token Creator（见 3.3 前提），或该 SA 不存在 |
 | 视图上 `[ERROR]` | BigQuery 视图不支持 RLS；从 `--tables` / 映射表 / 登记表中去掉视图 |
 | 大量 `[retry]` | BigQuery 速率限制；脚本会自动退避重试。持续出现时降低 `--parallel`（建议不超过 32） |
-| 组织范围 `[ERROR] 账号目录` | 执行账号不是有「用户 → 读取」权限的 Workspace 管理员；其余结果已写入 CSV |
+| 组织范围 `[ERROR] 账号目录` | 跑脚本的 user / SA 没有 Admin 控制台的 Users → Read 角色（见 0.2 第 2 条）；其余结果已写入 CSV |
 | `[WARN] 无法创建日志文件` | 当前目录（或 `--log-dir`）不可写：换到有写权限的目录运行，或用 `--log-dir` 指定；脚本本身照常执行，只是这次没有日志文件 |
 | 事后想查某次运行跳过了哪些表 | 打开 `logs/` 中对应时间的日志文件，搜索 `[SKIP]`（审核 CSV 只记录要变更的表） |
 
@@ -311,7 +259,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 |---|---|
 | 0 | 成功 |
 | 1 | 部分失败或数据有问题（其余照常处理） |
-| 2 | 参数错误 / 登记表不可用 / 无法确定执行账号或 quota 项目（**未做任何变更**） |
+| 2 | 参数错误 / 登记表不可用 / 无法确定跑脚本的账号或 quota 项目 / 执行时第一张表即报 Group 不存在（**未做任何变更**） |
 | 130 | 被 Ctrl-C 中断（重跑即可） |
 
 | 日志 | 含义 |
@@ -320,7 +268,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | `[CREATE]` / `[REPLACE]` / `[NOOP]` | 新建 / 覆盖（打印旧内容）/ 已正确无需改动 |
 | `[DROP]` | rollback 将删除的规则 |
 | `[SKIP]` | 跳过（附原因） |
-| `[NOTE]` | 提示，不影响退出码（首次设置 RLS、将被全部删除的表、条件表为空） |
-| `[WARN]` | 数据问题，退出码 1（登记表冲突、条件表 sa 不规范 / 重复） |
+| `[NOTE]` | 提示，不影响退出码（首次设置 RLS、将被全部删除的表、条件表为空、条件表中的非数组列不作为维度） |
+| `[WARN]` | 数据问题，多数情况退出码 1（登记表冲突、条件表 sa 不规范 / 重复）；读不到自定义角色定义、条件表列名含特殊字符这两种不影响退出码 |
 | `[ERROR]` | 失败 |
 | `[VERIFY-OK]` / `[VERIFY-FAIL]` | 挂载后验证结果 |

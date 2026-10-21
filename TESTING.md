@@ -1,10 +1,10 @@
 # 测试
 
-> 最新一次完整测试：2026-10-20。**五类测试全部 100% 通过。**
+> 最新一次完整测试：2026-10-21。**五类测试全部 100% 通过。**
 
 | 类别 | 位置 | 数量 | 结果 | 环境 |
 |---|---|---|---|---|
-| 1 单体测试 | `tests/unit/` | 666 | ✅ 666 / 666 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
+| 1 单体测试 | `tests/unit/` | 671 | ✅ 671 / 671 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
 | 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 35 | ✅ 35 / 35（约 14 分钟） | 真实 GCP（Argolis 测试组织） |
 | 3 功能测试 | `tests/functional/test_requirements.py` | 22 | ✅ 22 / 22 | 本地；每条需求另有对应的系统测试用例 |
 | 4 性能测试 | `tests/perf/run_perf.py`、`simulate.py` | 1000 表 × 500 新增 × 100 存量 | ✅ 全部步骤成功，0 重试、0 错误 | 真实 GCP + 本地模拟 |
@@ -40,13 +40,13 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 
 ---
 
-## 1. 单体测试（666）
+## 1. 单体测试（671）
 
 用 `tests/unit/fakes.py` 中的 FakeWorld 模拟 GCP（表、规则、授权对象、登记表 / 条件表 / 映射表、IAM、账号目录、Group），直接调用四个脚本的 `main()`，断言退出码、日志、生成的 DDL 与最终规则状态。
 
 | 文件 | 数量 | 内容 |
 |---|---|---|
-| `test_rls_core.py` | 103 | 纯逻辑：表名 / 主体解析、规则命名、DDL 生成与注入防护、过滤条件规范化、计划（CREATE / NOOP / REPLACE）、登记表判定、CSV |
+| `test_rls_core.py` | 104 | 纯逻辑：表名 / 主体解析、规则命名、DDL 生成与注入防护、过滤条件规范化、计划（CREATE / NOOP / REPLACE）、登记表判定、CSV |
 | `test_params_simplified.py` | 82 | 参数：值 / `.csv` / 混用 / 去重 / BOM / CRLF / 多列报错 / 文件不存在；重复参数累加；表名格式（反引号可选、拒绝冒号写法与非三段）；被删除的旧参数 → 退出码 2；`--parallel` 默认 16 |
 | `test_abnormal_cases.py` | 129 | 异常系：参数误用、注入（表名、Group 邮箱、映射表、条件表列名与 sa 值、CSV 公式）、脏数据、部分失败隔离、并发一致性 |
 | `test_bypass_registry.py` | 59 | apply_bypass 登记表双重保证：范围 ∩ `rls_enabled = 1`、精确比较、冲突、登记表不可用 |
@@ -58,7 +58,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | `test_auth_defaults.py` | 18 | 执行账号 / quota 项目自动确定；确定不了 → 退出码 2 + 提示 |
 | `test_review_fixes.py` | 26 | 独立审查报告的修复项：BigQuery 报 Group 不存在时不重试、第一张表即停止（退出码 2、其余零 DDL）、执行中途出现则停止未开始的表；apply_bypass `--group` 格式检查；映射表列名不区分大小写；rollback 中途失败仍输出已删规则内容；Cloud Identity 403 无权限 / API 未启用 / 429 重试 / 5xx 用尽 / 空组 / 嵌套组读不到（HttpMockSequence） |
 | `test_log_file.py` | 17 | 运行日志文件：四个脚本默认写 `logs/<脚本名>_<时间戳>.log`、内容与屏幕逐字相同、`--log-dir`、目录不可写只 `[WARN]`、同一秒不覆盖、argparse 错误 / `--help` 不写、Ctrl-C 与参数错误也记录、32 线程并发不交错、写盘失败不影响脚本 |
-| `test_gcp_auth.py` | 15 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新 |
+| `test_gcp_auth.py` | 19 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新；通过 gcloud 扮演 SA 时 `[AUTH]` 显示实际执行的 SA 与登录账号、扮演失败的提示 |
 | `test_gcp_ops.py` | 10 | 重试分类、限速、挂载后验证（扮演失败立即失败） |
 
 ## 2. 系统测试（35，真实 GCP）

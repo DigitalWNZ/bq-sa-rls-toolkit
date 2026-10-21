@@ -328,19 +328,20 @@ python rollback_rls.py --tables tables.csv --apply                              
 
 ## 权限要求汇总
 
-| 脚本 | 执行账号需要 |
-|---|---|
-| list_principals.py | 组织上 3 个只读角色：`roles/browser`、`roles/iam.securityReviewer`、`roles/bigquery.metadataViewer`（只指定项目时授予在项目上即可）；组织范围还需 Workspace / Cloud Identity 中有「用户 → 读取」「群组 → 读取」权限的管理员角色（超级管理员 / 用户管理管理员已包含） |
-| apply_bypass_rls.py / apply_copilot_rls.py / rollback_rls.py | 目标表上：`bigquery.rowAccessPolicies.create / update / delete / list / getIamPolicy / setIamPolicy` 与 `bigquery.tables.getData`（**`roles/bigquery.dataOwner` 或 `roles/bigquery.admin`** 包含，可授予在项目 / 数据集 / 表上）；条件表（Copilot 规则的子查询引用它）、映射表、登记表的读权限；quota 项目上 `roles/bigquery.jobUser`（`bigquery.jobs.create`） |
-| `--verify-sa` | 对该 SA 的 `roles/iam.serviceAccountTokenCreator`；该 SA 有目标表的读权限 |
-| 四个脚本共同 | quota 项目上 `roles/serviceusage.serviceUsageConsumer`（`serviceusage.services.use`）：脚本以 quota 项目计配额调用各 API，缺少时所有调用报 403 `USER_PROJECT_DENIED`（项目 Owner / Editor 已包含） |
+与 [RUNBOOK 0.2](RUNBOOK.md#02-授予跑脚本的-user--sa-权限一次) 一致：跑脚本的 user / SA 被授予下面这些权限后，便可运行四个脚本（已在测试环境用新建、无任何权限的 user 和 SA 各实测一遍）。
 
-**quota 项目**需启用 API：`cloudresourcemanager`、`iam`、`bigquery`、`cloudidentity`、`admin`（Admin SDK）、`iamcredentials`（`--verify-sa` 用）：
+| # | 在哪里 | 授予跑脚本的 user / SA | 用于 |
+|---|---|---|---|
+| 1 | quota 项目（APIs & Services） | 启用 API：`cloudresourcemanager`、`iam`、`bigquery`、`cloudidentity`、`admin`、`iamcredentials` | 全部脚本 |
+| 2 | admin.google.com（Workspace / Cloud Identity） | 自定义管理员角色，只勾 **Users → Read**、**Groups → Read** | 第 1 步：列出账号目录中的 user、展开 Group 成员 |
+| 3 | 组织层级 IAM | **Browser**、**Security Reviewer**、**BigQuery Metadata Viewer** | 第 1 步：遍历项目、列出 SA、读取各层级 IAM 与 BigQuery 授权 |
+| 4 | quota 项目 IAM | **Service Usage Consumer** | 全部脚本：以 quota 项目的名义调用 API（缺少时所有调用报 403 `USER_PROJECT_DENIED`） |
+| 5 | quota 项目 IAM | **BigQuery Job User** | 第 3、7、8 步：运行查询与 DDL |
+| 5 | 业务表所在项目（或数据集） | **BigQuery Data Owner** | 第 3、7、8 步：创建、修改、删除行级规则 |
+| 5 | 三张控制表所在项目（或数据集） | **BigQuery Data Viewer** | 第 3、7 步：读取登记表、条件表、映射表 |
+| 6 | 登录方式 | user：`gcloud auth login`；SA：由运维人员扮演（需对该 SA 有 Service Account Token Creator，`gcloud config set auth/impersonate_service_account <SA>`），或在挂载该 SA 的 GCE 虚拟机 / Cloud Run 上运行 | 全部脚本 |
 
-```bash
-gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com bigquery.googleapis.com \
-    cloudidentity.googleapis.com admin.googleapis.com iamcredentials.googleapis.com --project <quota项目>
-```
+可选：使用 `--verify-sa` 或按 RUNBOOK「验收」以某个 SA 身份查表时，需在该 SA 上给跑脚本的 user / SA 授予 **Service Account Token Creator**。
 
 ## 安全须知（信任边界）
 

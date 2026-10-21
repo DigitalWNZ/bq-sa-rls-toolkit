@@ -114,7 +114,7 @@ class _FakeAdc:
         return c
 
 
-def _env(monkeypatch, active_account=None, default_project=None, adc=None, token_ok=True):
+def _env(monkeypatch, active_account=None, default_project=None, adc=None, token_ok=True, impersonate=None):
     """模拟 gcloud config get-value account/project、config-helper（取 token）与 google.auth.default。"""
     calls = []
 
@@ -124,6 +124,8 @@ def _env(monkeypatch, active_account=None, default_project=None, adc=None, token
             return (active_account or "") + "\n"
         if cmd[1:4] == ["config", "get-value", "project"]:
             return (default_project or "") + "\n"
+        if cmd[1:4] == ["config", "get-value", "auth/impersonate_service_account"]:
+            return (impersonate or "(unset)") + "\n"
         if cmd[1:3] == ["config", "config-helper"]:
             if not token_ok:
                 raise subprocess.CalledProcessError(1, cmd)
@@ -197,3 +199,35 @@ def test_resolve_explicit_project_wins_over_everything(monkeypatch):
     _env(monkeypatch, active_account=None, default_project="dflt", adc=_FakeAdc("adcq"))
     a = gcp_auth.resolve_auth(None, "qp")
     assert a.project == "qp" and a.creds.with_quota == "qp"
+
+
+# ---- 通过 gcloud 扮演 SA（auth/impersonate_service_account）时，[AUTH] 显示实际执行的 SA ----
+def test_no_impersonation_auth_line_unchanged(monkeypatch):
+    _env(monkeypatch, active_account="ops@x.com", default_project="dflt")
+    a = gcp_auth.resolve_auth(None, None)
+    assert a.impersonated is None
+    assert gcp_auth.describe_auth(a) == "[AUTH] 执行账号: ops@x.com（gcloud 当前活动账号）；quota 项目: dflt（gcloud 默认项目）"
+
+
+def test_impersonation_shows_sa_and_login_account(monkeypatch):
+    sa = "runner@qp.iam.gserviceaccount.com"
+    _env(monkeypatch, active_account="ops@x.com", default_project="qp", impersonate=sa)
+    a = gcp_auth.resolve_auth(None, None)
+    assert a.impersonated == sa and a.account == "ops@x.com"
+    assert gcp_auth.describe_auth(a) == (f"[AUTH] 执行账号: {sa}（gcloud 扮演；登录账号 ops@x.com）；"
+                                         "quota 项目: qp（gcloud 默认项目）")
+
+
+def test_impersonation_delegation_chain_uses_last(monkeypatch):
+    _env(monkeypatch, active_account="ops@x.com", default_project="qp",
+         impersonate="mid@qp.iam.gserviceaccount.com,final@qp.iam.gserviceaccount.com")
+    assert gcp_auth.resolve_auth(None, None).impersonated == "final@qp.iam.gserviceaccount.com"
+
+
+def test_impersonation_token_failure_explains_token_creator(monkeypatch):
+    sa = "runner@qp.iam.gserviceaccount.com"
+    _env(monkeypatch, active_account="ops@x.com", default_project="qp", impersonate=sa, token_ok=False)
+    with pytest.raises(gcp_auth.AuthConfigError) as e:
+        gcp_auth.resolve_auth(None, None)
+    msg = str(e.value)
+    assert "登录账号 ops@x.com 无法扮演" in msg and sa in msg and "Service Account Token Creator" in msg

@@ -323,20 +323,26 @@ class TestConditionDimensions:
         fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
                   ("region", "STRING", "REPEATED"), ("prdtype", "STRING", "REPEATED"),
                   ("refername", "STRING", "REPEATED")]
-        dims, warns = core.condition_dimensions(fields)
-        assert dims == ["region", "prdtype", "refername"] and warns == []
+        dims, warns, notes = core.condition_dimensions(fields)
+        assert dims == ["region", "prdtype", "refername"] and warns == [] and notes == []
 
     def test_new_dimension_picked_up_automatically(self):
         fields = [("id", "STRING", "NULLABLE"), ("SA", "STRING", "NULLABLE"),
                   ("region", "STRING", "REPEATED"), ("channel", "STRING", "REPEATED")]
-        dims, _ = core.condition_dimensions(fields)
+        dims, _, _ = core.condition_dimensions(fields)
         assert dims == ["region", "channel"]
 
-    def test_non_repeated_string_column_excluded_with_warning(self):
+    def test_non_array_column_excluded_with_note_not_warning(self):
+        # 普通的非数组列（如 status、updated_at）是正常情况：提示（[NOTE]），不是警告
         fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
-                  ("region", "STRING", "REPEATED"), ("updated_at", "TIMESTAMP", "NULLABLE")]
-        dims, warns = core.condition_dimensions(fields)
-        assert dims == ["region"] and len(warns) == 1 and "updated_at" in warns[0]
+                  ("region", "STRING", "REPEATED"), ("updated_at", "TIMESTAMP", "NULLABLE"), ("status", "INTEGER", "NULLABLE")]
+        dims, warns, notes = core.condition_dimensions(fields)
+        assert dims == ["region"] and warns == [] and len(notes) == 2 and "updated_at" in notes[0] and "status" in notes[1]
+
+    def test_special_char_column_is_still_warning(self):
+        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"), ("odd col", "STRING", "REPEATED")]
+        dims, warns, notes = core.condition_dimensions(fields)
+        assert dims == [] and len(warns) == 1 and "含有特殊字符" in warns[0] and notes == []
 
     def test_requires_sa_column(self):
         with pytest.raises(ValueError, match="sa"):

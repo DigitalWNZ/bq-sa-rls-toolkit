@@ -112,7 +112,8 @@ class TestGroupMissing:
         err = capsys.readouterr().err
         assert code == 2
         assert len(world.ddl_log) == 1 and all(world.policies(t) == [] for t in (T1, T2, T3))   # 只尝试了第一张
-        assert f"[ERROR] BigQuery 报 Group {G_R} 不存在，已停止：其余 2 张表未执行，未做任何变更" in err
+        assert f"[ERROR] BigQuery 报 Group {G_R} 不存在，已停止：其余 2 张需要变更的表未执行，未做任何变更" in err
+        assert "===== 中止 (APPLY)：未做任何变更，2 张需要变更的表未执行 =====" in err and "CREATE 1" not in err
         assert "请稍后重跑" in err and "Traceback" not in err and "[retry]" not in err
 
     def test_copilot_first_table_missing_group_stops_everything(self, world, tmp_path, capsys):
@@ -120,7 +121,8 @@ class TestGroupMissing:
         code = copilot(tmp_path, "--apply")
         err = capsys.readouterr().err
         assert code == 2 and len(world.ddl_log) == 1
-        assert f"[ERROR] BigQuery 报 Group {G_COP} 不存在，已停止：其余 2 张表未执行" in err
+        assert f"[ERROR] BigQuery 报 Group {G_COP} 不存在，已停止：其余 2 张需要变更的表未执行" in err
+        assert "===== 中止 (APPLY)：未做任何变更，2 张需要变更的表未执行 =====" in err
         rows = [r for r in (tmp_path / "c.csv").read_text(encoding="utf-8-sig").splitlines()[1:]]
         assert len(rows) == 3 and sum("NOT RUN" in r for r in rows) == 2      # 审核 CSV 标明未执行的表
 
@@ -128,7 +130,9 @@ class TestGroupMissing:
         world.policies(T1).append({"id": BYP, "filter": "TRUE", "grantees": [f"group:{G_R}"]})   # T1 已正确 → NOOP
         world.missing_groups.add(G_R)
         code = bypass("--apply")
+        err = capsys.readouterr().err
         assert code == 2 and len(world.ddl_log) == 1 and T2 in world.ddl_log[0]
+        assert "其余 1 张需要变更的表未执行" in err                         # 已正确的 T1（NOOP）不计入
 
     def test_missing_group_mid_run_stops_remaining(self, world, capsys, monkeypatch):
         # 第一张成功，之后 Group 被删除：后续出现 Group 不存在 → 尚未开始的表不再执行，退出码 1
@@ -142,7 +146,8 @@ class TestGroupMissing:
         code = bypass("--apply", "--parallel", "1")
         err = capsys.readouterr().err
         assert code == 1 and world.policies(T1) and not world.policies(T3)
-        assert "执行中 BigQuery 报 Group" in err and "1 张表未执行" in err
+        assert "执行中 BigQuery 报 Group" in err and "1 张需要变更的表未执行" in err
+        assert "===== 中止 (APPLY)：CREATE 1，ERROR 1；1 张需要变更的表未执行 =====" in err   # 失败的表计入 ERROR
 
     def test_dry_run_unchanged(self, world, tmp_path, capsys):
         world.missing_groups.add(G_R)
@@ -152,7 +157,9 @@ class TestGroupMissing:
     def test_other_error_on_first_table_does_not_stop(self, world, capsys):
         world.fail_ddl_on.add(T1)                                          # 与 Group 无关的错误：其余表照常
         code = bypass("--apply")
+        err = capsys.readouterr().err
         assert code == 1 and world.policies(T2) and world.policies(T3)
+        assert "===== 完成 (APPLY)：CREATE 2，ERROR 1 =====" in err          # 失败的表计入 ERROR，不计入 CREATE
 
 
 # =========================================================================== #

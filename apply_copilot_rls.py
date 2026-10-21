@@ -65,7 +65,7 @@ from google.api_core.exceptions import NotFound
 
 import gcp_ops as ops
 import rls_core as core
-from apply_bypass_rls import (execute_tables, filter_by_registry, load_registry, log_first_policy_tables,
+from apply_bypass_rls import (abort_summary, execute_tables, filter_by_registry, load_registry, log_first_policy_tables,
                               log_group_abort, run_main)
 from gcp_auth import AuthConfigError, describe_auth, resolve_auth
 
@@ -163,12 +163,14 @@ def _main(argv):
 
     # 1. 维度
     try:
-        dims, warns = core.condition_dimensions(ops.table_fields(ctx, cond))
+        dims, warns, notes = core.condition_dimensions(ops.table_fields(ctx, cond))
     except Exception as e:  # noqa: BLE001
         ops.log(f"[ERROR] 读取条件表结构失败: {e}")
         return 1
     for w in warns:
         ops.log(f"[WARN] {w}")
+    for n in notes:
+        ops.log(f"[NOTE] {n}")
     ops.log(f"[DIM] 维度: {', '.join(dims) or '（无）'}")
     if not dims:
         ops.log("[ERROR] 条件表中没有可用作维度的 ARRAY<STRING> 列（除 id、sa 外），无法生成规则")
@@ -293,7 +295,13 @@ def _main(argv):
     write_plan_csv(args.output, entries, args.apply)
     ops.log(f"[CSV] 审核文件已写入 {args.output}（每张表一行，只含 CREATE / REPLACE）")
     if abort_code is not None:
-        ops.log(f"===== 中止 ({mode})：未执行 {not_run} 张表 =====")
+        done = {}
+        for e in entries:                                       # 只统计实际执行了的表
+            r = e.get("result", "")
+            key = e["action"] if r == "OK" else ("ERROR" if r.startswith("ERROR") else None)
+            if key:
+                done[key] = done.get(key, 0) + 1
+        ops.log(abort_summary(mode, status, not_run, done))
         return abort_code
     ops.log(f"===== 完成 ({mode})：" + ("，".join(f"{k} {v}" for k, v in sorted(counts_by_action.items())) or "无")
             + " =====")
