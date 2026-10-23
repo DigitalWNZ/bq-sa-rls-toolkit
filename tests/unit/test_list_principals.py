@@ -1,11 +1,11 @@
 """
-list_principals.py 新方案（2026-10-18）：列出指定项目 / 组织下的所有 SA 和 user，不能遗漏，全部使用权威 API。
-  来源 1  SA 清单：范围内每个 ACTIVE 项目 IAM serviceAccounts.list（含无授权 / 已禁用）；组织范围先递归列出文件夹 / 项目
-  来源 2  账号目录：只在组织范围，用执行账号自己的凭证调用 Admin SDK Directory 列出该组织全部 user（含暂停 / 归档）；
-          执行账号需为有「用户 → 读取」权限的 Workspace / Cloud Identity 管理员；读不到 [ERROR]、其余照写、退出码 1
-  来源 3  BQ 相关授权：组织 / 文件夹 / 项目 getIamPolicy（只指定项目时不读上层）、数据集 ACL、每张表 getIamPolicy；
-          只纳入含 bigquery.tables.getData 的角色（自定义角色读权限列表；读不到角色定义时宁可多列并 [WARN]）；Group 递归展开
-  不再调用 Cloud Asset；输出 3 列 email, principal_type, home_project。
+list_principals.py（2026-10-22 重大调整）：列出指定组织 / 项目下的全部主体，不看角色、不判断能否读表。
+  来源 1  SA 清单：范围内每个 ACTIVE 项目的全部 SA；待删除项目也尝试列出（失败只 [NOTE]）
+  来源 2  账号目录（只组织范围）：全部 user + 全部 Group（Group 只列组名、不展开）
+  来源 3  授权记录：组织 / 文件夹 / 项目 IAM（--projects 时含上级）、数据集 ACL、表 IAM 中的全部授权对象
+          （含 domain / public / federated / deleted）
+  来源 4  授权记录中出现的 Group 展开一层：直接成员中的 user / SA 列出，嵌套组只列组名
+  输出 3 列 email, principal_type, source（source = 在哪里、以什么角色被找到）。
 """
 
 import csv
@@ -48,6 +48,7 @@ def world(monkeypatch):
     w.project_sas[P_DEL] = ["ghost@old-proj.iam.gserviceaccount.com"]
     w.project_sas[P_OUT] = ["outsider@outside.iam.gserviceaccount.com"]
     # 来源 2：账号目录（含没有任何授权的 user、暂停 / 归档的 user、第二域名）
+    w.directory_groups[CUST] = ["bi-team@trip.com", "acl-g@trip.com", "unused@trip.com"]   # 账号目录里的全部 Group
     w.directory[CUST] = ["alice@trip.com", "dave@trip.com", "suspended@trip.com", "archived@trip.com", "eve@ctrip.com"]
     # 来源 3：授权
     w.iam_policies[f"organizations/{ORG}"] = [b("roles/bigquery.dataViewer", "user:orgreader@partner.com"),
@@ -56,15 +57,13 @@ def world(monkeypatch):
     w.iam_policies[f"projects/{P1}"] = [
         b("roles/bigquery.dataViewer", "serviceAccount:ext@partner-proj.iam.gserviceaccount.com",
           "group:bi-team@trip.com", "deleted:user:gone@trip.com?uid=1", "domain:trip.com", "allUsers"),
-        b("roles/bigquery.jobUser", "user:jobonly@partner.com"),                         # 不能读数据
-        b("projects/prod/roles/customReader", "user:custom@partner.com"),               # 自定义角色含 getData
-        b("organizations/111/roles/customMeta", "user:custommeta@partner.com"),         # 自定义角色不含 getData
+        b("roles/bigquery.jobUser", "user:jobonly@partner.com"),                         # 读不到数据，也列出
+        b("projects/prod/roles/customReader", "user:custom@partner.com"),
+        b("organizations/111/roles/customMeta", "user:custommeta@partner.com"),
         b("roles/owner", "user:Owner@Vendor.com"),
     ]
     w.iam_policies[f"projects/{P2}"] = []
     w.iam_policies[f"projects/{P3}"] = []
-    w.role_perms["projects/prod/roles/customReader"] = {"bigquery.tables.getData", "bigquery.tables.get"}
-    w.role_perms["organizations/111/roles/customMeta"] = {"bigquery.tables.get"}
     # 数据集 ACL（旧式角色 / 预定义角色 / iamMember / 特殊条目）
     w.add_table("prod.dw.orders", rls_enabled=None)
     w.add_table("prod.dw.orders_view", rls_enabled=None)
@@ -82,9 +81,9 @@ def world(monkeypatch):
     w.table_iam["prod.dw.orders_view"] = [b("roles/bigquery.dataViewer", "serviceAccount:view-sa@p8.iam.gserviceaccount.com")]
     # Group
     w.groups["bi-team@trip.com"] = [("ana@trip.com", "USER"), ("nested@trip.com", "GROUP")]
-    w.groups["nested@trip.com"] = [("svc-in-group@p7.iam.gserviceaccount.com", "SERVICE_ACCOUNT")]
+    w.groups["nested@trip.com"] = [("svc-in-group@p7.iam.gserviceaccount.com", "SERVICE_ACCOUNT")]   # 嵌套组：不展开
     w.groups["acl-g@trip.com"] = [("carol@vendor.com", "USER"), ("ext-g@other.com", "GROUP")]
-    w.groups["ext-g@other.com"] = []                  # 空组（读得到、没有成员）；读不到的组见 test_lp_a_08
+    w.groups["ext-g@other.com"] = []                  # 嵌套组：不展开
     install(monkeypatch, w, list_principals)
     return w
 
@@ -97,18 +96,25 @@ def run(tmp_path, *args, name="principals.csv"):
 
 
 ORG_EXPECTED = {
-    # 来源 1：所有 ACTIVE 项目的 SA（含无授权 / 已禁用；多层文件夹）
-    "etl@prod.iam.gserviceaccount.com", "idle@prod.iam.gserviceaccount.com", "disabled-sa@prod.iam.gserviceaccount.com",
-    "dev-sa@dev.iam.gserviceaccount.com", "deep-sa@deep.iam.gserviceaccount.com",
-    # 来源 2：账号目录全部 user（含无授权 / 暂停 / 归档 / 第二域名）
-    "alice@trip.com", "dave@trip.com", "suspended@trip.com", "archived@trip.com", "eve@ctrip.com",
-    # 来源 3：BQ 相关授权（含 getData 的角色）
-    "orgreader@partner.com",                                   # 组织层
-    "folder-sa@other.iam.gserviceaccount.com",                 # 文件夹层（roles/viewer 含 getData）
-    "ext@partner-proj.iam.gserviceaccount.com", "custom@partner.com", "owner@vendor.com",   # 项目层
-    "acl-reader@partner.com", "svc@p9.iam.gserviceaccount.com",                           # 数据集 ACL
-    "table-reader@vendor.com", "view-sa@p8.iam.gserviceaccount.com",                      # 表 / 视图 IAM
-    "ana@trip.com", "svc-in-group@p7.iam.gserviceaccount.com", "carol@vendor.com",        # Group 展开（含嵌套）
+    # 来源 1：所有 ACTIVE 项目的 SA（含无授权 / 已禁用；多层文件夹）+ 待删除项目的 SA
+    "etl@prod.iam.gserviceaccount.com": "serviceAccount", "idle@prod.iam.gserviceaccount.com": "serviceAccount",
+    "disabled-sa@prod.iam.gserviceaccount.com": "serviceAccount", "dev-sa@dev.iam.gserviceaccount.com": "serviceAccount",
+    "deep-sa@deep.iam.gserviceaccount.com": "serviceAccount", "ghost@old-proj.iam.gserviceaccount.com": "serviceAccount",
+    # 来源 2：账号目录全部 user（含无授权 / 暂停 / 归档 / 第二域名）与全部 Group
+    "alice@trip.com": "user", "dave@trip.com": "user", "suspended@trip.com": "user", "archived@trip.com": "user",
+    "eve@ctrip.com": "user", "bi-team@trip.com": "group", "acl-g@trip.com": "group", "unused@trip.com": "group",
+    # 来源 3：授权记录中的全部授权对象（不看角色）
+    "orgreader@partner.com": "user", "gcs-only@partner.com": "user",                          # 组织层
+    "folder-sa@other.iam.gserviceaccount.com": "serviceAccount",                                # 文件夹层
+    "ext@partner-proj.iam.gserviceaccount.com": "serviceAccount", "jobonly@partner.com": "user",  # 项目层
+    "custom@partner.com": "user", "custommeta@partner.com": "user", "owner@vendor.com": "user",
+    "deleted:user:gone@trip.com?uid=1": "deleted", "trip.com": "domain", "allUsers": "public",
+    "acl-reader@partner.com": "user", "meta@partner.com": "user",                             # 数据集 ACL
+    "svc@p9.iam.gserviceaccount.com": "serviceAccount",
+    "table-reader@vendor.com": "user", "table-meta@vendor.com": "user",                       # 表 / 视图 IAM
+    "view-sa@p8.iam.gserviceaccount.com": "serviceAccount",
+    # 来源 4：授权记录中的 Group 展开一层；嵌套组只列组名
+    "ana@trip.com": "user", "carol@vendor.com": "user", "nested@trip.com": "group", "ext-g@other.com": "group",
 }
 
 
@@ -118,77 +124,96 @@ ORG_EXPECTED = {
 class TestNormal:
     def test_lp_n_01_org_scope_lists_everything(self, world, tmp_path):
         code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
-        assert code == 0 and set(rows) == ORG_EXPECTED
+        assert code == 0
+        assert {e: r["principal_type"] for e, r in rows.items()} == ORG_EXPECTED
 
     def test_lp_n_02_sa_without_any_grant_listed(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--projects", P1)
-        assert "idle@prod.iam.gserviceaccount.com" in rows and "disabled-sa@prod.iam.gserviceaccount.com" in rows
+        assert rows["idle@prod.iam.gserviceaccount.com"]["source"] == "项目 SA: prod"
+        assert "disabled-sa@prod.iam.gserviceaccount.com" in rows
 
-    def test_lp_n_03_directory_users_without_grant_listed_in_org_scope(self, world, tmp_path):
+    def test_lp_n_03_directory_users_and_groups_in_org_scope(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         for u in ("dave@trip.com", "suspended@trip.com", "archived@trip.com", "eve@ctrip.com"):
-            assert rows[u]["principal_type"] == "user"
+            assert rows[u] == {"email": u, "principal_type": "user", "source": "账号目录"}
+        assert rows["unused@trip.com"] == {"email": "unused@trip.com", "principal_type": "group", "source": "账号目录 Group"}
+        assert rows["bi-team@trip.com"]["source"] == "账号目录 Group；项目 IAM prod: roles/bigquery.dataViewer"
+        assert world.calls["group"] == 2                                 # 只展开授权中出现的 bi-team、acl-g
 
-    def test_lp_n_04_project_scope_no_directory_reads_ancestors(self, world, tmp_path, capsys):
+    def test_lp_n_04_project_scope_reads_ancestors_no_directory(self, world, tmp_path, capsys):
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
         assert code == 0
-        assert "dave@trip.com" not in rows                           # 不读账号目录
-        assert "orgreader@partner.com" in rows                       # 读上级（组织层）的授权：prod 直接挂在组织下
-        assert "folder-sa@other.iam.gserviceaccount.com" not in rows  # folders/10 不是 prod 的上级
-        assert "dev-sa@dev.iam.gserviceaccount.com" not in rows      # 其它项目的 SA 不在范围
-        assert {"ext@partner-proj.iam.gserviceaccount.com", "acl-reader@partner.com", "table-reader@vendor.com",
-                "ana@trip.com"} <= set(rows)
-        assert world.calls["directory"] == 0
+        assert {"orgreader@partner.com", "gcs-only@partner.com"} <= set(rows)     # 上级（组织）的全部授权对象
+        assert rows["gcs-only@partner.com"]["source"] == "组织 IAM: roles/storage.admin"
+        assert "folder-sa@other.iam.gserviceaccount.com" not in rows          # folders/10 不是 prod 的上级
+        assert "dave@trip.com" not in rows and "unused@trip.com" not in rows  # 不读账号目录
+        assert "dev-sa@dev.iam.gserviceaccount.com" not in rows               # 其它项目的 SA 没有授权，不列
+        assert world.calls["directory"] == 0 and world.calls["dir_groups"] == 0
         assert f"[ANCESTOR] --projects 指定的 1 个项目的上级 1 个：organizations/{ORG}" in err
 
-    def test_lp_n_05_role_filter_get_data_only(self, world, tmp_path):
+    def test_lp_n_05_no_role_filter(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
-        for gone in ("gcs-only@partner.com", "jobonly@partner.com", "custommeta@partner.com",
-                     "meta@partner.com", "table-meta@vendor.com"):
-            assert gone not in rows
+        assert rows["jobonly@partner.com"]["source"] == "项目 IAM prod: roles/bigquery.jobUser"
+        assert rows["meta@partner.com"]["source"] == "数据集 ACL prod.dw: roles/bigquery.metadataViewer"
+        assert rows["table-meta@vendor.com"]["source"] == "表 IAM prod.dw.orders: roles/bigquery.metadataViewer"
+        assert rows["custommeta@partner.com"]["source"] == "项目 IAM prod: organizations/111/roles/customMeta"
 
-    def test_lp_n_06_legacy_dataset_roles_mapped(self, world, tmp_path):
+    def test_lp_n_06_dataset_roles_in_source(self, world, tmp_path):
         world.dataset_acl["prod.dw"] += [("OWNER", "userByEmail", "dsowner@partner.com"),
                                          ("WRITER", "userByEmail", "dswriter@partner.com")]
         _, rows, _ = run(tmp_path, "--projects", P1)
-        assert {"dsowner@partner.com", "dswriter@partner.com", "acl-reader@partner.com"} <= set(rows)
+        assert rows["dsowner@partner.com"]["source"] == "数据集 ACL prod.dw: OWNER"
+        assert rows["dswriter@partner.com"]["source"] == "数据集 ACL prod.dw: WRITER"
 
-    def test_lp_n_07_columns_and_types(self, world, tmp_path):
+    def test_lp_n_07_columns_types_and_sorting(self, world, tmp_path):
         _, rows, out = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         with open(out, encoding="utf-8-sig") as f:
-            assert next(csv.reader(f)) == ["email", "principal_type", "home_project"]
+            assert next(csv.reader(f)) == ["email", "principal_type", "source"]
         assert rows["etl@prod.iam.gserviceaccount.com"] == {"email": "etl@prod.iam.gserviceaccount.com",
-                                                             "principal_type": "serviceAccount", "home_project": "prod"}
-        assert rows["owner@vendor.com"] == {"email": "owner@vendor.com", "principal_type": "user", "home_project": ""}
+                                                             "principal_type": "serviceAccount", "source": "项目 SA: prod"}
+        assert rows["owner@vendor.com"] == {"email": "owner@vendor.com", "principal_type": "user",
+                                            "source": "项目 IAM prod: roles/owner"}
         emails = [r["email"] for r in read_csv(out)]
         assert emails == sorted(emails)
 
     def test_lp_n_08_service_agent_from_grants(self, world, tmp_path):
         world.iam_policies[f"projects/{P1}"].append(
-            b("roles/bigquery.dataViewer", "serviceAccount:service-1@gcp-sa-bigquery.iam.gserviceaccount.com"))
+            b("roles/bigquery.serviceAgent", "serviceAccount:service-1@gcp-sa-bigquery.iam.gserviceaccount.com"))
         _, rows, _ = run(tmp_path, "--projects", P1)
-        assert rows["service-1@gcp-sa-bigquery.iam.gserviceaccount.com"]["principal_type"] == "serviceAgent"
+        assert rows["service-1@gcp-sa-bigquery.iam.gserviceaccount.com"] == {
+            "email": "service-1@gcp-sa-bigquery.iam.gserviceaccount.com", "principal_type": "serviceAgent",
+            "source": "项目 IAM prod: roles/bigquery.serviceAgent"}
 
-    def test_lp_n_09_inactive_projects_skipped_with_note(self, world, tmp_path, capsys):
+    def test_lp_n_09_pending_deletion_project_sas_listed(self, world, tmp_path, capsys):
+        code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
+        err = capsys.readouterr().err
+        assert code == 0
+        assert rows["ghost@old-proj.iam.gserviceaccount.com"]["source"] == "项目 SA: old-proj（待删除项目）"
+        assert "1 个待删除项目（只列其中的 SA）" in err and "[SA] 待删除项目 old-proj: 1 个 SA" in err
+        assert world.calls["datasets"] == 3                              # 待删除项目不读数据集（只读 prod、dev、deep）
+
+    def test_lp_n_09b_pending_project_sa_list_refused_is_note(self, world, tmp_path, capsys):
+        world.fail_resources.add(f"sa:{P_DEL}")
         code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         err = capsys.readouterr().err
         assert code == 0 and "ghost@old-proj.iam.gserviceaccount.com" not in rows
-        assert "[NOTE]" in err and P_DEL in err
+        assert f"[NOTE] 待删除项目 {P_DEL}: 列不出其中的 SA" in err and "[ERROR]" not in err
 
     def test_lp_n_10_org_and_project_overlap_dedup(self, world, tmp_path):
         _, r1, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="a.csv")
         _, r2, _ = run(tmp_path, "--organizations", ORG, "--projects", P1, name="b.csv")
-        assert set(r1) == set(r2)
+        assert r1 == r2
 
     def test_lp_n_11_project_outside_org_added(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--organizations", ORG, "--projects", P_OUT)
-        assert "outsider@outside.iam.gserviceaccount.com" in rows
+        assert rows["outsider@outside.iam.gserviceaccount.com"]["source"] == "项目 SA: outside"
 
     def test_lp_n_12_exclusions(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q",
-                         "--exclude-members", "DAVE@trip.com", "--exclude-patterns", "*@prod.iam.gserviceaccount.com")
-        assert "dave@trip.com" not in rows and not any(e.endswith("@prod.iam.gserviceaccount.com") for e in rows)
+                         "--exclude-members", "DAVE@trip.com", "allusers", "--exclude-patterns", "*@prod.iam.gserviceaccount.com")
+        assert "dave@trip.com" not in rows and "allUsers" not in rows
+        assert not any(e.endswith("@prod.iam.gserviceaccount.com") for e in rows)
         assert "alice@trip.com" in rows
 
     def test_lp_n_13_files_with_bom_crlf(self, world, tmp_path):
@@ -204,10 +229,12 @@ class TestNormal:
         _, r32, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q", "--parallel", "32", name="b.csv")
         assert r1 == r32
 
-    def test_lp_n_15_role_definitions_cached(self, world, tmp_path):
-        world.table_iam["prod.dw.orders"] += [b("roles/bigquery.dataViewer", f"user:u{i}@vendor.com") for i in range(20)]
-        run(tmp_path, "--organizations", ORG, "--quota-project", "q")
-        assert world.role_lookups["roles/bigquery.dataViewer"] == 1
+    def test_lp_n_15_no_role_definition_lookups(self, world, tmp_path, capsys):
+        world.iam_policies[f"projects/{P1}"].append(b("projects/prod/roles/unreadable", "user:maybe@vendor.com"))
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0 and "maybe@vendor.com" in rows
+        assert "[WARN]" not in err and not hasattr(ops, "role_permissions")
 
     def test_lp_n_16_every_table_iam_read_including_views(self, world, tmp_path):
         run(tmp_path, "--projects", P1)
@@ -226,16 +253,68 @@ class TestNormal:
 
     def test_lp_n_19_conditional_bindings_included(self, world, tmp_path):
         world.iam_policies[f"projects/{P1}"].append(
-            {"role": "roles/bigquery.dataViewer", "members": ["user:temp@vendor.com"],
+            {"role": "roles/viewer", "members": ["user:temp@vendor.com"],
              "condition": {"title": "until 2027", "expression": "request.time < timestamp('2027-01-01T00:00:00Z')"}})
         _, rows, _ = run(tmp_path, "--projects", P1)
-        assert "temp@vendor.com" in rows
+        assert rows["temp@vendor.com"]["source"] == "项目 IAM prod: roles/viewer（带条件）"
 
     def test_lp_n_20_no_cloud_asset_calls(self, world, tmp_path):
         for name in ("asset_search_service_accounts", "asset_search_iam_policies", "asset_search_datasets"):
             assert not hasattr(ops, name)
         run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         assert world.calls.get("asset", 0) == 0
+
+    def test_lp_n_21_non_concrete_principals(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b(
+            "roles/bigquery.dataViewer", "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*",
+            "allAuthenticatedUsers", "projectViewer:prod"))
+        world.dataset_acl["prod.dw"] += [("READER", "domain", "Partner.com"),
+                                         ("READER", "specialGroup", "allAuthenticatedUsers")]
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert rows["deleted:user:gone@trip.com?uid=1"]["principal_type"] == "deleted"
+        assert rows["trip.com"]["principal_type"] == "domain" and rows["partner.com"]["principal_type"] == "domain"
+        assert rows["allUsers"]["principal_type"] == rows["allAuthenticatedUsers"]["principal_type"] == "public"
+        assert rows["allAuthenticatedUsers"]["source"] == \
+            "项目 IAM prod: roles/bigquery.dataViewer；数据集 ACL prod.dw: READER"
+        assert rows["principalSet://iam.googleapis.com/locations/global/workforcePools/p/*"]["principal_type"] == "federated"
+        assert not any(e.startswith("projectviewer") or e == "projectReaders" for e in rows)
+
+    def test_lp_n_22_source_limited_to_five(self, world, tmp_path):
+        for i in range(7):
+            world.add_table(f"prod.dw.t{i}", rls_enabled=None)
+            world.table_iam[f"prod.dw.t{i}"] = [b("roles/bigquery.dataViewer", "user:many@vendor.com")]
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        src = rows["many@vendor.com"]["source"]
+        assert src.endswith("；…共 7 处") and src.count("表 IAM prod.dw.t") == 5
+
+    def test_lp_n_23_groups_expanded_one_level_nested_listed_by_name(self, world, tmp_path):
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert rows["ana@trip.com"]["source"] == "Group 成员: bi-team@trip.com"
+        assert rows["nested@trip.com"] == {"email": "nested@trip.com", "principal_type": "group",
+                                           "source": "Group 成员: bi-team@trip.com（嵌套组，未展开）"}
+        assert "svc-in-group@p7.iam.gserviceaccount.com" not in rows      # 嵌套组不展开
+        assert world.calls["group"] == 2                                 # 只请求 bi-team、acl-g
+
+    def test_lp_n_24_project_scope_lists_other_project_principals_with_any_role(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"] += [b("roles/viewer", "user:dave@trip.com"),
+                                                 b("roles/browser", "serviceAccount:dev-sa@dev.iam.gserviceaccount.com")]
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert rows["dave@trip.com"]["source"] == "项目 IAM prod: roles/viewer"
+        assert rows["dev-sa@dev.iam.gserviceaccount.com"]["source"] == "项目 IAM prod: roles/browser"
+
+    def test_lp_n_25_authorized_refs_outside_scope_noted(self, world, tmp_path, capsys):
+        world.dataset_acl["prod.dw"] += [
+            (None, "view", {"projectId": "rpt-proj", "datasetId": "share", "tableId": "v_orders"}),
+            (None, "routine", {"projectId": "udf-proj", "datasetId": "fn", "routineId": "mask"}),
+            (None, "dataset", {"dataset": {"projectId": P1, "datasetId": "views"}, "targetTypes": ["VIEWS"]})]
+        code, rows, _ = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0
+        note = err[err.index("[NOTE] 以下 2 个项目中的视图"):]
+        assert "授权视图 rpt-proj.share.v_orders → 数据集 prod.dw" in note
+        assert "授权例程 udf-proj.fn.mask → 数据集 prod.dw" in note
+        assert f"授权数据集 {P1}.views" not in err
+        assert not any("rpt-proj" in e for e in rows)                    # 授权视图不是主体
 
 
 # =========================================================================== #
@@ -248,7 +327,7 @@ class TestAbnormal:
         assert e.value.code == 2
 
     def test_lp_a_02_org_only_without_quota_project_uses_resolved_default(self, world, tmp_path):
-        code, rows, _ = run(tmp_path, "--organizations", ORG)            # 不再要求 --quota-project
+        code, rows, _ = run(tmp_path, "--organizations", ORG)
         assert code == 0 and "dave@trip.com" in rows
 
     @pytest.mark.parametrize("bad", ["abc", "12a", "organizations/x", "1;2"])
@@ -256,19 +335,28 @@ class TestAbnormal:
         with pytest.raises(SystemExit):
             list_principals.main(["--organizations", bad, "--quota-project", "q", "-o", "x.csv"])
 
-    def test_lp_a_04_directory_unavailable_error_but_rest_written(self, world, tmp_path, capsys):
+    def test_lp_a_04_directory_users_unavailable_error_but_rest_written(self, world, tmp_path, capsys):
         world.directory_error = RuntimeError("403 Not Authorized to access this resource/api")
         code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         err = capsys.readouterr().err
-        assert code == 1 and "[ERROR]" in err and "用户 → 读取" in err and "管理员" in err
+        assert code == 1 and "[ERROR] 账号目录 C0trip: 列出 user 失败" in err and "用户 → 读取" in err
         assert "etl@prod.iam.gserviceaccount.com" in rows and "dave@trip.com" not in rows
+        assert "unused@trip.com" in rows and "[DIR] 账号目录 C0trip: 3 个 Group" in err   # Group 照常
+
+    def test_lp_a_04b_directory_groups_unavailable_error_but_rest_written(self, world, tmp_path, capsys):
+        world.fail_resources.add(f"dir_groups:{CUST}")
+        code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
+        err = capsys.readouterr().err
+        assert code == 1 and "[ERROR] 账号目录 C0trip: 列出 Group 失败" in err and "群组 → 读取" in err
+        assert "dave@trip.com" in rows and "unused@trip.com" not in rows
+        assert "[DIR] 账号目录 C0trip: 5 个 user" in err
 
     def test_lp_a_05_project_sa_list_failure_reported(self, world, tmp_path, capsys):
         world.fail_resources.add(f"sa:{P2}")
         code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         err = capsys.readouterr().err
-        assert code == 1 and P2 in err and "[ERROR]" in err
-        assert "etl@prod.iam.gserviceaccount.com" in rows                   # 其它项目照常
+        assert code == 1 and f"[ERROR] 项目 {P2}: 列出 SA 失败" in err
+        assert "etl@prod.iam.gserviceaccount.com" in rows
 
     @pytest.mark.parametrize("res", [f"iam:organizations/{ORG}", f"iam:{F1}", f"iam:projects/{P1}",
                                      "datasets:prod", "acl:prod.dw", "tables:prod.dw", "table_iam:prod.dw.orders",
@@ -278,71 +366,107 @@ class TestAbnormal:
         code, _, out = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
         assert code == 1 and "[ERROR]" in capsys.readouterr().err and out.exists()
 
-    def test_lp_a_07_unknown_role_definition_included_with_warn(self, world, tmp_path, capsys):
-        world.iam_policies[f"projects/{P1}"].append(b("projects/prod/roles/unreadable", "user:maybe@vendor.com"))
-        world.role_errors.add("projects/prod/roles/unreadable")
+    def test_lp_a_06b_table_deleted_during_scan_is_note(self, world, tmp_path, capsys):
+        # 列出表之后、读取它的 IAM 之前表被删除（真实的 HttpError 404）→ [NOTE] 跳过，退出码不受影响；
+        # 不中断、其余主体照常写入 CSV；只少了这张表自己 IAM 里的授权对象
+        world.not_found_resources.add("table_iam:prod.dw.orders")
+        code, rows, out = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 0 and "[ERROR]" not in err, err
+        assert "[NOTE] 表 prod.dw.orders: 表已不存在（扫描期间被删除），跳过" in err
+        assert "[TABLE] 2 张表 / 视图：授权对象 1 个（其中 1 张扫描期间已被删除，跳过）" in err
+        assert "table-reader@vendor.com" not in rows and "table-meta@vendor.com" not in rows
+        assert "view-sa@p8.iam.gserviceaccount.com" in rows                       # 同数据集的其它表照常
+        assert "acl-reader@partner.com" in rows and "carol@vendor.com" in rows     # 数据集 ACL、Group 成员照常
+        assert out.exists() and "===== 完成" in err
+
+    def test_lp_a_06c_table_not_found_google_cloud_style_also_note(self, world, tmp_path, capsys, monkeypatch):
+        # google-cloud 客户端风格的 NotFound（同为 404）也按「表已不存在」处理
+        from google.api_core.exceptions import NotFound
+        real = list_principals.ops.table_iam_bindings
+
+        def fake(ctx, t):
+            if t == "prod.dw.orders_view":
+                raise NotFound("Not found: Table prod:dw.orders_view")
+            return real(ctx, t)
+        monkeypatch.setattr(list_principals.ops, "table_iam_bindings", fake)
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert "maybe@vendor.com" in rows and "[WARN]" in err and "projects/prod/roles/unreadable" in err
-        assert code == 0
+        assert code == 0 and "[NOTE] 表 prod.dw.orders_view: 表已不存在（扫描期间被删除），跳过" in err, err
+        assert "view-sa@p8.iam.gserviceaccount.com" not in rows and "table-reader@vendor.com" in rows
 
-    def test_lp_a_08_unresolvable_and_cyclic_groups(self, world, tmp_path, capsys):
-        # 读不到的外部域嵌套组：[NOTE]、作为 group 写入 CSV、结尾汇总、不影响退出码；其余主体照常写入；环不会死循环
+    @pytest.mark.parametrize("status", [403, 400, 500])
+    def test_lp_a_06d_table_iam_other_http_errors_still_error(self, world, tmp_path, capsys, monkeypatch, status):
+        # 只有 404 单独处理：403（无权限）、400、重试用尽的 5xx 等仍是 [ERROR] + 退出码 1
+        from tests.unit.fakes import http_error
+
+        def fake(ctx, t):
+            raise http_error(status, f"HTTP {status} on {t}")
+        monkeypatch.setattr(list_principals.ops, "table_iam_bindings", fake)
+        code, rows, out = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1 and "[ERROR] 表 prod.dw.orders: 读取 IAM 策略失败" in err and "表已不存在" not in err, err
+        assert out.exists() and "acl-reader@partner.com" in rows
+
+    @pytest.mark.parametrize("res", ["tables:prod.dw", "acl:prod.dw", "datasets:prod", "iam:projects/prod"])
+    def test_lp_a_06e_404_elsewhere_still_error(self, world, tmp_path, capsys, res):
+        # 404 的特殊处理只限于读表 IAM：列出表 / 数据集 ACL / 列出数据集 / 项目 IAM 的 404 仍是 [ERROR]
+        world.not_found_resources.add(res)
+        code, _, out = run(tmp_path, "--projects", P1)
+        err = capsys.readouterr().err
+        assert code == 1 and "[ERROR]" in err and "表已不存在" not in err and out.exists(), err
+
+    def test_lp_a_08_unreadable_nested_group_not_fetched(self, world, tmp_path, capsys):
+        # 嵌套组只列组名、不请求成员：即使它读不到也不报错
         world.groups["ext-g@other.com"] = None
-        world.groups["bi-team@trip.com"].append(("bi-team@trip.com", "GROUP"))
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert code == 0 and "ana@trip.com" in rows and "carol@vendor.com" in rows
-        assert rows["ext-g@other.com"] == {"email": "ext-g@other.com", "principal_type": "group", "home_project": ""}
-        assert "[NOTE] group:ext-g@other.com（group:acl-g@trip.com 中的嵌套组） 是外部域的 Group" in err
-        assert "[NOTE] 以下 1 个外部域 Group 已作为 group 写入 CSV" in err and "  - ext-g@other.com" in err
-        assert "[GROUP] 共 2 个 Group，外部域 1 个（已写入 CSV）" in err
-        assert "[ERROR]" not in err and "[WARN]" not in err and "Traceback" not in err
+        assert code == 0 and "[ERROR]" not in err
+        assert rows["ext-g@other.com"]["source"] == "Group 成员: acl-g@trip.com（嵌套组，未展开）"
+        assert "[GROUP] 授权记录中的 Group 2 个，展开一层：嵌套组 2 个（只列组名）" in err
 
-    def test_lp_a_08b_top_level_group_unreadable_vs_empty(self, world, tmp_path, capsys):
-        # 本组织域名的组读不到 → [ERROR]（提示群组读取权限）+ group 写入 CSV + 退出码 1；空组（读得到、没有成员）不算错误
+    def test_lp_a_08b_top_level_own_group_unreadable_vs_empty(self, world, tmp_path, capsys):
         world.groups["bi-team@trip.com"] = None
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert code == 1 and "[ERROR] 展开 group:bi-team@trip.com 失败：无权读取" in err and "carol@vendor.com" in rows
-        assert "该 Group 属于本组织域名" in err and "群组 → 读取" in err
-        assert rows["bi-team@trip.com"]["principal_type"] == "group"
-        assert "[ERROR] 以下 1 个 Group 未能展开（Group 本身已写入 CSV）" in err and "  - bi-team@trip.com" in err
+        assert code == 1 and "[ERROR] 展开 group:bi-team@trip.com 失败：无权读取" in err and "群组 → 读取" in err
+        assert rows["bi-team@trip.com"]["source"] == "项目 IAM prod: roles/bigquery.dataViewer（未能展开）"
+        assert "ana@trip.com" not in rows and "carol@vendor.com" in rows
+        assert "[ERROR] 以下 1 个 Group 未能展开（Group 本身已写入 CSV）" in err
         world.groups["bi-team@trip.com"] = []
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert code == 0 and "[ERROR]" not in err and "全部展开" in err
-        assert "bi-team@trip.com" not in rows                          # 能展开的组本身不写入 CSV
+        assert code == 0 and "[ERROR]" not in err and rows["bi-team@trip.com"]["source"].endswith("dataViewer")
 
-    def test_lp_a_08c_group_api_error_is_error_not_silent(self, world, tmp_path, capsys, monkeypatch):
-        # API 未启用 / 限流重试用尽等异常：[ERROR] 说明原因、退出码 1，其余结果照常写入；与域名无关（外部域同样算错误）
-        real = list_principals.ops.expand_group
+    def test_lp_a_08c_group_api_error_is_error_regardless_of_domain(self, world, tmp_path, capsys, monkeypatch):
+        real = list_principals.ops.group_members_typed
         world.dataset_acl["prod.dw"].append(("READER", "groupByEmail", "partner-g@other.com"))
 
-        def boom(ctx, g, max_depth=10):
+        def boom(ctx, g, reasons=None):
             if g in ("bi-team@trip.com", "partner-g@other.com"):
                 raise RuntimeError("403 Cloud Identity API has not been used in project fake-quota or it is disabled")
-            return real(ctx, g, max_depth)
-        monkeypatch.setattr(list_principals.ops, "expand_group", boom)
+            return real(ctx, g, reasons)
+        monkeypatch.setattr(list_principals.ops, "group_members_typed", boom)
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
         assert code == 1 and "carol@vendor.com" in rows
         assert "[ERROR] 展开 group:bi-team@trip.com 失败: Cloud Identity API 未在 quota 项目启用" in err
         assert "[ERROR] 展开 group:partner-g@other.com 失败: Cloud Identity API 未在 quota 项目启用" in err
-        assert "  - bi-team@trip.com" in err and "  - partner-g@other.com" in err
-        assert rows["bi-team@trip.com"]["principal_type"] == rows["partner-g@other.com"]["principal_type"] == "group"
+        assert rows["partner-g@other.com"]["source"].endswith("（未能展开）")
 
     def test_lp_a_09_csv_formula_injection_neutralized(self, world, tmp_path):
         world.dataset_acl["prod.dw"].append(("READER", "userByEmail", '=HYPERLINK("http://evil")@x.com'))
         _, rows, _ = run(tmp_path, "--projects", P1)
         assert all(not e.startswith(("=", "+", "-", "@")) for e in rows)
 
-    def test_lp_a_10_odd_members_skipped(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/bigquery.dataViewer", "allAuthenticatedUsers",
-                                                      "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*",
-                                                      "projectViewer:prod", "deleted:serviceAccount:x@p.iam.gserviceaccount.com?uid=2"))
+    def test_lp_a_10_odd_members(self, world, tmp_path):
+        world.iam_policies[f"projects/{P1}"].append(b("roles/bigquery.dataViewer", "projectViewer:prod",
+                                                      "deleted:serviceAccount:x@p.iam.gserviceaccount.com?uid=2",
+                                                      "weird-no-prefix"))
         code, rows, _ = run(tmp_path, "--projects", P1)
-        assert code == 0 and not any("allauthenticated" in e or "principalset" in e or e.startswith("projectviewer") for e in rows)
+        assert code == 0
+        assert rows["deleted:serviceAccount:x@p.iam.gserviceaccount.com?uid=2"]["principal_type"] == "deleted"
+        assert not any(e.lower().startswith("projectviewer") or e == "weird-no-prefix" for e in rows)
 
     @pytest.mark.parametrize("pat", ["[", "*(", "\\", "?*[]"])
     def test_lp_a_11_exclude_pattern_weird_chars(self, world, tmp_path, pat):
@@ -355,9 +479,9 @@ class TestAbnormal:
         code, rows, _ = run(tmp_path, "--organizations", ORG2, "--quota-project", "q")
         assert code == 0 and rows == {}
 
-    def test_lp_a_13_removed_columns_flags_not_needed(self, world, tmp_path):
+    def test_lp_a_13_three_columns(self, world, tmp_path):
         _, rows, _ = run(tmp_path, "--projects", P1)
-        assert all(set(r) == {"email", "principal_type", "home_project"} for r in rows.values())
+        assert all(set(r) == {"email", "principal_type", "source"} for r in rows.values())
 
     @pytest.mark.parametrize("flag", ["--folder", "--organization", "--group", "--include-iam-bound", "--copilot-members"])
     def test_lp_a_14_removed_or_abbreviated_flags_rejected(self, world, flag):
@@ -378,28 +502,27 @@ class TestDirectoryWithOwnCredentials:
 
     def test_lp_d_03_project_scope_does_not_read_directory(self, world, tmp_path):
         code, _, _ = run(tmp_path, "--projects", P1)
-        assert code == 0 and world.directory_calls == []
+        assert code == 0 and world.directory_calls == [] and world.calls["dir_groups"] == 0
 
     def test_lp_d_04_one_directory_read_per_customer(self, world, tmp_path):
         world.crm_children[f"organizations/{ORG2}"] = {"folders": [], "projects": []}
         world.org_customer[ORG2] = CUST                         # 两个组织属于同一个账号目录
         run(tmp_path, "--organizations", f"{ORG},{ORG2}", "--quota-project", "q")
-        assert world.directory_calls == [CUST]
+        assert world.directory_calls == [CUST] and world.calls["dir_groups"] == 1
 
 
 # =========================================================================== #
-# --projects 读上级策略（继承的授权）；展不开的 Group 写入 CSV（外部域 [NOTE] / 本域 [ERROR]）
+# --projects 读上级策略；展不开的 Group（外部域 [NOTE] / 本域 [ERROR]）
 # =========================================================================== #
 class TestAncestorsAndGroups:
     def test_lp_anc_01_deep_project_reads_all_folders_and_org(self, world, tmp_path, capsys):
-        # deep 在 组织 111 → folders/10 → folders/20 下：三层的授权都要列出
-        world.iam_policies[F2] = [b("roles/bigquery.dataViewer", "user:f2reader@partner.com")]
+        world.iam_policies[F2] = [b("roles/browser", "user:f2browser@partner.com")]
         code, rows, _ = run(tmp_path, "--projects", P3)
         err = capsys.readouterr().err
         assert code == 0
-        assert {"orgreader@partner.com", "folder-sa@other.iam.gserviceaccount.com", "f2reader@partner.com",
-                "deep-sa@deep.iam.gserviceaccount.com"} <= set(rows)
-        assert "gcs-only@partner.com" not in rows                      # 上级中不能读数据的角色同样不算
+        assert rows["f2browser@partner.com"]["source"] == f"文件夹 IAM {F2}: roles/browser"
+        assert rows["folder-sa@other.iam.gserviceaccount.com"]["source"] == f"文件夹 IAM {F1}: roles/viewer"
+        assert {"orgreader@partner.com", "gcs-only@partner.com", "deep-sa@deep.iam.gserviceaccount.com"} <= set(rows)
         assert f"[ANCESTOR] --projects 指定的 1 个项目的上级 3 个：{F2}, {F1}, organizations/{ORG}" in err
         assert "[IAM] 4 个组织 / 文件夹 / 项目" in err
 
@@ -409,8 +532,7 @@ class TestAncestorsAndGroups:
         err = capsys.readouterr().err
         assert code == 1 and out.exists()
         assert f"[ERROR] 项目 {P1}: 读取上级文件夹 / 组织失败（需要组织层 Browser）" in err
-        assert "ext@partner-proj.iam.gserviceaccount.com" in rows      # 项目自身的授权照常
-        assert "orgreader@partner.com" not in rows
+        assert "ext@partner-proj.iam.gserviceaccount.com" in rows and "orgreader@partner.com" not in rows
 
     def test_lp_anc_03_ancestor_policy_failure_hints_security_reviewer(self, world, tmp_path, capsys):
         world.fail_resources.add(f"iam:{F1}")
@@ -418,17 +540,17 @@ class TestAncestorsAndGroups:
         err = capsys.readouterr().err
         assert code == 1
         assert f"[ERROR] {F1}: 读取 IAM 策略失败（读取文件夹 / 组织的 IAM 策略需要组织层 Security Reviewer）" in err
-        assert "orgreader@partner.com" in rows                          # 其它上级照常
+        assert "orgreader@partner.com" in rows
 
     def test_lp_anc_04_projects_covered_by_org_not_reread(self, world, tmp_path):
         run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="a.csv")
         org_only = world.calls["iam_policy"]
         world.calls["iam_policy"] = 0
-        _, rows, _ = run(tmp_path, "--organizations", ORG, "--projects", P2, name="b.csv")
+        run(tmp_path, "--organizations", ORG, "--projects", P2, name="b.csv")
         assert world.calls["ancestry"] == 0 and world.calls["iam_policy"] == org_only
 
     def test_lp_anc_05_project_without_ancestors(self, world, tmp_path, capsys):
-        code, rows, _ = run(tmp_path, "--projects", P_OUT)              # 不在任何组织 / 文件夹下
+        code, rows, _ = run(tmp_path, "--projects", P_OUT)
         err = capsys.readouterr().err
         assert code == 0 and "[ANCESTOR]" not in err and "[ERROR]" not in err
         assert "outsider@outside.iam.gserviceaccount.com" in rows and "orgreader@partner.com" not in rows
@@ -437,7 +559,7 @@ class TestAncestorsAndGroups:
         code, _, _ = run(tmp_path, "--projects", f"{P2},{P3}")
         err = capsys.readouterr().err
         assert code == 0 and world.calls["ancestry"] == 2
-        assert world.calls["iam_policy"] == 5                            # dev、deep + folders/10、folders/20、组织
+        assert world.calls["iam_policy"] == 5
         assert "上级 3 个" in err and world.calls["org_info"] == 1
 
     def test_lp_anc_07_ancestor_org_info_failure_is_error(self, world, tmp_path, capsys):
@@ -445,31 +567,31 @@ class TestAncestorsAndGroups:
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
         assert code == 1 and f"[ERROR] organizations/{ORG}: 读取组织信息" in err
-        assert "orgreader@partner.com" in rows                          # 组织策略照常读取
+        assert "orgreader@partner.com" in rows
 
     def test_lp_grp_01_external_top_level_group_note_exit_0(self, world, tmp_path, capsys):
         world.iam_policies[f"projects/{P1}"].append(b("roles/bigquery.dataViewer", "group:vendor-team@vendor.com"))
         world.groups["vendor-team@vendor.com"] = None
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
-        assert code == 0 and rows["vendor-team@vendor.com"]["principal_type"] == "group"
+        assert code == 0 and rows["vendor-team@vendor.com"] == {
+            "email": "vendor-team@vendor.com", "principal_type": "group",
+            "source": "项目 IAM prod: roles/bigquery.dataViewer（外部域，未展开）"}
         assert "[NOTE] group:vendor-team@vendor.com 是外部域的 Group" in err and "[ERROR]" not in err
         assert "[DOMAIN] 本组织域名（用于判断读不到的 Group 是否外部域）: trip.com, x.com" in err
 
     def test_lp_grp_02_directory_secondary_domain_is_own_in_org_scope(self, world, tmp_path, capsys):
-        # eve@ctrip.com 在账号目录中 → 组织范围 ctrip.com 算本域：读不到 → [ERROR]、退出码 1
         world.iam_policies[f"projects/{P1}"].append(b("roles/bigquery.dataViewer", "group:bi@ctrip.com"))
         world.groups["bi@ctrip.com"] = None
         code, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="org.csv")
         err = capsys.readouterr().err
-        assert code == 1 and "[ERROR] 展开 group:bi@ctrip.com 失败" in err and rows["bi@ctrip.com"]["principal_type"] == "group"
-        # 只指定项目时不读账号目录：ctrip.com 不在本域名中，按外部域处理（照样写入 CSV）
+        assert code == 1 and "[ERROR] 展开 group:bi@ctrip.com 失败" in err
         code, rows, _ = run(tmp_path, "--projects", P1, name="prj.csv")
         err = capsys.readouterr().err
         assert code == 0 and "[NOTE] group:bi@ctrip.com 是外部域的 Group" in err and "bi@ctrip.com" in rows
 
     def test_lp_grp_03_runner_domain_counts_but_not_sa(self, world, tmp_path, capsys):
-        del world.org_domain[ORG]                                       # 组织没有主域名时
+        del world.org_domain[ORG]
         world.groups["bi-team@trip.com"] = None
         code, _, _ = run(tmp_path, "--projects", P1, "--gcloud-account", "runner@trip.com", name="u.csv")
         assert code == 1 and "[ERROR] 展开 group:bi-team@trip.com 失败" in capsys.readouterr().err
@@ -480,92 +602,20 @@ class TestAncestorsAndGroups:
         assert "gserviceaccount.com" not in err.split("[DOMAIN]")[1].splitlines()[0]
 
     def test_lp_grp_04_exclusions_apply_to_group_rows(self, world, tmp_path):
-        world.groups["ext-g@other.com"] = None
         _, rows, _ = run(tmp_path, "--projects", P1, "--exclude-patterns", "*@other.com")
         assert "ext-g@other.com" not in rows
 
-    def test_lp_grp_05_same_unreadable_group_nested_twice_reported_once(self, world, tmp_path, capsys):
-        world.groups["ext-g@other.com"] = None
-        world.groups["bi-team@trip.com"].append(("ext-g@other.com", "GROUP"))
-        code, rows, _ = run(tmp_path, "--projects", P1)
-        err = capsys.readouterr().err
-        assert code == 0 and err.count("[NOTE] group:ext-g@other.com") == 1
-        assert "[NOTE] 以下 1 个外部域 Group" in err
+    def test_lp_grp_05_same_nested_group_in_two_groups_one_row(self, world, tmp_path):
+        world.groups["acl-g@trip.com"].append(("nested@trip.com", "GROUP"))
+        _, rows, _ = run(tmp_path, "--projects", P1)
+        assert rows["nested@trip.com"]["source"] == \
+            "Group 成员: acl-g@trip.com（嵌套组，未展开）；Group 成员: bi-team@trip.com（嵌套组，未展开）"
 
     def test_lp_grp_06_external_and_own_mixed(self, world, tmp_path, capsys):
-        world.groups["ext-g@other.com"] = None
-        world.groups["nested@trip.com"] = None
+        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "group:vendor-team@vendor.com"))
+        world.groups["vendor-team@vendor.com"] = None
+        world.groups["bi-team@trip.com"] = None
         code, rows, _ = run(tmp_path, "--projects", P1)
         err = capsys.readouterr().err
         assert code == 1
-        assert "[GROUP] 共 2 个 Group，外部域 1 个（已写入 CSV）、本域未能展开 1 个" in err
-        assert {r for r, v in rows.items() if v["principal_type"] == "group"} == {"ext-g@other.com", "nested@trip.com"}
-        assert "ana@trip.com" in rows and "svc-in-group@p7.iam.gserviceaccount.com" not in rows
-
-
-# =========================================================================== #
-# 基本角色（Owner / Editor / Viewer）：IAM 权限里没有 getData，但数据集默认 ACL 的特殊组让它们能读表 → 按能读处理
-# =========================================================================== #
-class TestBasicRoles:
-    def test_lp_basic_01_counted_without_role_lookup(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "user:viewer-only@partner.com"))
-        code, rows, _ = run(tmp_path, "--projects", P1)
-        assert code == 0 and "viewer-only@partner.com" in rows
-        assert not {"roles/owner", "roles/editor", "roles/viewer"} & set(world.role_lookups)   # 不查角色定义
-
-    def test_lp_basic_02_org_scope_external_user_with_project_viewer(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "user:viewer-only@partner.com"))
-        _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
-        assert rows["viewer-only@partner.com"]["principal_type"] == "user"
-
-    def test_lp_basic_03_org_scope_external_sa_with_folder_editor(self, world, tmp_path):
-        world.iam_policies[F1].append(b("roles/editor", "serviceAccount:ext-editor@other-org.iam.gserviceaccount.com"))
-        _, rows, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q")
-        assert rows["ext-editor@other-org.iam.gserviceaccount.com"]["home_project"] == "other-org"
-
-    def test_lp_basic_04_project_scope_internal_user_with_viewer_only(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/viewer", "user:dave@trip.com"))
-        _, rows, _ = run(tmp_path, "--projects", P1)
-        assert "dave@trip.com" in rows                                  # 以前漏：不读账号目录、基本角色又被筛掉
-
-    def test_lp_basic_05_project_scope_other_project_sa_with_editor(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/editor", "serviceAccount:dev-sa@dev.iam.gserviceaccount.com"))
-        _, rows, _ = run(tmp_path, "--projects", P1)
-        assert "dev-sa@dev.iam.gserviceaccount.com" in rows
-
-    def test_lp_basic_06_project_scope_inherited_org_viewer(self, world, tmp_path):
-        world.iam_policies[f"organizations/{ORG}"].append(b("roles/viewer", "user:org-viewer@trip.com"))
-        world.iam_policies[F1].append(b("roles/owner", "serviceAccount:f-owner@x.iam.gserviceaccount.com"))
-        _, rows, _ = run(tmp_path, "--projects", P2)                    # dev 在 组织 → folders/10 下
-        assert {"org-viewer@trip.com", "f-owner@x.iam.gserviceaccount.com",
-                "folder-sa@other.iam.gserviceaccount.com"} <= set(rows)
-
-    def test_lp_basic_07_group_with_basic_role_expanded(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/owner", "group:owners@trip.com"))
-        world.groups["owners@trip.com"] = [("bob@trip.com", "USER")]
-        _, rows, _ = run(tmp_path, "--projects", P1)
-        assert "bob@trip.com" in rows and "owners@trip.com" not in rows
-
-    def test_lp_basic_08_non_bigquery_roles_still_filtered(self, world, tmp_path):
-        world.iam_policies[f"projects/{P1}"].append(b("roles/storage.admin", "user:gcs2@partner.com"))
-        world.iam_policies[f"projects/{P1}"].append(b("roles/browser", "user:browser@partner.com"))
-        world.role_perms["roles/browser"] = {"resourcemanager.projects.get"}
-        _, rows, _ = run(tmp_path, "--projects", P1)
-        assert "gcs2@partner.com" not in rows and "browser@partner.com" not in rows
-
-    def test_lp_basic_09_authorized_refs_outside_scope_noted(self, world, tmp_path, capsys):
-        world.dataset_acl["prod.dw"] += [
-            (None, "view", {"projectId": "rpt-proj", "datasetId": "share", "tableId": "v_orders"}),
-            (None, "routine", {"projectId": "udf-proj", "datasetId": "fn", "routineId": "mask"}),
-            (None, "dataset", {"dataset": {"projectId": P1, "datasetId": "views"}, "targetTypes": ["VIEWS"]})]
-        code, rows, _ = run(tmp_path, "--projects", P1)
-        err = capsys.readouterr().err
-        assert code == 0
-        note = err[err.index("[NOTE] 以下 2 个项目中的视图"):]
-        assert "rpt-proj" in note and "授权视图 rpt-proj.share.v_orders → 数据集 prod.dw" in note
-        assert "udf-proj" in note and "授权例程 udf-proj.fn.mask → 数据集 prod.dw" in note
-        assert f"授权数据集 {P1}.views" not in err                       # 范围内的项目不提示
-        # 组织范围：rpt-proj 不在组织内，同样提示；组织内的项目不提示
-        code, _, _ = run(tmp_path, "--organizations", ORG, "--quota-project", "q", name="org.csv")
-        err = capsys.readouterr().err
-        assert code == 0 and "rpt-proj" in err and f"授权数据集 {P1}.views" not in err
+        assert "[GROUP] 授权记录中的 Group 3 个，展开一层：嵌套组 1 个（只列组名）、外部域 1 个（未展开）、本域未能展开 1 个" in err

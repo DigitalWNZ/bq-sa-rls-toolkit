@@ -80,28 +80,29 @@ class TestApplyBypassNormal:
     def test_n_bp_01_dry_run_shows_plan_and_changes_nothing(self, world, capsys):
         world.policies(T2).append(bypass_rule(G_R))
         world.policies(T3).append({**bypass_rule(G_R), "filter": "region = 'HK'"})
-        code = self.run("--group", G_R, "--tables", f"{T1},{T2},{T3}")
+        code = self.run("--group", G_R)
         err = capsys.readouterr().err
         assert code == 0 and world.ddl_log == []
         assert f"[CREATE] {T1}" in err and f"[NOOP] {T2}" in err and f"[REPLACE] {T3}" in err
-        assert "DRY-RUN" in err and "CREATE 1，NOOP 1，REPLACE 1" in err
+        assert "DRY-RUN" in err and "CREATE 2，NOOP 1，REPLACE 1" in err        # T1、T4 新建
 
     def test_n_bp_02_apply_creates_exact_ddl(self, world):
-        code = self.run("--group", G_R, "--tables", T1, "--apply")
+        code = self.run("--group", G_R, "--apply")
         assert code == 0
-        assert world.ddl_log == [
-            f"CREATE OR REPLACE ROW ACCESS POLICY `{BYP_R}`\nON `{T1}`\nGRANT TO (\"group:{G_R}\")\nFILTER USING (TRUE)"]
+        assert f"CREATE OR REPLACE ROW ACCESS POLICY `{BYP_R}`\nON `{T1}`\nGRANT TO (\"group:{G_R}\")\nFILTER USING (TRUE)" \
+            in world.ddl_log
+        assert len(world.ddl_log) == 4                                   # 登记表中开启的 4 张表各一次
         assert world.policy(T1, BYP_R) == {"id": BYP_R, "filter": "TRUE", "grantees": [f"group:{G_R}"]}
 
     def test_n_bp_03_rerun_is_noop(self, world, capsys):
-        self.run("--group", G_R, "--tables", T1, "--apply")
+        self.run("--group", G_R, "--apply")
         n = len(world.ddl_log)
-        code = self.run("--group", G_R, "--tables", T1, "--apply")
+        code = self.run("--group", G_R, "--apply")
         assert code == 0 and len(world.ddl_log) == n and "[NOOP]" in capsys.readouterr().err
 
     def test_n_bp_04_second_group_gets_own_rule(self, world):
-        self.run("--group", G_R, "--tables", T1, "--apply")
-        code = self.run("--group", G_W, "--tables", T1, "--apply")        # 已非首条，无需 force
+        self.run("--group", G_R, "--apply")
+        code = self.run("--group", G_W, "--apply")        # 已非首条，无需 force
         assert code == 0
         assert {p["id"] for p in world.policies(T1)} == {BYP_R, BYP_W}
         assert world.policy(T1, BYP_W)["grantees"] == [f"group:{G_W}"]
@@ -110,44 +111,40 @@ class TestApplyBypassNormal:
                                         {"grantees": [f"group:{G_R}", "user:x@domain.com"]}])
     def test_n_bp_05_replace_restores_rule(self, world, capsys, change):
         world.policies(T1).append({**bypass_rule(G_R), **change})
-        code = self.run("--group", G_R, "--tables", T1, "--apply")
+        code = self.run("--group", G_R, "--apply")
         err = capsys.readouterr().err
         assert code == 0 and f"[REPLACE] {T1}" in err and "被覆盖的旧内容" in err
         assert world.policy(T1, BYP_R) == bypass_rule(G_R)
 
-    def test_n_bp_06_scope_combinations_deduplicated(self, world, tmp_path):
-        tf = write_list(tmp_path, "t.csv", [T1])
-        df = write_list(tmp_path, "d.csv", [f"{P}.ods"])
-        pf = write_list(tmp_path, "p.csv", [P])
-        code = self.run("--group", G_R, "--tables", T1, "--tables", tf, "--datasets", f"{P}.dw",
-                        "--datasets", df, "--projects", P, "--projects", pf,
-                        "--apply")
+    def test_n_bp_06_targets_come_from_registry_only(self, world):
+        world.register(T1, 1)                                # 登记表里重复登记：只执行一次
+        code = self.run("--group", G_R, "--apply")
         assert code == 0
-        assert len(world.ddl_log) == 4                       # 4 张业务表各一次，重复范围不重复执行
+        assert len(world.ddl_log) == 4                       # 4 张业务表各一次
         assert all(world.policy(t, BYP_R) for t in (T1, T2, T3, T4))
         assert world.policies(COND) == [] and world.policies(MAP) == []
 
     def test_n_bp_07_verify_outcomes(self, world, capsys):
         world.verify_result[(T1, READER_SA)] = ("ok", "可见数据（2s）")
         world.verify_result[(T2, READER_SA)] = ("skip", "表元数据行数为 0")
-        code = self.run("--group", G_R, "--tables", f"{T1},{T2}", "--apply", "--verify-sa", READER_SA)
+        code = self.run("--group", G_R, "--apply", "--verify-sa", READER_SA)
         err = capsys.readouterr().err
         assert code == 0 and f"[VERIFY-OK] {T1}" in err and f"[VERIFY-SKIP] {T2}" in err
 
     def test_n_bp_08_group_email_normalized(self, world):
-        code = self.run("--group", "Group_ExistingSA_Read@Domain.COM", "--tables", T1, "--apply")
+        code = self.run("--group", "Group_ExistingSA_Read@Domain.COM", "--apply")
         assert code == 0 and world.policy(T1, BYP_R)["grantees"] == [f"group:{G_R}"]
 
     @pytest.mark.parametrize("parallel", ["1", "3", "32"])
     def test_n_bp_09_parallel_levels_same_outcome(self, world, parallel):
-        code = self.run("--group", G_R, "--tables", T1, "--projects", P, "--apply",
+        code = self.run("--group", G_R, "--apply",
                         "--parallel", parallel)
         assert code == 0 and sorted(world.ddl_log) == sorted(
             core.build_policy_ddl(t, BYP_R, [f"group:{G_R}"], "TRUE") for t in (T1, T2, T3, T4))
 
     def test_n_bp_10_first_policy_list_sorted_and_only_fresh_tables(self, world, capsys):
         world.policies(T1).append(bypass_rule(G_W))
-        code = self.run("--group", G_R, "--tables", f"{T4},{T2},{T1}")
+        code = self.run("--group", G_R)
         err = capsys.readouterr().err
         block = err[err.index("将为以下这些表首次设置RLS规则"):]
         block = block[:block.index("[CREATE]")]
@@ -263,8 +260,8 @@ class TestEndToEndFlow:
         assert list_principals.main(["--projects", P, "-o", str(tmp_path / "p.csv")]) == 0            # 第 1 步
         assert apply_copilot_rls.main([*AUTH, "-o", str(tmp_path / "c.csv"), "--apply"]) == 0          # 第 7 步先于第 3 步：不再拦截
         assert {x["id"] for x in w.policies(T1)} == {COP_G}                                         # 每表一条 Group 规则
-        assert apply_bypass_rls.main(["--group", G_R, "--datasets", f"{P}.dw", *BYP_ARGS, "--apply"]) == 0   # 第 3 步补 bypass
-        assert apply_bypass_rls.main(["--group", G_W, "--datasets", f"{P}.dw", *BYP_ARGS, "--apply"]) == 0
+        assert apply_bypass_rls.main(["--group", G_R, *BYP_ARGS, "--apply"]) == 0   # 第 3 步补 bypass
+        assert apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply"]) == 0
         assert apply_copilot_rls.main([*AUTH, "-o", str(tmp_path / "c.csv"), "--apply"]) == 0          # 重跑：NOOP
         assert {x["id"] for x in w.policies(T1)} == {BYP_R, BYP_W, COP_G}
         assert rollback_rls.main(["--datasets", f"{P}.dw", "--principals", G_COP, "--apply"]) == 0         # 第 8 步：撤 Copilot Group 规则

@@ -61,7 +61,7 @@ flowchart TD
 
 | 文件 | 说明 |
 |---|---|
-| `list_principals.py` | 第 1 步：列出指定组织 / 项目下的全部 SA 和 user（白名单候选），输出 CSV |
+| `list_principals.py` | 第 1 步：列出指定组织 / 项目下的全部主体（SA、user、Group 等，不看角色；白名单候选），输出 CSV |
 | `apply_bypass_rls.py` | 第 3 步：为一个白名单 Group 在目标表上设置 `FILTER USING (TRUE)` 规则 |
 | `apply_copilot_rls.py` | 第 7 步：为 Copilot Group 在每张表上设置一条按条件表过滤的规则 |
 | `rollback_rls.py` | 第 8 步：删除目标表上的 RLS 规则（按主体 / 规则名 / 全部） |
@@ -82,9 +82,9 @@ gcloud auth login admin@your-domain.com
 gcloud config set project your-quota-project
 
 # 3. 先演练（默认不做任何变更），确认日志后加 --apply 执行
-python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables tables.csv \
+python apply_bypass_rls.py --group group_existingsa_read@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb
-python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables tables.csv \
+python apply_bypass_rls.py --group group_existingsa_read@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply
 ```
 
@@ -120,8 +120,8 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 | 码 | 含义 |
 |---|---|
 | 0 | 成功 |
-| 1 | 部分失败或数据有问题（其余照常处理）：DDL 失败、验证失败、登记表记录冲突、条件表数据不规范、部分范围读取失败等 |
-| 2 | 参数错误 / 登记表不可用 / 无法确定执行账号或 quota 项目 / 执行时第一张表即报 Group 不存在 —— **未做任何变更** |
+| 1 | 部分失败或数据有问题（其余照常处理）：DDL 失败、验证失败、登记表记录冲突 / 表名格式不对、登记的表不存在、条件表数据不规范、部分范围读取失败等 |
+| 2 | 参数错误（含 apply_bypass 传入已删除的 `--tables` / `--datasets` / `--projects`）/ 登记表不可用 / 条件表缺 `status` 列或类型不对 / 无法确定执行账号或 quota 项目 / 执行时第一张表即报 Group 不存在 —— **未做任何变更** |
 | 130 | 被用户中断（Ctrl-C） |
 
 **日志前缀**：`[LOG]` 运行日志文件位置；`[AUTH]` 账号；`[SCAN]` 目标范围；`[CREATE]` / `[NOOP]` / `[REPLACE]` / `[DROP]` 逐表计划；`[SKIP]` 跳过（附原因）；
@@ -146,8 +146,9 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 |---|---|---|
 | `id` | STRING | 主键（不参与过滤） |
 | `sa` | STRING | 账号邮箱：**小写、裸邮箱**（不带 `user:` / `serviceAccount:` 前缀），与 `SESSION_USER()` 精确比较 |
-| `region`、`prdtype`、`refername` … | `ARRAY<STRING>`（REPEATED） | **维度**：除 `id`、`sa` 外的全部 `ARRAY<STRING>` 列都是维度（运行时读取表结构，以后加列不用改代码）；**NULL / 空数组 = 该维度全部可见** |
-| `status` 等 | 非数组列 | 不是维度，不参与过滤 |
+| `status` | INT64（**必须有**） | **只有 `status = 1` 的行生效**；0 / NULL / 其它值的行等同不存在（该账号查到 0 行）。改 `status` 立即生效，无需重跑脚本。缺少该列或类型不是 INT64 → `[ERROR]`，退出码 2，未做任何变更 |
+| `region`、`prdtype`、`refername` … | `ARRAY<STRING>`（REPEATED） | **维度**：除 `id`、`sa`、`status` 外的全部 `ARRAY<STRING>` 列都是维度（运行时读取表结构，以后加列不用改代码）；**NULL / 空数组 = 该维度全部可见** |
+| 其它非数组列 | — | 不是维度，不参与过滤 |
 
 ### 映射表 `adm_user_mem_copilot_tb_col_mapping`（apply_copilot 读取）
 
@@ -161,11 +162,12 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 
 | 列 | 说明 |
 |---|---|
-| `table_name` | 表名，**按原始字符串精确比较**（不做大小写 / 空格 / 反引号规范化），应写 `project.dataset.table` |
+| `table_name` | 表名，**按原始字符串精确比较**（不做大小写 / 空格 / 反引号规范化），应写 `project.dataset.table`（反引号可选） |
 | `rls_enabled` | `1` = 设置 RLS；其它值（0 / NULL / …）= 不设置 |
-| `status` 等 | 脚本不读 |
+| `status` 等 | 脚本不读（登记表的 `status` 与条件表的 `status` 无关） |
 
-同一 `table_name` 有多行且 `rls_enabled` 不一致 → `[WARN]` + `[SKIP]`，退出码 1。rollback_rls.py **不看**登记表（登记表改为 0 之后，正需要用它删除规则）。
+apply_bypass **只处理**登记表中 `rls_enabled = 1` 的表（不扫描项目 / 数据集）；apply_copilot 用它与映射表取交集。
+同一 `table_name` 有多行且 `rls_enabled` 不一致 → `[WARN]` + `[SKIP]`，退出码 1；`table_name` 不是三段格式 → apply_bypass `[WARN]` + `[SKIP]`，退出码 1。rollback_rls.py **不看**登记表（登记表改为 0 之后，正需要用它删除规则）。
 
 ---
 
@@ -173,7 +175,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 
 ### 1. list_principals.py：列出全部 SA 和 user（第 1 步）
 
-列出指定组织 / 项目下的**全部** SA 和 user，作为白名单候选，供客户审核后加入 ReadOnly / Writable Group。只读，不做任何变更。
+列出指定组织 / 项目下的**全部主体**（SA、user、Group 以及其它授权对象），**不看角色、不判断能否读 BigQuery 表数据**，作为白名单候选，供客户审核后加入 ReadOnly / Writable Group。只读，不做任何变更。
 **全部使用权威 API（不使用 Cloud Asset Inventory**——实测其 SA 搜索索引会漏账号）。
 
 **参数**
@@ -182,31 +184,58 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables table
 |---|---|
 | `--organizations` | 组织数字 ID（值或 .csv） |
 | `--projects` | Project ID（值或 .csv）；可与组织叠加，至少给一类 |
-| `--exclude-members` | 从输出中去掉这些邮箱 |
+| `--exclude-members` | 从输出中去掉这些邮箱（或 `allUsers`、`trip.com` 等原始值） |
 | `--exclude-patterns` | 从输出中去掉匹配通配符的邮箱，如 `'copilot-*@*'` |
 | `-o` | 输出 CSV，默认 `principals.csv` |
 | `--parallel` | 并发数，默认 16 |
 | `--gcloud-account` / `--quota-project` | 可选，见[快速开始](#执行账号与-quota-项目四个脚本相同均可不写) |
 
-**来源（取并集去重）**
+**从哪里列出谁**
 
-1. **SA 清单**：范围内每个 ACTIVE 项目用 IAM `serviceAccounts.list` 列出全部 SA（含已禁用、没有任何授权的）。组织范围先用 Resource Manager 递归列出全部文件夹和项目；待删除的项目跳过并 `[NOTE]`。
-2. **账号目录**（只在指定 `--organizations` 时）：Admin SDK Directory API 列出组织账号目录里的全部 user（含暂停 / 归档、所有域名）。
-3. **BigQuery 相关授权**：组织 / 文件夹 / 项目 IAM 策略（只指定项目时，同样读取该项目全部上级文件夹 / 组织的策略，不漏继承的授权；效果同 Console 项目 IAM 页面的「继承」行）、每个数据集的 ACL、每张表 / 视图的 IAM 策略；只纳入能读表数据的角色：含 `bigquery.tables.getData` 的角色，以及**基本角色 Owner / Editor / Viewer**（它们的 IAM 权限里没有这一项，但每个数据集的 ACL 默认带特殊组 `projectOwners` / `projectWriters` / `projectReaders`，项目的基本角色持有者借此能读表，所以一律按能读表处理，不管授在项目、文件夹还是组织上）。用于找出其它项目的 SA、外部域的 user、Google 服务代理（如默认在每个项目上有 Editor 的 `<项目编号>@cloudservices.gserviceaccount.com`）。其中的 Group 递归展开。
-4. **授权视图 / 数据集 / 例程**（只提示）：数据集 ACL 中授权了其它项目的视图 / 数据集 / 例程读取本数据集时，能查询它们的人也能间接读到数据；这些项目不在本次扫描范围内时打印 `[NOTE]` 列出，需要的话把它们加入 `--projects` 重跑。
+| # | 查哪里 | `--organizations` | `--projects` |
+|---|---|---|---|
+| 1 | 各项目的 SA 清单（IAM `serviceAccounts.list`） | 组织下全部 ACTIVE 项目的**全部 SA**（含已禁用、没有任何授权的）；**待删除项目**也尝试列出（实测：只有**直接**在该项目上有权限的账号能列出；只靠组织层继承权限的账号会得到 404，只打 `[NOTE]`，不算错误） | 指定项目的全部 SA |
+| 2 | 账号目录（Workspace / Cloud Identity） | **全部 user**（含暂停 / 归档、所有域名）和**全部 Group**（只列组名，不展开） | 不读 |
+| 3 | IAM 策略（Resource Manager `getIamPolicy`） | 组织、所有文件夹、所有 ACTIVE 项目 | 指定项目及其**全部上级文件夹 / 组织**（授在上级的角色继承到本项目） |
+| 4 | 数据集 ACL | 每个数据集 | 指定项目的每个数据集 |
+| 5 | 表 / 视图 IAM 策略 | 每张表 / 视图 | 指定项目的每张表 / 视图 |
+| 6 | 第 3–5 处出现的 Group | **展开一层**：直接成员中的 user / SA 列出；成员中的 Group 只列组名（嵌套组，不再展开） | 同左 |
 
-跳过 `deleted:`、`domain:`、`allUsers`、`allAuthenticatedUsers`、授权视图 / 例程 / 数据集等非具体账号。任何读取失败都 `[ERROR]` 并以退出码 1 结束（其余结果照常写入），绝不悄悄跳过。
+第 3–5 处**列出全部授权对象，不看角色**（只有 Browser、Job User、Metadata Viewer 等读不到数据的也列出），带条件的授权同样列出。非具体账号也写入 CSV：`domain:`（类型 `domain`）、`allUsers` / `allAuthenticatedUsers`（`public`）、`principal://` / `principalSet://`（`federated`）、`deleted:`（`deleted`，已删除账号残留的授权）。数据集 ACL 的 `projectOwners` / `projectWriters` / `projectReaders` 特殊组跳过（就是项目 IAM 中的 Owner / Editor / Viewer，第 3 处已列出）。
 
-**展不开的 Group**：一律作为 `principal_type = group` 写入 CSV（成员未展开），按域名分两类：
+**授权视图 / 数据集 / 例程**（只提示）：数据集 ACL 中授权了其它项目的视图 / 数据集 / 例程读取本数据集时，能查询它们的人也能间接读到数据；这些项目不在本次扫描范围内时打印 `[NOTE]` 列出，需要的话把它们加入 `--projects` 重跑。
+
+任何读取失败都 `[ERROR]` 并以退出码 1 结束（其余结果照常写入），绝不悄悄跳过。唯一例外：列出表之后、读取它的 IAM 之前表被删除（404）→ `[NOTE] 表已不存在（扫描期间被删除），跳过`，不影响退出码（表已不存在，它的授权也随之失效）。
+
+**展不开的 Group**（第 6 处）：照样写入 CSV，`source` 末尾注明未展开，按域名分两类：
 
 | Group | 处理 | 退出码 |
 |---|---|---|
-| 外部域（不属于本组织域名）：Cloud Identity 不允许读取其它组织的 Group，超级管理员也读不到 | `[NOTE]` | 不影响 |
-| 本组织域名的 Group 读不到（多半缺「群组 → 读取」权限），或展开出错（API 未启用、限流重试用尽等） | `[ERROR]` | 1 |
+| 外部域（不属于本组织域名）：Cloud Identity 不允许读取其它组织的 Group，超级管理员也读不到 | `[NOTE]`，`source` 末尾「（外部域，未展开）」 | 不影响 |
+| 本组织域名的 Group 读不到（多半缺「群组 → 读取」权限），或展开出错（API 未启用、限流重试用尽等） | `[ERROR]`，`source` 末尾「（未能展开）」 | 1 |
 
 本组织域名 = 组织的主域名（组织显示名称）+ 账号目录里 user 的域名（只在组织范围）+ 跑脚本账号的域名（SA 除外），日志 `[DOMAIN]` 行列出。只指定项目时不读账号目录，辅助域名（如 `ctrip.com`）的 Group 会按外部域处理（照样写入 CSV）。
 
-**输出**：CSV 三列 `email, principal_type, home_project`；`principal_type` ∈ `serviceAccount` / `user` / `serviceAgent` / `group`（展不开的 Group）；`home_project` 由 SA 邮箱反推（user / 服务代理 / group 为空）。
+**输出**：CSV 三列 `email, principal_type, source`：
+
+| 列 | 内容 |
+|---|---|
+| `email` | 邮箱；非邮箱的主体写原始值，如 `trip.com`、`allAuthenticatedUsers`、`principalSet://…`、`deleted:user:a@trip.com?uid=1` |
+| `principal_type` | `serviceAccount` / `serviceAgent`（Google 服务代理）/ `user` / `group` / `domain` / `public` / `federated` / `deleted` |
+| `source` | 在哪里、以什么角色被找到，多处用「；」分隔，最多列 5 处（超过时写「…共 N 处」） |
+
+`source` 的写法：`项目 SA: <项目>`（待删除项目加「（待删除项目）」）、`账号目录`、`账号目录 Group`、`组织 IAM: <角色>`、`文件夹 IAM folders/<id>: <角色>`、`项目 IAM <项目>: <角色>`、`数据集 ACL <项目.数据集>: <角色>`、`表 IAM <项目.数据集.表>: <角色>`、`Group 成员: <组>`（嵌套组加「（嵌套组，未展开）」）；带条件的授权加「（带条件）」。例如：
+
+```
+email,principal_type,source
+audit@trip.com,user,组织 IAM: roles/browser
+bi-sub@trip.com,group,Group 成员: bi-team@trip.com（嵌套组，未展开）
+etl@trip-prod.iam.gserviceaccount.com,serviceAccount,项目 SA: trip-prod；项目 IAM trip-prod: roles/bigquery.dataEditor
+partner@vendor.com,user,数据集 ACL trip-prod.dw: READER
+trip.com,domain,表 IAM trip-prod.dw.orders: roles/bigquery.dataViewer
+```
+
+客户可据此判断哪些要加白名单：例如 `audit@trip.com` 只有组织 Browser（读不到数据），可以不加；`partner@vendor.com` 能读 `trip-prod.dw`，要加。
 
 ```bash
 python list_principals.py --organizations 123456789012
@@ -229,21 +258,28 @@ FILTER USING (TRUE)
 | 参数 | 说明 |
 |---|---|
 | `--group`（必填） | 白名单 Group 邮箱，只能一个 |
-| `--registry-table`（必填） | 登记表 `project.dataset.table` |
-| `--tables` / `--datasets` / `--projects` | 目标范围（值或 .csv），可叠加，**至少给一类**；数据集 / 项目展开时只取普通表（视图跳过） |
+| `--registry-table`（必填） | 登记表 `project.dataset.table`：处理其中 `rls_enabled = 1` 的**全部**表 |
 | `--verify-sa` | 可选：执行后扮演该 Group 里的一个 SA 查表，300 秒内查到任意一行即通过；SA 无法扮演时立即失败 |
 | `--parallel` | 默认 16 |
 | `--apply` | 真正执行 |
 | `--gcloud-account` / `--quota-project` | 可选 |
 
-**双重保证**：最终表 = （`--tables` ∪ `--datasets` 展开 ∪ `--projects` 展开）**∩ 登记表 `rls_enabled = 1` 的表**。不在登记表 / 未开启的表逐张 `[SKIP]`（退出码不受影响）。
+**目标表 = 登记表中 `rls_enabled = 1` 的全部表**：不再扫描项目 / 数据集，耗时只与登记的表数有关（项目里有几万张表也不受影响）。
+`--tables` / `--datasets` / `--projects` 已删除，传入即参数错误（退出码 2）。`rls_enabled ≠ 1` 的表不处理，只在 `[SCAN]` 行汇总数量。
+
+| 登记表中的情况 | 结果 |
+|---|---|
+| 登记的表不存在（如已被 drop） | `[SKIP] 表不存在`，其余表照常，退出码 1 |
+| 登记了视图 | BigQuery 拒绝建规则（视图不支持 RLS），`[ERROR]`，其余表照常，退出码 1 |
+| `table_name` 不是 `project.dataset.table` | `[WARN]` + `[SKIP]`，退出码 1 |
+| 同一 `table_name` 多行且 `rls_enabled` 不一致 | `[WARN]` + `[SKIP]`，退出码 1 |
 
 **首次设置提示**：表上原本没有任何规则时，新建第一条会让其它未被授权的账号查到 0 行；这些表在日志中以 `[NOTE]` 列出（「将为以下这些表首次设置RLS规则」），只提示、不拦截。
 
 ```bash
-python apply_bypass_rls.py --group group_existingsa_read@trip.com --tables tables.csv \
+python apply_bypass_rls.py --group group_existingsa_read@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply
-python apply_bypass_rls.py --group group_existingsa_write@trip.com --datasets trip-prod.dw trip-prod.ods \
+python apply_bypass_rls.py --group group_existingsa_write@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply --verify-sa etl@trip-prod.iam.gserviceaccount.com
 ```
 
@@ -265,9 +301,9 @@ python apply_bypass_rls.py --group group_existingsa_write@trip.com --datasets tr
 
 **处理逻辑**
 
-1. **维度** = 条件表中除 `id`、`sa` 外的 `ARRAY<STRING>` 列。
+1. **维度** = 条件表中除 `id`、`sa`、`status` 外的 `ARRAY<STRING>` 列；条件表必须有 `status` 列（INT64），**只有 `status = 1` 的行生效**（缺列或类型不对 → `[ERROR]`，退出码 2，未做任何变更）。
 2. **选表**：映射表中 `to_name` 属于维度的行（一张表多行 = 多个维度）∩ 登记表 `rls_enabled = 1`；未开启 / 未登记的表 `[SKIP]`；登记为开启但没有任何校验维度的表 `[SKIP]`。映射列不存在 / 是数组 / 是 RECORD → 跳过该表；表本身不存在（如已被 drop）→ `[SKIP] 表不存在`，其余表照常，退出码 1。
-3. **每张表一条规则**，`GRANT TO ("group:<group>")`，过滤条件与客户 sample 写法相同——每个维度一段、多段 AND：
+3. **每张表一条规则**，`GRANT TO ("group:<group>")`，过滤条件与客户 sample 写法相同——每个维度一段、多段 AND，每个子查询都带 `c.status = 1`：
 
 ```sql
 CREATE OR REPLACE ROW ACCESS POLICY `rls_copilot_group_copilot_trip_com`
@@ -275,12 +311,12 @@ ON `trip-prod.dw.orders`
 GRANT TO ("group:group_copilot@trip.com")
 FILTER USING (
   (`region` IN (SELECT v FROM `trip-bq-admin.bq_auth.adm_user_mem_copilot_condition` AS c, UNNEST(c.region) AS v
-                WHERE c.sa = SESSION_USER())
+                WHERE c.status = 1 AND c.sa = SESSION_USER())
    OR EXISTS (SELECT 1 FROM `trip-bq-admin.bq_auth.adm_user_mem_copilot_condition` AS c
-              WHERE c.sa = SESSION_USER() AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0)))
+              WHERE c.status = 1 AND c.sa = SESSION_USER() AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0)))
   AND
-  (`prd_type` IN (SELECT v FROM `…condition` AS c, UNNEST(c.prdtype) AS v WHERE c.sa = SESSION_USER())
-   OR EXISTS (SELECT 1 FROM `…condition` AS c WHERE c.sa = SESSION_USER() AND (c.prdtype IS NULL OR ARRAY_LENGTH(c.prdtype) = 0)))
+  (`prd_type` IN (SELECT v FROM `…condition` AS c, UNNEST(c.prdtype) AS v WHERE c.status = 1 AND c.sa = SESSION_USER())
+   OR EXISTS (SELECT 1 FROM `…condition` AS c WHERE c.status = 1 AND c.sa = SESSION_USER() AND (c.prdtype IS NULL OR ARRAY_LENGTH(c.prdtype) = 0)))
 )
 ```
 
@@ -292,12 +328,13 @@ FILTER USING (
 |---|---|
 | 新增账号（加入 Group + 条件表加一行） | **不用** |
 | 修改某账号的可见范围（改条件表） | **不用**（实时生效） |
-| 撤销账号（移出 Group 或删除条件表行） | **不用** |
+| 撤销账号（移出 Group、删除条件表行，或把 `status` 改为非 1） | **不用** |
+| 恢复账号（`status` 改回 1） | **不用** |
 | 新增业务表、改映射维度、登记表开启新表、条件表新增维度列 | 要（只会 CREATE / REPLACE 有变化的表，其余 NOOP） |
 
-**账号生效的前提**（脚本不检查，由客户维护）：① 账号在 `--group` 里；② 条件表里有该账号的行；③ `--group` 对条件表有读权限（BigQuery 以查询者身份执行子查询；因此组内成员能读到整张条件表）。
+**账号生效的前提**（脚本不检查，由客户维护）：① 账号在 `--group` 里；② 条件表里有该账号 `status = 1` 的行；③ `--group` 对条件表有读权限（BigQuery 以查询者身份执行子查询；因此组内成员能读到整张条件表）。
 
-**数据校验**（只提醒，规则照建）：条件表 `sa` 值非小写 / 有首尾空白 / 带前缀 / 不是邮箱（这些账号永远匹配不到，查到 0 行）、同一 `sa` 多行（各维度独立判断会出现交叉组合）→ `[WARN]`、退出码 1；条件表为空 → `[NOTE]`。
+**数据校验**（只提醒，规则照建；**只看 `status = 1` 的行**）：条件表 `sa` 值非小写 / 有首尾空白 / 带前缀 / 不是邮箱（这些账号永远匹配不到，查到 0 行）、同一 `sa` 多行（各维度独立判断会出现交叉组合）→ `[WARN]`、退出码 1；没有 `status = 1` 的行 → `[NOTE]`。另打印 `[NOTE] 条件表共 N 行，其中 status = 1 的 M 行生效`。
 
 **输出**：审核 CSV，每张表一行，只含 CREATE / REPLACE：`table, policy_name, action, dimensions, filter, note`（执行模式另加 `result`）；REPLACE 时 `note` 记录旧内容。
 
@@ -343,7 +380,7 @@ python rollback_rls.py --tables tables.csv --apply                              
 | # | 在哪里 | 授予跑脚本的 user / SA | 用于 |
 |---|---|---|---|
 | 1 | quota 项目（APIs & Services） | 启用 API：`cloudresourcemanager`、`iam`、`bigquery`、`cloudidentity`、`admin`、`iamcredentials` | 全部脚本 |
-| 2 | admin.google.com（Workspace / Cloud Identity） | 自定义管理员角色，只勾 **Users → Read**、**Groups → Read** | 第 1 步：列出账号目录中的 user、展开 Group 成员 |
+| 2 | admin.google.com（Workspace / Cloud Identity） | 自定义管理员角色，只勾 **Users → Read**、**Groups → Read** | 第 1 步：列出账号目录中的 user 和 Group、展开 Group 成员 |
 | 3 | 组织层级 IAM | **Browser**、**Security Reviewer**、**BigQuery Metadata Viewer** | 第 1 步：遍历项目、列出 SA、读取各层级 IAM 与 BigQuery 授权 |
 | 4 | quota 项目 IAM | **Service Usage Consumer** | 全部脚本：以 quota 项目的名义调用 API（缺少时所有调用报 403 `USER_PROJECT_DENIED`） |
 | 5 | quota 项目 IAM | **BigQuery Job User** | 第 3、7、8 步：运行查询与 DDL |
@@ -366,8 +403,7 @@ python rollback_rls.py --tables tables.csv --apply                              
 - **Copilot Group 成员能读整张条件表**：规则里的子查询以查询者身份执行，所以 Copilot Group 必须有条件表的读权限，组内每个账号因此都能看到所有账号的可见范围。这是 BigQuery 子查询规则的固有特性（被规则引用的表不能再加 RLS），请知悉。
 - **REPLACE 时有极短的无过滤窗口**：规则内容变化时脚本用 `CREATE OR REPLACE ROW ACCESS POLICY` 覆盖。若该表上只有这一条规则，BigQuery 官方说明替换瞬间可能短暂不过滤。首次设置或 NOOP 不受影响；如需避免，可在业务低峰执行。
 - **rollback 不要与 apply 同时对同一批表运行**：rollback 先读取规则再删除，「这张表的规则将被全部删除」的判断在读取时做出；同时有 apply 在建规则时，判断可能与执行时的实际情况不一致。
-- **list_principals 的覆盖范围**：不列出 `domain:`（整个域）、`allUsers` / `allAuthenticatedUsers`（公开）、`principal://` / `principalSet://`（Workforce / Workload Identity Federation）这类非具体账号的授权；不扫描 Analytics Hub 订阅（linked dataset）和其它组织中的授权视图。基本角色一律按能读表处理，个别数据集若删掉了默认特殊组，会多列几个其实读不到这些表的人（宁可多列）。
-- **list_principals 读不到某个自定义角色的定义时按「能读表数据」处理**：打印 `[WARN]`，其成员照常列入 CSV，退出码不因此变为 1。这是有意的「宁可多列、不可漏列」，与其它读取失败（`[ERROR]` + 退出码 1）不同。
+- **list_principals 的覆盖范围**：嵌套组只列组名，其成员不逐个列出；用公司域名注册、但不受公司管理的个人 Google 账号（不在账号目录里）只有出现在授权记录或 Group 成员中时才会列出——完整名单请管理员在 Admin 控制台的「非受管用户转移工具」中导出；用 `--projects` 跑时，通过 `domain:` 授权的 user 只体现为一行 `domain`；不扫描 Analytics Hub 订阅（linked dataset）和其它组织中的授权视图。
 - **映射表 `col_name` 不区分大小写**：与 BigQuery 列名规则一致（`Region` 与 `region` 视为同一列），生成的过滤条件使用表中的真实写法。
 - **Group 写错或刚创建尚未同步**：执行时 BigQuery 报「Group … does not exist」，脚本不再等待重试——第一张需要变更的表失败即停止，其余表都不执行（退出码 2，未做任何变更）。Group 刚创建或刚改过成员时，等几分钟后重跑即可。演练不执行 DDL，发现不了这类问题。
 

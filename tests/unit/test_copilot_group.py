@@ -98,15 +98,16 @@ class TestNormal:
         cond = COND
         assert world.ddl_log == [
             f"CREATE OR REPLACE ROW ACCESS POLICY `{POL}`\nON `{T2}`\nGRANT TO (\"{GRANTEE}\")\nFILTER USING ("
-            f"(`market` IN (SELECT v FROM `{cond}` AS c, UNNEST(c.region) AS v WHERE c.sa = SESSION_USER()) "
-            f"OR EXISTS (SELECT 1 FROM `{cond}` AS c WHERE c.sa = SESSION_USER() "
+            f"(`market` IN (SELECT v FROM `{cond}` AS c, UNNEST(c.region) AS v WHERE c.status = 1 AND c.sa = SESSION_USER()) "
+            f"OR EXISTS (SELECT 1 FROM `{cond}` AS c WHERE c.status = 1 AND c.sa = SESSION_USER() "
             f"AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0))))"]
 
-    def test_c_n_03_multi_dimension_and_and_no_status(self, world, tmp_path):
+    def test_c_n_03_multi_dimension_and_and_status_1(self, world, tmp_path):
         run(tmp_path, "--tables", T1, "--apply")
         flt = world.policy(T1, POL)["filter"]
-        assert flt.count(" AND (") >= 2 and "UNNEST(c.region)" in flt and "UNNEST(c.prdtype)" in flt
-        assert "UNNEST(c.refername)" in flt and "status" not in flt          # Q3：status 不生效
+        assert flt.count(") AND (") >= 2 and "UNNEST(c.region)" in flt and "UNNEST(c.prdtype)" in flt
+        assert "UNNEST(c.refername)" in flt
+        assert flt.count("c.status = 1 AND c.sa = SESSION_USER()") == 6       # 只有 status = 1 的行生效
 
     def test_c_n_04_non_string_column_cast(self, world, tmp_path):
         run(tmp_path, "--tables", T3, "--apply")
@@ -290,7 +291,32 @@ class TestAbnormal:
     def test_c_a_12_condition_table_without_sa_column(self, world, tmp_path):
         world.condition_fields[COND] = [f for f in DIM3 if f[0] != "sa"]
         code, _ = run(tmp_path, "--apply")
-        assert code == 1 and world.ddl_log == []
+        assert code == 2 and world.ddl_log == []                           # 表结构问题：未做任何变更
+
+    @pytest.mark.parametrize("status_field", [None, ("status", "STRING", "NULLABLE"), ("status", "BOOL", "NULLABLE")])
+    def test_c_a_12b_condition_table_status_column_missing_or_wrong_type(self, world, tmp_path, capsys, status_field):
+        world.condition_status_column = False
+        world.condition_fields[COND] = [f for f in DIM3 if f[0] != "status"] + ([status_field] if status_field else [])
+        code, _ = run(tmp_path, "--apply")
+        err = capsys.readouterr().err
+        assert code == 2 and world.ddl_log == [] and "status" in err and "未做任何变更" in err
+
+    def test_c_a_12c_only_status_1_rows_checked_and_counted(self, world, tmp_path, capsys):
+        world.condition_sas[COND] = [SA_A]                                    # status = 1
+        world.condition_inactive[COND] = ["Bad Value", SA_A, U_B]              # status ≠ 1：不检查、不算重复
+        code, _ = run(tmp_path, "--apply")
+        err = capsys.readouterr().err
+        assert code == 0 and "[WARN]" not in err
+        assert "[NOTE] 条件表共 4 行，其中 status = 1 的 1 行生效，其余 3 行（status 为 0 / NULL / 其它值）不生效" in err
+        assert "[PRINCIPAL] 条件表中 status = 1 的 sa 共 1 个" in err
+
+    def test_c_a_12d_no_active_rows_note_rules_still_built(self, world, tmp_path, capsys):
+        world.condition_sas[COND] = []
+        world.condition_inactive[COND] = [SA_A]
+        code, _ = run(tmp_path, "--apply")
+        err = capsys.readouterr().err
+        assert code == 0 and world.ddl_log
+        assert "[NOTE] 条件表中没有 status = 1 的 sa 记录：规则照建，但组内成员都会查到 0 行" in err
 
     def test_c_a_13_condition_table_without_dimensions(self, world, tmp_path):
         world.condition_fields[COND] = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"), ("status", "INTEGER", "NULLABLE")]

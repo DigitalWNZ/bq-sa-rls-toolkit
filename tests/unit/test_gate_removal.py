@@ -130,7 +130,7 @@ class TestCopilotNoBypassGate:
     def test_g_c_06_bypass_added_later_restores_existing_accounts(self, world, tmp_path):
         """先建 Copilot 规则（现存账号查到 0 行），再用 apply_bypass_rls.py 补 bypass：无需首条策略确认。"""
         copilot(tmp_path, "--apply")
-        assert bypass("--tables", T1, "--apply") == 0
+        assert bypass("--apply") == 0
         assert world.policy(T1, BYP) is not None and world.policy(T1, COP_A) is not None
 
     def test_g_c_07_exit_2_only_for_param_or_registry_errors(self, world, tmp_path):
@@ -184,7 +184,7 @@ class TestCopilotRegistry:
 
     def test_g_r_07_registry_read_once(self, world, tmp_path):
         copilot(tmp_path)
-        assert world.calls["query"] == 3          # 条件表 sa + 映射表 + 登记表各一次
+        assert world.calls["query"] == 4          # 条件表行数 + 条件表 sa + 映射表 + 登记表各一次
 
     def test_g_r_08_skipped_tables_not_read(self, world, tmp_path):
         copilot(tmp_path)
@@ -226,25 +226,27 @@ class TestCopilotNoAuthTableProtection:
 # =========================================================================== #
 class TestBypassNoFirstPolicyGate:
     def test_g_b_01_apply_creates_first_policy_without_flag(self, world, capsys):
-        code = bypass("--tables", f"{T1},{T2}", "--apply")
+        code = bypass("--apply")
         err = capsys.readouterr().err
         assert code == 0 and world.policy(T1, BYP) is not None and world.policy(T2, BYP) is not None
         assert FIRST_MSG in err and "如确认" not in err
 
     def test_g_b_02_force_first_policy_flag_removed(self, world):
         with pytest.raises(SystemExit) as e:
-            bypass("--tables", T1, "--force-first-policy", "--apply")
+            bypass("--force-first-policy", "--apply")
         assert e.value.code == 2
 
     def test_g_b_03_first_policy_list_sorted_note_only(self, world, capsys):
         world.policies(T1).append(other_rule())
-        code = bypass("--tables", f"{T3},{T2},{T1}")
+        code = bypass()
         err = capsys.readouterr().err
         assert code == 0 and listed_after(err, FIRST_MSG) == [T2, T3]          # 按表名排序，已有 RLS 的 T1 不在内
 
     def test_g_b_04_no_list_when_all_tables_have_rls(self, world, capsys):
-        world.policies(T1).append(other_rule())
-        assert bypass("--tables", T1, "--apply") == 0
+        for t in world.tables:
+            if any(r["table_name"] == t and r["rls_enabled"] == 1 for r in world.registry_rows[REG]):
+                world.policies(t).append(other_rule())
+        assert bypass("--apply") == 0
         assert FIRST_MSG not in capsys.readouterr().err
 
 

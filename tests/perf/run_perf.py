@@ -161,11 +161,11 @@ def create_tables(n, workers):
 def create_auth_tables(n_tables, new):
     q = lambda sql: L.bq().query(sql, location=L.LOCATION).result()  # noqa: E731
     q(f"CREATE OR REPLACE TABLE `{T_COND}` (id STRING, sa STRING, region ARRAY<STRING>, prdtype ARRAY<STRING>, "
-      f"refername ARRAY<STRING>) CLUSTER BY sa")
+      f"refername ARRAY<STRING>, status INT64) CLUSTER BY sa")
     regions = ["HK", "SG", "US"]
     for start in range(0, len(new), 200):
-        rows = ", ".join(f"('c{i}', '{e}', ['{regions[i % 3]}'], [], [])" for i, e in enumerate(new[start:start + 200], start))
-        q(f"INSERT INTO `{T_COND}` (id, sa, region, prdtype, refername) VALUES {rows}")
+        rows = ", ".join(f"('c{i}', '{e}', ['{regions[i % 3]}'], [], [], 1)" for i, e in enumerate(new[start:start + 200], start))
+        q(f"INSERT INTO `{T_COND}` (id, sa, region, prdtype, refername, status) VALUES {rows}")
     maps = [f"STRUCT('{tbl(i)}' AS table_name, '{c}' AS col_name, '{d}' AS to_name)"
             for i in range(n_tables) for c, d in table_dims(i, n_tables)]
     q(f"CREATE OR REPLACE TABLE `{T_MAP}` AS SELECT * FROM UNNEST([{', '.join(maps)}])")
@@ -237,10 +237,7 @@ def main():
     auth = ["--condition-table", T_COND, "--mapping-table", T_MAP, "--registry-table", T_REG, "--group", G_COP]
     tmp = "/tmp/rls_perf"
     os.makedirs(tmp, exist_ok=True)
-    tables_file = f"{tmp}/tables.csv"                         # 第 3 步：--tables 传 .csv 文件（全部业务表）+ 登记表
-    with open(tables_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(tbl(i) for i in range(a.tables)) + "\n")
-    byp = ["--tables", tables_file, "--registry-table", T_REG]
+    byp = ["--registry-table", T_REG]                          # 第 3 步：只看登记表（全部业务表都登记为 rls_enabled = 1）
     n_dim_tables = sum(1 for i in range(a.tables) if table_dims(i, a.tables))
     last = {}
 

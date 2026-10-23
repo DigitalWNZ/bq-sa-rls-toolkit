@@ -8,16 +8,14 @@
   GRANT TO ("group:<group>") FILTER USING (TRUE)
 一次只处理一个 Group（--group），ReadOnly、Writable 各运行一次。
 
-目标表（可叠加；每个参数的值可直接写（逗号 / 空格分隔），也可写单列无表头的 .csv 文件，可混用）:
-  --tables     project.dataset.table（反引号可选，如 `trip-prod.dw.orders`；不支持 project:dataset.table）
-  --datasets   project.dataset（展开为其中全部表）
-  --projects   Project ID（展开为项目内全部表）
-  三类至少给出一类（任给其一即可），都不给则报错（退出码 2）。
-
-双重保证: 最终表 = (--tables ∪ --datasets 展开 ∪ --projects 展开) ∩ 登记表中 rls_enabled = 1 的表。
+目标表 = 登记表中 rls_enabled = 1 的全部表（不再扫描项目 / 数据集，耗时与项目大小无关）:
   --registry-table 必填：登记表（adm_user_mem_copilot_tb），只读 table_name、rls_enabled 两列（不看 status）；
-  table_name 按原始字符串精确比较；不在登记表或 rls_enabled ≠ 1 的表逐张打印 [SKIP]，不授权（退出码不受影响）；
-  同一 table_name 有多行且 rls_enabled 不一致 -> [WARN] + [SKIP]，退出码 1。
+  table_name 须为 project.dataset.table（反引号可选），格式不对 -> [WARN] + [SKIP]，退出码 1；
+  同一 table_name 有多行且 rls_enabled 不一致 -> [WARN] + [SKIP]，退出码 1；
+  rls_enabled ≠ 1 的表不处理，只在 [SCAN] 行汇总数量；
+  登记表里有、但表实际不存在（如已被 drop）-> [SKIP] 表不存在，其余表照常，退出码 1；
+  登记了视图 -> BigQuery 拒绝建规则（视图不支持 RLS），[ERROR]，退出码 1。
+  不再支持 --tables / --datasets / --projects（传入即参数错误，退出码 2）。
 逐表判断: 无同名规则 -> [CREATE]；同名且内容相同 -> [NOOP]；同名但内容不同 -> [REPLACE]（日志打印被覆盖的旧内容）。
 首次设置提示: 表上原本没有任何 RLS 时，新建第一条会让未被授权的账号查到 0 行；
   这些表会在日志中列出（「将为以下这些表首次设置RLS规则」），只作提示，不拦截。
@@ -26,13 +24,13 @@
 运行日志: 屏幕输出原样另存到 logs/apply_bypass_rls_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录）。
 
 示例:
-  python apply_bypass_rls.py --group group_existingsa_read@domain.com --tables tables.csv \\
+  python apply_bypass_rls.py --group group_existingsa_read@domain.com \\
       --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb
   python apply_bypass_rls.py ... --apply --verify-sa reader@prod.iam.gserviceaccount.com
 
 Group 不存在: 执行时 BigQuery 报「Group … does not exist」→ 不等待重试，立即停止（第一张需要变更的表先单独执行，
   它失败则其余表都不执行，退出码 2）。Group 刚创建 / 刚改成员时等几分钟后重跑。
-退出码: 0 成功；1 DDL 执行失败 / 验证失败 / 登记表记录冲突；2 参数错误 / 登记表不可用 / 第一张表即报 Group 不存在（未做任何变更）
+退出码: 0 成功；1 DDL 执行失败 / 验证失败 / 登记表记录冲突或表名格式不对 / 表不存在；2 参数错误 / 登记表不可用 / 第一张表即报 Group 不存在（未做任何变更）
 """
 
 import argparse
@@ -55,14 +53,17 @@ def log_first_policy_tables(tables):
 
 
 # --------------------------------------------------------------------------- #
-# 与 rollback_rls.py 共用的参数 / 辅助
+# 参数 / 辅助（add_scope_args、read_scope 只给 rollback_rls.py 用：apply_bypass_rls 只看登记表）
 # --------------------------------------------------------------------------- #
+PARALLEL_HELP = "同时处理的表数（默认 16；实测 32 以内 DDL 吞吐线性增长、无后端错误，48 时 BigQuery 开始大量返回暂时性错误，建议不超过 32）"
+
+
 def add_scope_args(p):
     p.add_argument("--tables", nargs="*", action="extend", default=[],
                    help="project.dataset.table（反引号可选），逗号或空格分隔；也可写 .csv 文件（单列无表头）")
     p.add_argument("--datasets", nargs="*", action="extend", default=[], help="project.dataset（展开为其中全部表）；也可写 .csv 文件")
     p.add_argument("--projects", nargs="*", action="extend", default=[], help="Project ID（展开为项目内全部表）；也可写 .csv 文件")
-    p.add_argument("--parallel", type=int, default=16, help="同时处理的表数（默认 16；实测 32 以内 DDL 吞吐线性增长、无后端错误，48 时 BigQuery 开始大量返回暂时性错误，建议不超过 32）")
+    p.add_argument("--parallel", type=int, default=16, help=PARALLEL_HELP)
 
 
 def read_scope(args):
@@ -187,9 +188,9 @@ def run_main(fn, argv):
 def _main(argv):
     p = argparse.ArgumentParser(description="为一个白名单 Group 设置 FILTER TRUE 行级规则", allow_abbrev=False)
     p.add_argument("--group", required=True, help="白名单 Group 邮箱（只能一个）")
-    add_scope_args(p)
     p.add_argument("--registry-table", required=True,
-                   help="登记表 project.dataset.table（adm_user_mem_copilot_tb）：只有其中 rls_enabled = 1 的表才授权")
+                   help="登记表 project.dataset.table（adm_user_mem_copilot_tb）：处理其中 rls_enabled = 1 的全部表")
+    p.add_argument("--parallel", type=int, default=16, help=PARALLEL_HELP)
     p.add_argument("--quota-project", default=None, help="quota / 运行查询与 DDL 的项目（默认 gcloud 默认项目，其次 application-default 凭证的 quota 项目）")
     p.add_argument("--verify-sa", default=None,
                    help="挂载后验证用的 SA（在该 Group 中、有表读权限、执行账号可扮演）：300 秒内查到任意一行即通过")
@@ -208,13 +209,9 @@ def _main(argv):
         grantee = f"group:{group}"
         policy_name = core.bypass_policy_name(group)
         core.build_policy_ddl("p.d.t", policy_name, [grantee], "TRUE")   # 提前校验 Group 邮箱
-        tables, datasets, projects, _ = read_scope(args)
         registry = core.parse_table_arg(args.registry_table)
     except (ValueError, OSError) as e:
         ops.log(f"[ERROR] {e}")
-        return 2
-    if not (tables or datasets or projects):
-        ops.log("[ERROR] 请指定 --tables、--datasets、--projects 中的至少一项")
         return 2
 
     try:
@@ -232,25 +229,34 @@ def _main(argv):
         ops.log(f"[ERROR] {e}")
         return 2
 
-    try:
-        scope_list = ops.expand_tables(ctx, tables, datasets, projects)
-    except Exception as e:  # noqa: BLE001
-        ops.log(f"[ERROR] 展开目标表失败: {e}")
-        return 1
-    table_list, conflicts = filter_by_registry(scope_list, status, registry)
-    skipped = len(scope_list) - len(table_list)
-    ops.log(f"[SCAN] 目标范围 {len(scope_list)} 张表；登记表中已开启 {len(table_list)} 张，跳过 {skipped} 张")
+    # 目标表 = 登记表中 rls_enabled = 1 的全部表
+    table_list, bad_names, conflicts, n_disabled = core.registry_targets(status)
+    for name in bad_names:
+        ops.log(f"[WARN] 登记表 table_name {name!r} 不是 project.dataset.table 格式")
+        ops.log(f"[SKIP] {name}: 登记表表名格式不对，不授权")
+    for name in conflicts:
+        ops.log(f"[WARN] {name}: 登记表中有多条记录且 rls_enabled 不一致（既有 1 又有其它值），按未开启处理")
+        ops.log(f"[SKIP] {name}: 登记表记录冲突，不授权")
+    ops.log(f"[SCAN] 登记表中 rls_enabled = 1 的表 {len(table_list)} 张；rls_enabled ≠ 1 的 {n_disabled} 张不处理")
 
-    # 阶段 1：并行读取现有规则（只读取本规则名的授权对象），生成计划
-    failed = conflicts > 0
+    # 阶段 1：并行读取现有规则（只读取本规则名的授权对象），生成计划；表不存在 -> [SKIP]
+    failed = bool(bad_names or conflicts)
+    skipped = len(bad_names) + len(conflicts)
+
+    def plan_table(t):
+        if not ops.table_exists(ctx, t):
+            return None
+        return core.plan_upsert(ops.list_policies(ctx, t, grantees_for={policy_name}), policy_name, "TRUE", [grantee])
+
     plans = {}
-    for t, pl, err in ops.parallel_map(
-            lambda t: core.plan_upsert(ops.list_policies(ctx, t, grantees_for={policy_name}),
-                                       policy_name, "TRUE", [grantee]),
-            table_list, workers=workers(args), desc="plan"):
+    for t, pl, err in ops.parallel_map(plan_table, table_list, workers=workers(args), desc="plan"):
         if err:
             failed = True
             ops.log(f"[ERROR] {t}: 读取现有规则失败: {err}")
+        elif pl is None:
+            failed = True
+            skipped += 1
+            ops.log(f"[SKIP] {t}: {core.TABLE_NOT_FOUND_MSG}")
         else:
             plans[t] = pl
 

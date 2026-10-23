@@ -386,11 +386,18 @@ def read_registry_rows(ctx, registry_table):
 
 
 def condition_sa_counts(ctx, condition_table):
-    """条件表 sa 列 {原值: 行数}（不做任何规范化；NULL 和空串除外）。"""
+    """条件表中 status = 1（生效）的行：sa 列 {原值: 行数}（不做任何规范化；NULL 和空串除外）。"""
     t = core.fq(condition_table)
-    rows = run_query(ctx, f"SELECT sa, COUNT(*) AS n FROM `{t}` WHERE sa IS NOT NULL AND TRIM(sa) != '' GROUP BY sa",
-                     ctx.table_location(t))
+    rows = run_query(ctx, f"SELECT sa, COUNT(*) AS n FROM `{t}` WHERE status = 1 AND sa IS NOT NULL AND TRIM(sa) != '' "
+                          "GROUP BY sa", ctx.table_location(t))
     return {r["sa"]: r["n"] for r in rows}
+
+
+def condition_row_counts(ctx, condition_table):
+    """条件表 (总行数, status = 1 的行数)。"""
+    t = core.fq(condition_table)
+    r = run_query(ctx, f"SELECT COUNT(*) AS total, COUNTIF(status = 1) AS active FROM `{t}`", ctx.table_location(t))[0]
+    return r["total"], r["active"]
 
 
 # --------------------------------------------------------------------------- #
@@ -525,21 +532,6 @@ def group_members_typed(ctx, group_email, reasons=None):
     return out
 
 
-def expand_group(ctx, group_email, max_depth=10):
-    """
-    递归展开 Group（含嵌套组）-> (members, unresolved, reasons)。
-    unresolved [(group, via)]：读不到的组（含最外层的组本身，此时 via 为 []）；reasons {group: 原因}。
-    """
-    cache, reasons = {}, {}
-
-    def fetch(g):
-        if g not in cache:
-            cache[g] = group_members_typed(ctx, g, reasons)
-        return cache[g]
-    members, unresolved = core.expand_group(group_email, fetch, max_depth=max_depth)
-    return members, unresolved, reasons
-
-
 # --------------------------------------------------------------------------- #
 # list_principals：全部使用权威 API（不使用 Cloud Asset，其搜索索引可能漏掉资源）
 # --------------------------------------------------------------------------- #
@@ -622,6 +614,17 @@ def directory_users(ctx, customer):
     return [u["primaryEmail"].lower() for u in users if u.get("primaryEmail")]
 
 
+def directory_groups(ctx, customer):
+    """账号目录里的全部 Group 邮箱（Cloud Identity groups.list，需要「群组 → 读取」管理员权限）。"""
+    api = ctx.ci.groups()
+    out, req = [], api.list(parent=f"customers/{customer}", view="BASIC", pageSize=500)
+    while req is not None:
+        resp = execute_with_backoff(req, desc=f"list groups {customer}")
+        out.extend(g["groupKey"]["id"].lower() for g in resp.get("groups", []) if g.get("groupKey", {}).get("id"))
+        req = api.list_next(req, resp)
+    return out
+
+
 def resource_iam_bindings(ctx, resource):
     """organizations/<id> / folders/<id> / projects/<id> 的 IAM 策略 bindings（requestedPolicyVersion 3，含条件绑定）。"""
     crm = ctx._build("cloudresourcemanager", "v3")
@@ -663,13 +666,6 @@ def table_iam_bindings(ctx, table):
     return pol.get("bindings", [])
 
 
-def role_permissions(ctx, role):
-    """角色包含的权限（预定义 / 基本角色 roles/...；自定义角色 organizations/x/roles/y、projects/p/roles/y）。"""
-    iam = ctx._build("iam", "v1")
-    if role.startswith("organizations/"):
-        req = iam.organizations().roles().get(name=role)
-    elif role.startswith("projects/"):
-        req = iam.projects().roles().get(name=role)
-    else:
-        req = iam.roles().get(name=role)
-    return set(execute_with_backoff(req, desc=f"get role {role}").get("includedPermissions", []))
+def is_not_found_error(e):
+    """BigQuery 返回 404（资源不存在）：googleapiclient 的 HttpError 404，或 google-cloud 客户端的 NotFound。"""
+    return isinstance(e, NotFound) or (isinstance(e, HttpError) and e.resp.status == 404)

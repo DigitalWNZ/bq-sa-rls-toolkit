@@ -43,13 +43,15 @@ def _create_tables():
     _q(f"""CREATE OR REPLACE TABLE `{L.T_PART}` PARTITION BY dt OPTIONS (require_partition_filter = TRUE) AS
            SELECT DATE '2026-01-01' AS dt, * FROM UNNEST([{_values_sql()}])""")
     _q(f"""CREATE OR REPLACE TABLE `{L.T_COND}`
-           (id STRING, sa STRING, region ARRAY<STRING>, prdtype ARRAY<STRING>, refername ARRAY<STRING>)
+           (id STRING, sa STRING, region ARRAY<STRING>, prdtype ARRAY<STRING>, refername ARRAY<STRING>, status INT64)
            CLUSTER BY sa""")
-    _q(f"""INSERT INTO `{L.T_COND}` (id, sa, region, prdtype, refername) VALUES
-           ('c1', '{L.SA_COP_A}', ['HK'], [], []),
-           ('c2', '{L.SA_COP_B}', [], [], []),
-           ('c3', '{L.ACCOUNT}', ['SG'], [], []),
-           ('c4', '{L.SA_COP_M}', ['HK'], ['mobile'], [])""")
+    # status = 1 才生效；c5 是停用的行（status = 0），RLS 子查询应当忽略它
+    _q(f"""INSERT INTO `{L.T_COND}` (id, sa, region, prdtype, refername, status) VALUES
+           ('c1', '{L.SA_COP_A}', ['HK'], [], [], 1),
+           ('c2', '{L.SA_COP_B}', [], [], [], 1),
+           ('c3', '{L.ACCOUNT}', ['SG'], [], [], 1),
+           ('c4', '{L.SA_COP_M}', ['HK'], ['mobile'], [], 1),
+           ('c5', '{L.SA_COP_A}', [], [], [], 0)""")
     _q(f"""CREATE OR REPLACE TABLE `{L.T_MAPPING}` AS SELECT * FROM UNNEST([
            STRUCT('{L.T_ORDERS}' AS table_name, 'region' AS col_name, 'region' AS to_name),
            STRUCT('{L.T_ORDERS}', 'prd_type', 'prdtype'),
@@ -168,6 +170,8 @@ def world():
     readers = [L.SA_READER, L.SA_COP_A, L.SA_COP_B, L.SA_COP_N, L.SA_COP_M]
     _dataset_access(L.DATASET, [("READER", "userByEmail", e) for e in readers]
                     + [("WRITER", "userByEmail", L.SA_ETL), ("READER", "groupByEmail", L.G_ACL)])
+    # no_bypass_t 也登记为开启：apply_bypass 会处理它，--verify-sa 用的 reader 需要能读它
+    _dataset_access(L.NB_DATASET, [("READER", "userByEmail", L.SA_READER)])
     # 条件表所在数据集：Copilot Group 需要读条件表（RLS 子查询以查询者身份执行）
     _dataset_access(L.AUTH_DATASET, [("READER", "groupByEmail", L.G_COPILOT)])
     for who in (L.SA_READER, L.SA_ETL, L.SA_COP_A, L.SA_COP_M):

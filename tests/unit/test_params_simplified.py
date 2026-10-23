@@ -123,16 +123,29 @@ class TestParseFunctions:
 # 合并后的列表参数（各脚本）
 # =========================================================================== #
 class TestMergedListParams:
-    def test_bypass_tables_values_file_mixed(self, world, tmp_path):
-        f = write(tmp_path, "t.csv", [T2, bq(T3)])
-        assert bypass("--tables", T1, f, "--apply") == 0
-        assert all(world.policy(t, BYP) for t in (T1, T2, T3))
+    def test_bypass_scope_flags_removed(self, world, tmp_path):
+        # apply_bypass_rls 只看登记表：--tables / --datasets / --projects 已删除（值或文件都不接受）
+        f = write(tmp_path, "t.csv", [T2])
+        for flag, val in (("--tables", T1), ("--tables", f), ("--datasets", f"{P}.ods"), ("--projects", P)):
+            with pytest.raises(SystemExit) as e:
+                bypass(flag, val, "--apply")
+            assert e.value.code == 2
+        assert world.ddl_log == []
 
-    def test_bypass_datasets_and_projects_files(self, world, tmp_path):
+    def test_rollback_tables_values_file_mixed(self, world, tmp_path):
+        assert bypass("--apply") == 0                                      # 登记表中的 T1 / T2 / T3 都建了 bypass
+        f = write(tmp_path, "t.csv", [T2, bq(T3)])
+        assert rollback_rls.main(["--tables", T1, f, "--policy-names", BYP, "--apply"]) == 0
+        assert not any(world.policy(t, BYP) for t in (T1, T2, T3))
+
+    def test_rollback_datasets_and_projects_files(self, world, tmp_path):
+        assert bypass("--apply") == 0
         d = write(tmp_path, "d.csv", [bq(f"{P}.ods")])
         p = write(tmp_path, "p.csv", [P])
-        assert bypass("--datasets", d, "--apply") == 0 and world.policy(T3, BYP) and world.policy(T1, BYP) is None
-        assert bypass("--projects", p, "--apply") == 0 and world.policy(T1, BYP)
+        assert rollback_rls.main(["--datasets", d, "--policy-names", BYP, "--apply"]) == 0
+        assert world.policy(T3, BYP) is None and world.policy(T1, BYP)
+        assert rollback_rls.main(["--projects", p, "--policy-names", BYP, "--apply"]) == 0
+        assert world.policy(T1, BYP) is None
 
     def test_copilot_tables_file(self, world, tmp_path):
         f = write(tmp_path, "t.csv", [T1])
@@ -159,8 +172,7 @@ class TestMergedListParams:
 
     def test_repeated_flags_accumulate(self, world, tmp_path):
         """同一个列表参数写多次（例如值一次、文件一次）全部生效，而不是只保留最后一次。"""
-        f = write(tmp_path, "t.csv", [T3])
-        assert bypass("--tables", T1, "--tables", f, "--tables", bq(T2), "--apply") == 0
+        assert bypass("--apply") == 0
         assert all(world.policy(t, BYP) for t in (T1, T2, T3))
         for t in (T1, T2):
             world.policies(t).append({"id": "k", "filter": "TRUE", "grantees": ["user:k@trip.com"]})
@@ -191,7 +203,7 @@ class TestMergedListParams:
 # =========================================================================== #
 class TestTableNameFormat:
     def test_backticked_names_everywhere(self, world, tmp_path):
-        assert apply_bypass_rls.main(["--group", G, "--registry-table", bq(REG), "--tables", bq(T1), "--apply"]) == 0
+        assert apply_bypass_rls.main(["--group", G, "--registry-table", bq(REG), "--apply"]) == 0
         assert copilot(tmp_path, "--tables", bq(T1), "--apply", cond=bq(COND), mapping=bq(MAP), reg=bq(REG)) == 0
         assert world.policy(T1, BYP) and world.policy(T1, COP)
         assert rollback_rls.main(["--tables", bq(T1), "--principals", G_COP, "--apply"]) == 0
@@ -200,7 +212,7 @@ class TestTableNameFormat:
     @pytest.mark.parametrize("bad", [f"{P}:dw.orders", "dw.orders", f"`{P}.dw.orders", f"{P}.dw.orders.x",
                                      f"`{P}`.`dw`.`orders`"])
     def test_bad_table_names_rejected_in_every_script(self, world, tmp_path, bad):
-        assert bypass("--tables", bad, "--apply") == 2
+        assert apply_bypass_rls.main(["--group", G, "--registry-table", bad, "--apply"]) == 2
         assert copilot(tmp_path, "--tables", bad, "--apply") == 2
         assert rollback_rls.main(["--tables", bad, "--principals", G, "--apply"]) == 2
         assert world.ddl_log == []
@@ -212,17 +224,16 @@ class TestTableNameFormat:
         assert copilot(tmp_path, "--apply", **kw) == 2 and world.ddl_log == []
 
     def test_colon_form_rejected_for_bypass_registry(self, world):
-        assert apply_bypass_rls.main(["--group", G, "--registry-table", REG.replace(".", ":", 1),
-                                      "--tables", T1, "--apply"]) == 2
+        assert apply_bypass_rls.main(["--group", G, "--registry-table", REG.replace(".", ":", 1), "--apply"]) == 2
 
     @pytest.mark.parametrize("bad", [f"{P}:dw", "dw", f"`{P}.dw"])
     def test_bad_dataset_names_rejected(self, world, bad):
-        assert bypass("--datasets", bad, "--apply") == 2
         assert rollback_rls.main(["--datasets", bad, "--principals", G, "--apply"]) == 2
 
     def test_bad_name_inside_file_rejected(self, world, tmp_path):
         f = write(tmp_path, "t.csv", [T1, f"{P}:dw.booking"])
-        assert bypass("--tables", f, "--apply") == 2 and world.ddl_log == []
+        assert rollback_rls.main(["--tables", f, "--principals", G, "--apply"]) == 2
+        assert copilot(tmp_path, "--tables", f, "--apply") == 2 and world.ddl_log == []
 
     def test_mapping_table_contents_rules_unchanged(self, world, tmp_path):
         """只改参数解析：映射表里仍允许 dataset.table（默认映射表所在项目）。"""
@@ -263,7 +274,7 @@ class TestRemovedFlagsAndDefaults:
         assert e.value.code == 2
 
     def test_parallel_default_16(self, world, tmp_path, capsys):
-        bypass("--tables", T1)
+        bypass()
         copilot(tmp_path)
         rollback_rls.main(["--tables", T1, "--principals", G])
         err = capsys.readouterr().err
@@ -284,8 +295,8 @@ class TestRemovedFlagsAndDefaults:
         calls = []
         monkeypatch.setattr(ops, "verify_full_access",
                             lambda ctx, t, sa, timeout=300, mode="sample": calls.append((t, sa, timeout, mode)) or ("ok", "1 行"))
-        assert bypass("--tables", T1, "--apply", "--verify-sa", READER) == 0
-        assert calls == [(T1, READER, 300, "sample")]
+        assert bypass("--apply", "--verify-sa", READER) == 0
+        assert sorted(calls) == sorted((t, READER, 300, "sample") for t in (T1, T2, T3))
 
     def test_rollback_by_principal_always_reads_grantees(self, world):
         world.policies(T1).extend([{"id": "manual_x", "filter": "TRUE", "grantees": [f"group:{G}"]},

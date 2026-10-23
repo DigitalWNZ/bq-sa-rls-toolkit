@@ -12,7 +12,7 @@ import apply_copilot_rls
 import list_principals
 import rls_core as core
 import rollback_rls
-from tests.unit.fakes import FakeWorld, install, fake_auth
+from tests.unit.fakes import REG, FakeWorld, install, fake_auth
 from tests.unit.test_normal_cases import (AUTH, BYP_ARGS, BYP_R, COP_G, G_COP, COND, G_R, G_W, MAP, P, SA_A, SA_B, T1, T2, T3, U_C,
                                           bypass_rule, cai_sa, cop_rule, read_csv, schema, write_list)
 
@@ -63,7 +63,8 @@ class TestArgumentAbuse:
 
     @pytest.mark.parametrize("mod,args", [
         (list_principals, ["--proj", P]), (list_principals, ["--organization", "1"]),
-        (apply_bypass_rls, ["--grou", G_R, "--tables", T1, *BYP_ARGS]),
+        (apply_bypass_rls, ["--grou", G_R, *BYP_ARGS]),
+        (apply_bypass_rls, ["--group", G_R, "--tables", T1, *BYP_ARGS]),           # 已删除的范围参数
         (apply_copilot_rls, ["--condition", COND, "--mapping-table", MAP]),
         (rollback_rls, ["--tab", T1, "--principals", SA_A]),
     ])
@@ -75,9 +76,9 @@ class TestArgumentAbuse:
     @pytest.mark.parametrize("mod,args", [
         (list_principals, ["--projects", "/nonexistent/p.csv"]),
         (list_principals, ["--organizations", "/nonexistent/o.csv"]),
-        (apply_bypass_rls, ["--group", G_R, "--tables", "/nonexistent/t.csv", *BYP_ARGS]),
-        (apply_bypass_rls, ["--group", G_R, "--datasets", "/nonexistent/d.csv", *BYP_ARGS]),
-        (apply_bypass_rls, ["--group", G_R, "--projects", "/nonexistent/p.csv", *BYP_ARGS]),
+        (rollback_rls, ["--tables", "/nonexistent/t.csv", "--principals", SA_A]),
+        (rollback_rls, ["--datasets", "/nonexistent/d.csv", "--principals", SA_A]),
+        (rollback_rls, ["--projects", "/nonexistent/p.csv", "--principals", SA_A]),
         (apply_copilot_rls, [*AUTH, "--tables", "/nonexistent/t.csv"]),
         (rollback_rls, ["--tables", T1, "--principals", "/nonexistent/p.csv"]),
         (rollback_rls, ["--tables", T1, "--policy-names", "/nonexistent/n.csv"]),
@@ -90,26 +91,25 @@ class TestArgumentAbuse:
     def test_a_arg_04_multi_column_csv_rejected(self, world, tmp_path, capsys):
         f = tmp_path / "t.csv"
         f.write_text(f"{T1},extra\n", encoding="utf-8")
-        assert apply_bypass_rls.main(["--group", G_R, "--tables", str(f), *BYP_ARGS]) == 2
+        assert rollback_rls.main(["--tables", str(f), "--principals", SA_A]) == 2
         assert "单列" in capsys.readouterr().err
 
     def test_a_arg_05_header_row_treated_as_value_and_rejected(self, world, tmp_path, capsys):
         f = tmp_path / "t.csv"
         f.write_text(f"table\n{T1}\n", encoding="utf-8")
-        assert apply_bypass_rls.main(["--group", G_R, "--tables", str(f), *BYP_ARGS]) == 2
+        assert rollback_rls.main(["--tables", str(f), "--principals", SA_A]) == 2
         assert "table" in capsys.readouterr().err and world.ddl_log == []
 
     def test_a_arg_06_empty_file_means_no_scope(self, world, tmp_path):
         f = write_list(tmp_path, "t.csv", [""])
-        assert apply_bypass_rls.main(["--group", G_R, "--tables", f, *BYP_ARGS]) == 2
         assert rollback_rls.main(["--tables", f, "--principals", SA_A]) == 2
 
     @pytest.mark.parametrize("parallel", ["0", "-5"])
     def test_a_arg_07_nonpositive_parallel_degrades_to_serial(self, world, parallel):
-        assert apply_bypass_rls.main(["--group", G_R, "--tables", T1, *BYP_ARGS, "--apply", "--parallel", parallel]) == 0
+        assert apply_bypass_rls.main(["--group", G_R, *BYP_ARGS, "--apply", "--parallel", parallel]) == 0
 
     def test_a_arg_08_bypass_two_groups_rejected(self, world, capsys):
-        assert apply_bypass_rls.main(["--group", f"{G_R} {G_W}", "--tables", T1, *BYP_ARGS, "--apply"]) == 2
+        assert apply_bypass_rls.main(["--group", f"{G_R} {G_W}", *BYP_ARGS, "--apply"]) == 2
         assert world.ddl_log == []
 
     @pytest.mark.parametrize("flag", ["--all-policies", "--force-drop-all"])
@@ -120,7 +120,7 @@ class TestArgumentAbuse:
 
     def test_a_arg_09b_bypass_force_first_policy_rejected(self, world):
         with pytest.raises(SystemExit) as e:
-            apply_bypass_rls.main(["--group", G_R, "--tables", T1, *BYP_ARGS, "--force-first-policy", "--apply"])
+            apply_bypass_rls.main(["--group", G_R, *BYP_ARGS, "--force-first-policy", "--apply"])
         assert e.value.code == 2 and world.ddl_log == []
 
     @pytest.mark.parametrize("mod,flag", [
@@ -130,7 +130,7 @@ class TestArgumentAbuse:
         (rollback_rls, "--groups"), (list_principals, "--folder"), (list_principals, "--include-iam-bound"),
     ])
     def test_a_arg_10_legacy_flags_rejected(self, world, mod, flag):
-        base = {list_principals: ["--projects", P], apply_bypass_rls: ["--group", G_R, "--tables", T1, *BYP_ARGS],
+        base = {list_principals: ["--projects", P], apply_bypass_rls: ["--group", G_R, *BYP_ARGS],
                 apply_copilot_rls: [*AUTH], rollback_rls: ["--tables", T1, "--principals", SA_A]}[mod]
         with pytest.raises(SystemExit):
             mod.main([*base, flag, "x"])
@@ -156,19 +156,19 @@ class TestInjection:
 
     @pytest.mark.parametrize("bad", ["p.d.t`; DROP TABLE x; --", "p.d.t\nx", "p;d.t", "p.d.t) OR TRUE", "p.d", "p.d.t.u", "../etc"])
     def test_a_inj_01_table_names(self, world, bad):
-        assert apply_bypass_rls.main(["--group", G_R, "--tables", bad, *BYP_ARGS, "--apply"]) == 2
+        assert apply_bypass_rls.main(["--group", G_R, "--registry-table", bad, "--apply"]) == 2
         assert rollback_rls.main(["--tables", bad, "--principals", SA_A, "--apply"]) == 2
         assert world.ddl_log == []
 
     @pytest.mark.parametrize("bad", ["p.d`x", "p d", "p.d;", "p"])
     def test_a_inj_02_dataset_and_project_names(self, world, bad):
-        assert apply_bypass_rls.main(["--group", G_R, "--datasets", bad, *BYP_ARGS, "--apply"]) == 2
-        assert apply_bypass_rls.main(["--group", G_R, "--projects", "bad proj!", *BYP_ARGS, "--apply"]) == 2
+        assert rollback_rls.main(["--datasets", bad, "--principals", SA_A, "--apply"]) == 2
+        assert rollback_rls.main(["--projects", "bad proj!", "--principals", SA_A, "--apply"]) == 2
         assert world.ddl_log == []
 
     @pytest.mark.parametrize("bad", ['g@x.com") FILTER USING (TRUE) --', "g@x.com`", "g@x.com\\", "g@x.com'", "g@x.com\u00a0x"])
     def test_a_inj_03_group_email(self, world, bad, capsys):
-        code = apply_bypass_rls.main(["--group", bad, "--tables", T1, *BYP_ARGS, "--apply"])
+        code = apply_bypass_rls.main(["--group", bad, *BYP_ARGS, "--apply"])
         assert code == 2 and world.ddl_log == [] and "Traceback" not in capsys.readouterr().err
 
     @pytest.mark.parametrize("bad_col", INJECTIONS + ["region, amount", "`region`"])
@@ -284,7 +284,7 @@ class TestSafetyAndFailures:
         assert world.policy(T1, COP_G) is not None
 
     def test_a_safe_02_bypass_first_policy_mixed_batch_not_blocked(self, world, capsys):
-        code = apply_bypass_rls.main(["--group", G_W, "--tables", f"{T1},{T3}", *BYP_ARGS, "--apply"])
+        code = apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply"])
         err = capsys.readouterr().err
         assert code == 0 and world.policy(T1, core.bypass_policy_name(G_W)) and world.policy(T3, core.bypass_policy_name(G_W))
         assert "将为以下这些表首次设置RLS规则" in err and f"  - {T3}" in err and f"  - {T1}" not in err
@@ -300,11 +300,11 @@ class TestSafetyAndFailures:
 
     def test_a_safe_04_registry_gate_duplicates_and_missing_registry(self, world, capsys):
         world.unregister(COND).register(COND, 0)
-        code = apply_bypass_rls.main(["--group", G_W, "--tables", f"{T1},{T1},{COND}", *BYP_ARGS, "--apply"])
+        code = apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply"])
         assert code == 0 and world.policies(COND) == [] and world.policy(T1, core.bypass_policy_name(G_W))
-        assert len(world.ddl_log) == 1                                          # 重复的表只执行一次
-        code = apply_bypass_rls.main(["--group", G_W, "--tables", T1, "--registry-table", f"{P}.auth.missing",
-                                      "--apply"])
+        enabled = {r["table_name"] for r in world.registry_rows[REG] if r["rls_enabled"] == 1}
+        assert len(world.ddl_log) == len(enabled)                               # 只处理登记表中开启的表，每张一次
+        code = apply_bypass_rls.main(["--group", G_W, "--registry-table", f"{P}.auth.missing", "--apply"])
         assert code == 2 and "missing" in capsys.readouterr().err
 
     def test_a_safe_05_copilot_auth_tables_controlled_by_registry(self, world, tmp_path, capsys):
@@ -338,7 +338,7 @@ class TestSafetyAndFailures:
         world.condition_fields[COND] = [("id", "STRING", "NULLABLE"), ("region", "STRING", "REPEATED")]
         code, _ = self.copilot(tmp_path, "--apply")
         err = capsys.readouterr().err
-        assert code == 1 and world.ddl_log == [] and "sa" in err and "Traceback" not in err
+        assert code == 2 and world.ddl_log == [] and "缺少 sa 列" in err and "Traceback" not in err   # 表结构问题：未做任何变更
 
     def test_a_safe_10_condition_table_without_dimensions(self, world, tmp_path, capsys):
         world.condition_fields[COND] = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"), ("note", "STRING", "NULLABLE")]
@@ -380,7 +380,7 @@ class TestSafetyAndFailures:
 
     def test_a_safe_16_bypass_ddl_failure_isolated(self, world, capsys):
         world.fail_ddl_on.add(T1)
-        code = apply_bypass_rls.main(["--group", G_W, "--tables", f"{T1},{T2}", *BYP_ARGS, "--apply"])
+        code = apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply"])
         err = capsys.readouterr().err
         assert code == 1 and world.policy(T2, core.bypass_policy_name(G_W)) and "[ERROR]" in err and "Traceback" not in err
 
@@ -400,7 +400,7 @@ class TestSafetyAndFailures:
 
     def test_a_safe_19_verify_failure_semantics(self, world, capsys):
         world.verify_result[(T1, SA_A)] = ("fail", "403 Access Denied")
-        assert apply_bypass_rls.main(["--group", G_W, "--tables", T1, *BYP_ARGS, "--apply", "--verify-sa", SA_A]) == 1
+        assert apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply", "--verify-sa", SA_A]) == 1
         world.policies(T1).append(cop_rule(SA_A))
         # rollback 的验证只报告：查询失败也不改变退出码
         import gcp_ops as ops
@@ -410,7 +410,7 @@ class TestSafetyAndFailures:
 
     def test_a_safe_20_unexpected_exception_is_clean_error(self, world, monkeypatch, capsys):
         monkeypatch.setattr(apply_bypass_rls, "resolve_auth", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("gcloud not logged in")))
-        code = apply_bypass_rls.main(["--group", G_W, "--tables", T1, *BYP_ARGS, "--apply"])
+        code = apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply"])
         err = capsys.readouterr().err
         assert code == 1 and "[ERROR] RuntimeError: gcloud not logged in" in err and "Traceback" not in err
 

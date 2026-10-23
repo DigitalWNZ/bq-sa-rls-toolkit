@@ -55,7 +55,7 @@ def copilot(tmp_path, *args, group=G_COP):
 
 
 def bypass(*args, group=G_R):
-    return apply_bypass_rls.main(["--group", group, "--tables", f"{T1},{T2},{T3}", "--registry-table", REG, *args])
+    return apply_bypass_rls.main(["--group", group, "--registry-table", REG, *args])
 
 
 # =========================================================================== #
@@ -265,14 +265,15 @@ class TestCloudIdentityShapes:
         with pytest.raises(Exception):
             ops.group_members_typed(ctx, "g@trip.com")
 
-    def test_expand_group_reports_unreadable_root_and_nested(self):
+    def test_direct_members_only_nested_group_not_fetched(self):
+        # 只展开一层：成员中的 Group 原样返回（类型 GROUP），不再请求它的成员
         ctx = _CICtx(_ci([
             LOOKUP_OK, (200, {"memberships": [{"preferredMemberKey": {"id": "ext@partner.com"}, "type": "GROUP"},
-                                              {"preferredMemberKey": {"id": "a@trip.com"}, "type": "USER"}]}),
-            (403, _err(403, "Permission denied for resource ext@partner.com (or it may not exist)."))]))
-        members, unresolved, reasons = ops.expand_group(ctx, "root@trip.com")
-        assert "a@trip.com" in members and unresolved == [("ext@partner.com", ["root@trip.com"])]
-        assert reasons["ext@partner.com"].startswith("无权读取")
-        ctx = _CICtx(_ci([(403, _err(403, "Permission denied for resource root@trip.com (or it may not exist)."))]))
-        members, unresolved, reasons = ops.expand_group(ctx, "root@trip.com")
-        assert members == {} and unresolved == [("root@trip.com", [])] and "root@trip.com" in reasons
+                                              {"preferredMemberKey": {"id": "a@trip.com"}, "type": "USER"}]})]))
+        assert ops.group_members_typed(ctx, "root@trip.com") == [("ext@partner.com", "GROUP"), ("a@trip.com", "USER")]
+
+    def test_directory_groups_paged(self):
+        ctx = _CICtx(_ci([(200, {"groups": [{"groupKey": {"id": "A@trip.com"}}, {"groupKey": {}}],
+                                 "nextPageToken": "t"}),
+                          (200, {"groups": [{"groupKey": {"id": "b@trip.com"}}]})]))
+        assert ops.directory_groups(ctx, "C0x") == ["a@trip.com", "b@trip.com"]

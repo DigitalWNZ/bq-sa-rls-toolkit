@@ -3,7 +3,7 @@
 为 Copilot Group 设置行级规则（Doc 第 7 步）：每张表给 --group 建一条规则，组内每个 SA / user 按条件表各自只看到规定的数据。
 
 数据来源（三张表都必填，格式 project.dataset.table）:
-  --condition-table  adm_user_mem_copilot_condition（id, sa, region[], prdtype[], refername[] ...）
+  --condition-table  adm_user_mem_copilot_condition（id, sa, status, region[], prdtype[], refername[] ...）
                      客户业务人员为每个 SA / user 指定可见的维度值；某维度为 NULL / 空数组 = 该维度全部可见
   --mapping-table    adm_user_mem_copilot_tb_col_mapping（table_name, col_name, to_name）
                      每张业务表里与维度对应的真实列名（col_name）及维度正式名称（to_name）
@@ -13,15 +13,17 @@
   表名一律写 project.dataset.table（反引号可选，如 `trip-bq-admin.bq_auth.adm_user_mem_copilot_tb`；不支持冒号写法）
 
 处理逻辑:
-  1. 维度 = 条件表中除 id、sa 外的 ARRAY<STRING> 列（运行时读取表结构；以后加列不用改代码；status 等非数组列不算）
+  1. 维度 = 条件表中除 id、sa、status 外的 ARRAY<STRING> 列（运行时读取表结构；以后加列不用改代码）；
+     条件表必须有 status 列（INT64）：只有 status = 1 的行生效，0 / NULL / 其它值的行等同不存在；
+     缺少 status 列或类型不对 -> [ERROR]，退出码 2，未做任何变更
   2. 选表：映射表中 to_name 属于维度的行（一张表可有多行 = 多个维度）；无效行忽略；
      再与登记表 rls_enabled = 1 的表取交集（table_name 原始字符串精确比较，不看 status）：
      未开启 / 未登记的表逐张 [SKIP]；同名多行 rls_enabled 不一致 -> [WARN] + [SKIP]，退出码 1；
      登记为开启、但映射表中没有任何校验维度的表 -> [SKIP]，不建规则
   3. 每张表一条规则，规则名 rls_copilot_<group 邮箱，小写，非字母数字换成 _>，GRANT TO ("group:<group>")；
-     过滤条件为子查询，按 SESSION_USER() 实时查条件表（改条件值、新增账号都立即生效，无需重跑）:
-       <col_name> IN (SELECT v FROM 条件表 c, UNNEST(c.<维度>) v WHERE c.sa = SESSION_USER())
-       OR EXISTS (... c.<维度> IS NULL OR ARRAY_LENGTH(c.<维度>) = 0)
+     过滤条件为子查询，按 SESSION_USER() 实时查条件表（改条件值、改 status、新增账号都立即生效，无需重跑）:
+       <col_name> IN (SELECT v FROM 条件表 c, UNNEST(c.<维度>) v WHERE c.status = 1 AND c.sa = SESSION_USER())
+       OR EXISTS (... WHERE c.status = 1 AND c.sa = SESSION_USER() AND (c.<维度> IS NULL OR ARRAY_LENGTH(c.<维度>) = 0))
      多个维度用 AND 连接；非 STRING 列 CAST 为 STRING。
   需要重跑的情况：映射表 / 登记表变化（新增表、改维度）、条件表新增维度列。规则内容相同 -> NOOP。
 
@@ -29,9 +31,10 @@
   ③ --group 对条件表有读权限（BigQuery 以查询者身份执行子查询）。组内成员因此能读到整张条件表。
 
 安全与校验:
+  - 以下检查只看 status = 1 的行；另 [NOTE] 条件表总行数与 status = 1 的行数
   - 条件表 sa 值不是小写 / 有首尾空白 / 带 user: 等前缀 / 不是邮箱 -> 这些账号永远匹配不到 SESSION_USER()（查到 0 行）：[WARN]，退出码 1
   - 同一 sa 在条件表中有多行 -> 各维度独立判断会出现交叉组合：[WARN]，退出码 1
-  - 条件表为空 -> [NOTE]，规则照建（组内成员都查到 0 行）
+  - 条件表中没有 status = 1 的行 -> [NOTE]，规则照建（组内成员都查到 0 行）
   - 同名规则：内容相同 -> NOOP；授权对象或过滤条件不同 -> REPLACE（审核 CSV 的 note 记录旧内容）
   - 每张表最多 400 条规则：已满且需要新建 -> [SKIP]，退出码 1
   - 映射列不存在 / REPEATED / RECORD / 类型不支持 -> 跳过该表（列名不区分大小写，过滤条件使用表中的真实写法）
@@ -53,8 +56,8 @@
       --registry-table auth-proj.auth.adm_user_mem_copilot_tb
   python apply_copilot_rls.py ... --apply
 
-退出码: 0 成功；1 有表被跳过 / 失败、条件表数据有问题、登记表记录冲突；2 参数错误 / 登记表不可用 / 无法确定执行账号 /
-  第一张表即报 Group 不存在（未做任何变更）
+退出码: 0 成功；1 有表被跳过 / 失败、条件表数据有问题、登记表记录冲突；2 参数错误 / 登记表不可用 / 条件表缺 status 列 /
+  无法确定执行账号 / 第一张表即报 Group 不存在（未做任何变更）
 """
 
 import argparse
@@ -79,11 +82,11 @@ def write_plan_csv(path, entries, apply):
 
 
 def check_condition_sa(counts):
-    """条件表 sa 列的数据问题 -> 是否有问题（[WARN] 已打印）。"""
+    """条件表中 status = 1 的行的 sa 列数据问题 -> 是否有问题（[WARN] 已打印）。"""
     raw = list(counts)
     bad = False
     if not raw:
-        ops.log("[NOTE] 条件表中没有任何 sa 记录：规则照建，但组内成员都会查到 0 行")
+        ops.log("[NOTE] 条件表中没有 status = 1 的 sa 记录：规则照建，但组内成员都会查到 0 行")
         return False
     unnormalized = core.unnormalized_sa_values(raw)
     invalid = core.invalid_sa_values(raw)
@@ -101,7 +104,7 @@ def check_condition_sa(counts):
         bad = True
         ops.log("[WARN] 条件表中以下 sa 有多行：各维度独立判断，会看到不同行之间维度值的交叉组合，"
                 f"请确认是否预期: {dup}")
-    ops.log(f"[PRINCIPAL] 条件表共 {len(raw)} 个 sa")
+    ops.log(f"[PRINCIPAL] 条件表中 status = 1 的 sa 共 {len(raw)} 个")
     return bad
 
 
@@ -164,6 +167,9 @@ def _main(argv):
     # 1. 维度
     try:
         dims, warns, notes = core.condition_dimensions(ops.table_fields(ctx, cond))
+    except core.ConditionSchemaError as e:
+        ops.log(f"[ERROR] {e}；未做任何变更")
+        return 2
     except Exception as e:  # noqa: BLE001
         ops.log(f"[ERROR] 读取条件表结构失败: {e}")
         return 1
@@ -173,7 +179,7 @@ def _main(argv):
         ops.log(f"[NOTE] {n}")
     ops.log(f"[DIM] 维度: {', '.join(dims) or '（无）'}")
     if not dims:
-        ops.log("[ERROR] 条件表中没有可用作维度的 ARRAY<STRING> 列（除 id、sa 外），无法生成规则")
+        ops.log("[ERROR] 条件表中没有可用作维度的 ARRAY<STRING> 列（除 id、sa、status 外），无法生成规则")
         return 1
 
     # 2. 选表
@@ -207,12 +213,15 @@ def _main(argv):
     for t, cols in mapping.items():
         ops.log(f"[MAP] {t}: " + ", ".join(f"{c}->{d}" for c, d in cols))
 
-    # 3. 条件表数据检查（只提醒，不影响建规则）
+    # 3. 条件表数据检查（只看 status = 1 的行；只提醒，不影响建规则）
     try:
+        total, active = ops.condition_row_counts(ctx, cond)
         counts = ops.condition_sa_counts(ctx, cond)
     except Exception as e:  # noqa: BLE001
         ops.log(f"[ERROR] 读取条件表失败: {e}")
         return 1
+    ops.log(f"[NOTE] 条件表共 {total} 行，其中 status = 1 的 {active} 行生效"
+            + (f"，其余 {total - active} 行（status 为 0 / NULL / 其它值）不生效" if total > active else ""))
     failed = check_condition_sa(counts) or failed
 
     # 4. 逐表规划（并行；只读取本规则名的授权对象）

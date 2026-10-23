@@ -218,3 +218,12 @@ def test_org_info_and_customer():
     assert ops.org_directory_customer(ctx, "9") == "C0x"
     with pytest.raises(RuntimeError):
         ops.org_directory_customer(_CrmCtx(org={"displayName": "x.com"}), "9")
+
+
+def test_is_not_found_error_only_404():
+    from google.api_core.exceptions import Forbidden, NotFound
+    assert ops.is_not_found_error(HttpError(_Resp(404), b"Not found: Table p:d.t"))
+    assert ops.is_not_found_error(NotFound("Not found: Table p:d.t"))
+    for e in (HttpError(_Resp(403), b"denied"), HttpError(_Resp(500), b"x"), Forbidden("denied"),
+              RuntimeError("404 in message but not an HTTP 404")):
+        assert not ops.is_not_found_error(e), e

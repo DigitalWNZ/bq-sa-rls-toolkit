@@ -110,10 +110,7 @@ def run(n_tables, n_new, n_existing, parallel, latency=None):
         assert code in allow, f"{name} 退出码 {code}\n{log[-2000:]}"
 
     step("1 list_principals", lambda: list_principals.main(["--projects", P, "-o", f"{tmp}/p.csv", *par]))
-    tables_file = f"{tmp}/tables.csv"                      # 第 3 步：--tables 传 .csv 文件（全部业务表）+ 登记表
-    with open(tables_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(t for t in w.tables if t.startswith(f"{P}.{DS}.")) + "\n")
-    byp = ["--tables", tables_file, "--registry-table", REG]
+    byp = ["--registry-table", REG]                         # 第 3 步：只看登记表
     step("3 apply_bypass (read 组)", lambda: apply_bypass_rls.main(
         ["--group", G_R, *byp, "--apply", *par]))
     step("3 apply_bypass (write 组)", lambda: apply_bypass_rls.main(

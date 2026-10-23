@@ -27,7 +27,7 @@ NAME_RE = r"(?P<script>[a-z_]+)_(?P<stamp>\d{8}_\d{6})(_\d+)?\.log"
 
 SCRIPTS = {
     "list_principals": (list_principals, ["--projects", P, "-o", "{tmp}/p.csv"]),
-    "apply_bypass_rls": (apply_bypass_rls, ["--group", G_R, "--tables", T1, "--registry-table", REG]),
+    "apply_bypass_rls": (apply_bypass_rls, ["--group", G_R, "--registry-table", REG]),
     "apply_copilot_rls": (apply_copilot_rls, ["--group", G_COP, "--condition-table", COND, "--mapping-table", MAP,
                                               "--registry-table", REG, "-o", "{tmp}/c.csv"]),
     "rollback_rls": (rollback_rls, ["--tables", T1, "--principals", G_COP]),

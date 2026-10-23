@@ -28,20 +28,21 @@ def abn(world):
     q(f"CREATE OR REPLACE TABLE `{T_X}` AS SELECT * FROM UNNEST([{values}])")
     q(f"CREATE OR REPLACE VIEW `{T_VIEW}` AS SELECT * FROM `{T_X}`")
     q(f"CREATE OR REPLACE TABLE `{COND2}` (id STRING, sa STRING, region ARRAY<STRING>, `odd col` ARRAY<STRING>, "
-      f"note STRING) CLUSTER BY sa")
-    q(f"""INSERT INTO `{COND2}` (id, sa, region, `odd col`, note) VALUES
-          ('u1', '{L.SA_COP_A.upper()}', ['HK'], [], 'mixed case'),
-          ('u2', 'serviceAccount:{L.SA_COP_B}', ['SG'], [], 'prefixed'),
-          ('u3', '{L.G_READ}', [], [], 'group email as sa'),
-          ('u4', 'not an email', ['US'], [], 'garbage'),
-          ('u5', '{L.ACCOUNT}', ['SG'], [], 'ok user')""")
+      f"note STRING, status INT64) CLUSTER BY sa")
+    q(f"""INSERT INTO `{COND2}` (id, sa, region, `odd col`, note, status) VALUES
+          ('u1', '{L.SA_COP_A.upper()}', ['HK'], [], 'mixed case', 1),
+          ('u2', 'serviceAccount:{L.SA_COP_B}', ['SG'], [], 'prefixed', 1),
+          ('u3', '{L.G_READ}', [], [], 'group email as sa', 1),
+          ('u4', 'not an email', ['US'], [], 'garbage', 1),
+          ('u5', '{L.ACCOUNT}', ['SG'], [], 'ok user', 1)""")
     q(f"""CREATE OR REPLACE TABLE `{MAP2}` AS SELECT * FROM UNNEST([
           STRUCT('{T_X}' AS table_name, 'region' AS col_name, 'region' AS to_name),
           STRUCT('{T_X}', 'region', 'odd col'),
           STRUCT('{T_VIEW}', 'region', 'region')])""")        # 视图被误配进映射表
     reg = ", ".join(f"(GENERATE_UUID(), '{t}', 1, 1, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())" for t in (T_X, T_VIEW))
     q(f"INSERT INTO `{L.T_REGISTRY}` (id, table_name, rls_enabled, status, create_time, update_time) VALUES {reg}")
-    code, log = bypass("--group", L.G_READ, "--tables", f"{T_X},{T_VIEW}", "--apply")
+    # bypass 只看登记表：T_X、T_VIEW 都登记为开启（同时处理登记表里其它开启的表）
+    code, log = bypass("--group", L.G_READ, "--apply")
     yield {"bypass_code": code, "bypass_log": log}
     q(f"DELETE FROM `{L.T_REGISTRY}` WHERE table_name IN ('{T_X}', '{T_VIEW}')")
     for t in (T_X, T_VIEW):
@@ -51,9 +52,11 @@ def abn(world):
 
 
 def test_r01_rls_on_view_is_rejected_by_bigquery_and_isolated(abn):
-    # 视图不支持 RLS：显式列出的视图会在 DDL 阶段失败（退出码 1），普通表照常成功
+    # 视图不支持 RLS：登记表里登记了视图 → 它在 DDL 阶段失败（[ERROR]，退出码 1），普通表照常成功
     assert abn["bypass_code"] == 1
-    assert "[ERROR]" in abn["bypass_log"] and BYP_R in L.policies(T_X) and L.policies(T_VIEW) == {}
+    log = abn["bypass_log"]
+    assert f"[CREATE] {T_VIEW}" in log and "[ERROR]" in log and "Traceback" not in log, log
+    assert BYP_R in L.policies(T_X) and L.policies(T_VIEW) == {}
 
 
 def test_r02a_view_in_mapping_table_fails_in_isolation(abn, tmp_path):
@@ -95,7 +98,7 @@ def test_r04_user_principal_runner_sees_only_own_rows(abn):
 
 def test_r05_verify_sa_not_impersonable_fails_cleanly(abn):
     ghost = L.sa("rlsit-ghost")
-    code, log = bypass("--group", L.G_WRITE, "--tables", T_X, "--apply", "--verify-sa", ghost)
+    code, log = bypass("--group", L.G_WRITE, "--apply", "--verify-sa", ghost)
     assert code == 1 and "[VERIFY-FAIL]" in log and "Traceback" not in log
 
 
@@ -111,8 +114,37 @@ def test_r06_bad_gcloud_account_is_clean_error():
 
 
 def test_r07_nonexistent_dataset_and_project_scope(abn):
-    code, log = bypass("--group", L.G_READ, "--tables", L.T_ORDERS, "--datasets", f"{L.PROJECT}.no_such_dataset",
-                       "--apply")
-    assert code == 1 and "展开目标表失败" in log and "Traceback" not in log
+    # apply_bypass 已不接受范围参数；rollback 仍支持 --datasets：数据集不存在 → 展开失败，退出码 1
+    code, log = L.run_cli("rollback_rls.py", "--datasets", f"{L.PROJECT}.no_such_dataset", "--principals", L.SA_COP_A,
+                          "--apply")
+    assert code == 1 and "展开目标表失败" in log and "Traceback" not in log, log
     code, log = L.run_cli("rollback_rls.py", "--tables", f"{L.PROJECT}.{L.DATASET}.no_such_table", "--principals", L.SA_COP_A, "--apply")
     assert code == 1 and "读取现有规则失败" in log and "Traceback" not in log
+
+
+def test_r08_table_deleted_during_list_principals_is_note(world, tmp_path, capsys, monkeypatch):
+    # 真实地「列出表之后、读取它的 IAM 之前把表删掉」：真实 BigQuery 返回 404 → [NOTE] 跳过，退出码 0、不中断、CSV 照常
+    import gcp_ops
+    import list_principals
+    gone = L.tbl("lp_deleted_mid_scan")
+    q(f"CREATE OR REPLACE TABLE `{gone}` AS SELECT 1 AS x")
+    real = gcp_ops.dataset_tables
+
+    def list_then_drop(ctx, ds):
+        tables = real(ctx, ds)
+        if gone in tables:
+            q(f"DROP TABLE `{gone}`")                                  # 已列出，随后被删除
+        return tables
+    monkeypatch.setattr(gcp_ops, "dataset_tables", list_then_drop)
+    out = tmp_path / "p.csv"
+    try:
+        code = list_principals.main(["--gcloud-account", L.ACCOUNT, "--quota-project", L.PROJECT,
+                                     "--projects", L.PROJECT, "-o", str(out), "--log-dir", L.LOG_DIR])
+    finally:
+        q(f"DROP TABLE IF EXISTS `{gone}`")
+    err = capsys.readouterr().err
+    assert f"[NOTE] 表 {gone}: 表已不存在（扫描期间被删除），跳过" in err, err[-3000:]
+    assert code == 0 and "[ERROR]" not in err and "Traceback" not in err, err[-3000:]
+    assert "张扫描期间已被删除，跳过）" in err and "===== 完成" in err
+    rows = {r["email"]: r for r in read_csv(out)}
+    assert L.SA_ETL in rows and L.G_ACL in rows and L.SA_ACL in rows          # 其余主体照常写入 CSV

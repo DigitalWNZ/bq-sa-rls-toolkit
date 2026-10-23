@@ -6,28 +6,23 @@ install(monkeypatch, world) 会把 gcp_ops 里被业务脚本调用的函数替�
 
 import re
 
+import httplib2
 from google.api_core.exceptions import NotFound
+from googleapiclient.errors import HttpError
 
 import gcp_ops as ops
 import rls_core as core
+
+
+def http_error(status, message):
+    """与 googleapiclient 真实抛出的一样的 HttpError（resp.status = status）。"""
+    return HttpError(httplib2.Response({"status": status}), message.encode("utf-8"))
 
 _CREATE_RE = re.compile(
     r"CREATE OR REPLACE ROW ACCESS POLICY `(?P<name>[^`]+)`\s+ON `(?P<table>[^`]+)`\s+"
     r"GRANT TO \((?P<grant>.*?)\)\s+FILTER USING \((?P<filter>.*)\)\s*$", re.S)
 _DROP_RE = re.compile(r"DROP ROW ACCESS POLICY `(?P<name>[^`]+)` ON `(?P<table>[^`]+)`")
 _DROP_ALL_RE = re.compile(r"DROP ALL ROW ACCESS POLICIES ON `(?P<table>[^`]+)`")
-
-# list_principals：常见角色的权限（只列与判断相关的；未列出的角色视为「读不到角色定义」）
-GET_DATA = "bigquery.tables.getData"
-DEFAULT_ROLE_PERMS = {
-    # 与实际一致：基本角色的 IAM 权限里没有 bigquery.tables.getData（读表靠数据集 ACL 默认的特殊组）
-    "roles/owner": {"resourcemanager.projects.get", "bigquery.datasets.get"}, "roles/editor": {"bigquery.datasets.get"},
-    "roles/viewer": {"bigquery.datasets.get"},
-    "roles/bigquery.admin": {GET_DATA}, "roles/bigquery.dataOwner": {GET_DATA}, "roles/bigquery.dataEditor": {GET_DATA},
-    "roles/bigquery.dataViewer": {GET_DATA}, "roles/bigquery.metadataViewer": {"bigquery.tables.get"},
-    "roles/bigquery.jobUser": {"bigquery.jobs.create"}, "roles/bigquery.user": {"bigquery.jobs.create"},
-    "roles/storage.admin": {"storage.buckets.get"},
-}
 
 # apply_bypass_rls.py 的登记表（adm_user_mem_copilot_tb）；add_table 默认把表登记为 rls_enabled=1
 REG = "trip-bq-admin.bq_auth.adm_user_mem_copilot_tb"
@@ -51,18 +46,20 @@ class FakeWorld:
         self.directory = {}       # customer id -> [user email]
         self.directory_error = None
         self.directory_calls = []  # [customer]
+        self.directory_groups = {}  # customer id -> [group email]（账号目录里的全部 Group）
         self.project_sas = {}     # project -> [SA email]
         self.iam_policies = {}    # "organizations/1" / "folders/2" / "projects/p" -> [binding]
         self.dataset_acl = {}     # "p.d" -> [(role, entity_type, entity_id)]
         self.table_iam = {}       # "p.d.t" -> [binding]
-        self.role_perms = {k: set(v) for k, v in DEFAULT_ROLE_PERMS.items()}
-        self.role_errors = set()  # 读角色定义失败的角色
-        self.role_lookups = {}    # role -> 查询次数
         self.groups = {}          # group email -> [(member, type)] 或 None（读不到）
         self.fail_resources = set()   # "sa:p" / "iam:projects/p" / "datasets:p" / "acl:p.d" / "tables:p.d" / "table_iam:p.d.t" / "crm:folders/1" / "customer:1"
+        self.not_found_resources = set()   # 同上的键：抛真实的 HttpError 404（如表在列出之后被删除）
         # copilot
         self.condition_fields = {}   # table -> [(name, type, mode)]
-        self.condition_sas = {}      # table -> [email]
+        self.condition_sas = {}      # table -> [email]（status = 1，生效的行）
+        self.condition_inactive = {}  # table -> [email]（status ≠ 1，不生效的行）
+        # 条件表默认带 status INT64 列（fields 里没写时自动补上）；测试「缺 status 列」时置为 False
+        self.condition_status_column = True
         self.mapping_rows = {}       # table -> [{"table_name","col_name","to_name"}]
         # bypass 登记表
         self.registry_rows = {REG: []}   # table -> [{"table_name","rls_enabled","status"}]
@@ -73,7 +70,7 @@ class FakeWorld:
         # API 调用计数（性能测量用）
         self.calls = {"list_policies": 0, "policy_iam": 0, "ddl": 0, "get_table": 0, "list_tables": 0,
                       "dataset_acl": 0, "group": 0, "query": 0, "crm": 0, "iam_policy": 0, "sa_list": 0,
-                      "datasets": 0, "table_iam": 0, "role": 0, "directory": 0, "ancestry": 0, "org_info": 0}
+                      "datasets": 0, "table_iam": 0, "directory": 0, "ancestry": 0, "org_info": 0, "dir_groups": 0}
         self.latency = {}         # 可选：每类调用的模拟耗时（秒），用于估算
         import threading
         self._lock = threading.Lock()
@@ -229,7 +226,12 @@ def install(monkeypatch, world, script_module=None):
 
     def table_fields(ctx, t):
         t = core.fq(t)
-        return world.registry_fields[t] if t in world.registry_fields else world.condition_fields[t]
+        if t in world.registry_fields:
+            return world.registry_fields[t]
+        fields = list(world.condition_fields[t])
+        if world.condition_status_column and not any(n.lower() == "status" for n, _, _ in fields):
+            fields.append(("status", "INT64", "NULLABLE"))
+        return fields
 
     monkeypatch.setattr(ops, "table_fields", table_fields)
 
@@ -240,6 +242,7 @@ def install(monkeypatch, world, script_module=None):
 
     monkeypatch.setattr(ops, "read_registry_rows", read_registry_rows)
     def condition_sa_counts(ctx, t):
+        """只统计 status = 1 的行（condition_sas）。"""
         world.hit("query")
         out = {}
         for v in world.condition_sas[core.fq(t)]:
@@ -247,16 +250,25 @@ def install(monkeypatch, world, script_module=None):
                 out[v] = out.get(v, 0) + 1
         return out
 
+    def condition_row_counts(ctx, t):
+        world.hit("query")
+        t = core.fq(t)
+        active = len(world.condition_sas[t])
+        return active + len(world.condition_inactive.get(t, [])), active
+
     def read_mapping_rows(ctx, t):
         world.hit("query")
         return [dict(r) for r in world.mapping_rows[core.fq(t)]]
 
     monkeypatch.setattr(ops, "condition_sa_counts", condition_sa_counts)
+    monkeypatch.setattr(ops, "condition_row_counts", condition_row_counts)
     monkeypatch.setattr(ops, "read_mapping_rows", read_mapping_rows)
 
     def guard(key):
         if key in world.fail_resources:
             raise RuntimeError(f"403 Permission denied on {key}")
+        if key in world.not_found_resources:
+            raise http_error(404, f"Not found: {key}")
 
     def list_org_descendants(ctx, org_id):
         folders, active, inactive = [], [], []
@@ -335,26 +347,27 @@ def install(monkeypatch, world, script_module=None):
         world.hit("table_iam")
         return [dict(x) for x in world.table_iam.get(t, [])]
 
-    def role_permissions(ctx, role):
-        world.hit("role")
-        with world._lock:
-            world.role_lookups[role] = world.role_lookups.get(role, 0) + 1
-        if role in world.role_errors or role not in world.role_perms:
-            raise RuntimeError(f"404 role {role} not found or permission denied")
-        return set(world.role_perms[role])
+    def group_members_typed(ctx, g, reasons=None):
+        """直接成员 [(email, type)]；world.groups 中没有或为 None = 读不到（返回 None 并写原因）。"""
+        world.hit("group")
+        guard(f"group:{g}")
+        items = world.groups.get(g)
+        if items is None:
+            if reasons is not None:
+                reasons[g] = f"{ops.GROUP_UNREADABLE_REASON}: HTTP 403"
+            return None
+        return [(e.lower(), t) for e, t in items]
 
-    def expand_group(ctx, g, max_depth=10):
-        def fetch(x):
-            world.hit("group")
-            return world.groups.get(x)
-        members, unresolved = core.expand_group(g, fetch, max_depth)
-        return members, unresolved, {}
+    def directory_groups(ctx, customer):
+        guard(f"dir_groups:{customer}")
+        world.hit("dir_groups")
+        return list(world.directory_groups.get(customer, []))
 
     for name, fn in (("list_org_descendants", list_org_descendants), ("org_directory_customer", org_directory_customer),
                      ("org_info", org_info), ("project_ancestors", project_ancestors),
                      ("directory_users", directory_users), ("resource_iam_bindings", resource_iam_bindings),
                      ("project_service_accounts", project_service_accounts), ("project_datasets", project_datasets),
                      ("dataset_access", dataset_access), ("dataset_tables", dataset_tables),
-                     ("table_iam_bindings", table_iam_bindings), ("role_permissions", role_permissions),
-                     ("expand_group", expand_group)):
+                     ("table_iam_bindings", table_iam_bindings), ("group_members_typed", group_members_typed),
+                     ("directory_groups", directory_groups)):
         monkeypatch.setattr(ops, name, fn)

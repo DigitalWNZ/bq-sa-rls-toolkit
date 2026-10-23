@@ -45,7 +45,6 @@ def main():
     out["table_iam"] = med(lambda: ops.table_iam_bindings(ctx, table))
     out["iam_policy"] = med(lambda: ops.resource_iam_bindings(ctx, f"projects/{L.PROJECT}"), n=3)
     out["sa_list"] = med(lambda: ops.project_service_accounts(ctx, L.PROJECT), n=3)
-    out["role"] = med(lambda: ops.role_permissions(ctx, "roles/bigquery.dataViewer"), n=3)
     out["group"] = med(lambda: ops.group_members_typed(ctx, L.G_READ), n=3)
     print("REAL_LATENCY = {" + ", ".join(f'"{k}": {v:.3f}' for k, v in out.items()) + "}", flush=True)
     remaining = ops.list_policies(ctx, table, grantees_for=set())

@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import rls_core as core
 from tests.integration import itlib as L
 from tests.integration.test_e2e import BYP_R, COP_G
 
@@ -142,10 +143,12 @@ def test_r12_two_copilot_runs_at_once(stab, tmp_path):
 def test_r13_bypass_and_copilot_at_once(stab, tmp_path):
     with ThreadPoolExecutor(max_workers=2) as ex:
         f1 = ex.submit(L.run_cli, "apply_bypass_rls.py", "--registry-table", L.T_REGISTRY, "--group", L.G_READ,
-                       "--tables", ",".join(TABLES), "--apply", "--parallel", "8")
+                       "--apply", "--parallel", "8")
         f2 = ex.submit(L.run_cli, "apply_copilot_rls.py", *copilot_args(tmp_path / "c.csv", "--apply", "--parallel", "8"))
         (c1, l1), (c2, l2) = f1.result(), f2.result()
-    assert (c1, c2) == (0, 0), (l1[-3000:], l2[-3000:])
+    # bypass 处理登记表中开启的全部表（含 stab_t*）；登记表里的 dropped_t 不存在 → [SKIP]，退出码 1，其余都成功
+    assert (c1, c2) == (1, 0), (l1[-3000:], l2[-3000:])
+    assert f"[SKIP] {L.T_DROPPED}: {core.TABLE_NOT_FOUND_MSG}" in l1 and "[ERROR]" not in l1, l1[-3000:]
     assert_copilot_converged()
     pols = all_policies()
     assert all(BYP_R in p and p[BYP_R]["grantees"] == {f"group:{L.G_READ}"} for p in pols.values()), pols

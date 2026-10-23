@@ -54,44 +54,43 @@ class TestApplyBypass:
 
     def test_registry_table_required_and_old_flags_rejected(self, world):
         with pytest.raises(SystemExit) as e:
-            apply_bypass_rls.main(["--group", G_R, "--tables", T1])
+            apply_bypass_rls.main(["--group", G_R])
         assert e.value.code == 2
-        for old in (["--condition-table", AUTH_COND], ["--mapping-table", AUTH_MAP]):
+        for old in (["--condition-table", AUTH_COND], ["--mapping-table", AUTH_MAP], ["--tables", T1],
+                    ["--datasets", "p.dw"], ["--projects", "p"]):
             with pytest.raises(SystemExit):
-                self.run("--group", G_R, "--tables", T1, *old)
+                self.run("--group", G_R, *old)
 
-    def test_unregistered_or_disabled_tables_skipped_even_in_scope(self, world, capsys):
-        code = self.run("--group", G_R, "--datasets", "p.dw", "--tables", f"{AUTH_COND},{AUTH_MAP}",
-                        "--apply")
+    def test_unregistered_or_disabled_tables_not_processed(self, world, capsys):
+        code = self.run("--group", G_R, "--apply")
         err = capsys.readouterr().err
         assert code == 0
         assert world.policies(AUTH_COND) == [] and world.policies(AUTH_MAP) == []
         assert world.policy(T1, BYP_R) is not None
-        assert f"[SKIP] {AUTH_COND}" in err and f"[SKIP] {AUTH_MAP}" in err
         assert not any(AUTH_COND in d or AUTH_MAP in d for d in world.ddl_log)
-        first_block = err[err.index("将为以下这些表首次设置RLS规则"):].split("如确认")[0]
+        first_block = err[err.index("将为以下这些表首次设置RLS规则"):].split("=====")[0]
         assert AUTH_COND not in first_block and AUTH_MAP not in first_block
 
     def test_nonexistent_registry_table_is_error(self, world, capsys):
-        code = apply_bypass_rls.main(["--group", G_R, "--tables", T1, "--registry-table", "p.dw.typo"])
+        code = apply_bypass_rls.main(["--group", G_R, "--registry-table", "p.dw.typo"])
         assert code == 2 and world.ddl_log == [] and "p.dw.typo" in capsys.readouterr().err
 
     def test_dry_run_changes_nothing(self, world, capsys):
-        code = self.run("--group", G_R, "--tables", f"{T1},{T2},{T3}")
+        code = self.run("--group", G_R)
         out = capsys.readouterr().err
         assert code == 0 and world.ddl_log == []
         assert f"[CREATE] {T1}" in out and f"[NOOP] {T3}" in out
         assert "将为以下这些表首次设置RLS规则" in out and T1 in out
 
     def test_first_policy_listed_but_not_blocked(self, world, capsys):
-        code = self.run("--group", G_R, "--tables", f"{T1},{T2}", "--apply")
+        code = self.run("--group", G_R, "--apply")
         err = capsys.readouterr().err
         assert code == 0 and world.policy(T1, BYP_R) and world.policy(T2, BYP_R)
         assert f"  - {T1}" in err and f"  - {T2}" not in err          # 只有原本无 RLS 的 T1 被列出
         assert "--force-first-policy" not in err
 
-    def test_force_first_policy_creates_per_group_rule(self, world):
-        code = self.run("--group", G_R, "--tables", f"{T1},{T2},{T3}", "--apply")
+    def test_per_group_rule_on_every_registered_table(self, world):
+        code = self.run("--group", G_R, "--apply")
         assert code == 0
         for t in (T1, T2, T3):
             p = world.policy(t, BYP_R)
@@ -101,7 +100,7 @@ class TestApplyBypass:
 
     def test_replace_when_content_differs_prints_old(self, world, monkeypatch, capsys):
         world.policies(T3)[0]["filter"] = "region = 'HK'"
-        code = self.run("--group", G_R, "--tables", T3, "--apply")
+        code = self.run("--group", G_R, "--apply")
         err = capsys.readouterr().err
         assert code == 0 and world.policy(T3, BYP_R)["filter"] == "TRUE"
         assert f"[REPLACE] {T3}" in err and "region = 'HK'" in err
@@ -109,45 +108,39 @@ class TestApplyBypass:
 
     def test_group_required(self, world):
         with pytest.raises(SystemExit) as e:
-            self.run("--tables", T1)
+            self.run()
         assert e.value.code == 2
 
     def test_only_one_group(self, world, capsys):
-        code = self.run("--group", f"{G_R},{G_W}", "--tables", T1)
+        code = self.run("--group", f"{G_R},{G_W}")
         assert code == 2 and "只能指定一个" in capsys.readouterr().err
 
     @pytest.mark.parametrize("flag", ["--merge", "--groups", "--skip-edition-check", "--edition-days"])
     def test_removed_flags_rejected(self, world, flag):
         with pytest.raises(SystemExit):
-            self.run("--group", G_R, "--tables", T1, flag, "x")
+            self.run("--group", G_R, flag, "x")
 
-    def test_scope_datasets_projects_and_files(self, world, tmp_path):
-        f = tmp_path / "ds.csv"
-        f.write_text("p.ods\n", encoding="utf-8")
-        code = self.run("--group", G_W, "--tables", T1, "--datasets", str(f), "--projects", "p",
-                        "--apply")
+    def test_only_registry_decides_targets(self, world):
+        code = self.run("--group", G_W, "--apply")
         assert code == 0
         for t in (T1, T2, T3):
             assert world.policy(t, BYP_W) is not None
         assert world.policies(AUTH_COND) == [] and world.policies(AUTH_MAP) == []
 
-    def test_scope_required(self, world, capsys):
-        assert self.run("--group", G_R) == 2
-
     def test_verify_sa_failure_exit_1(self, world):
         sa = "reader@p.iam.gserviceaccount.com"
         world.verify_result[(T3, sa)] = ("fail", "300s 内未达到可见")
-        code = self.run("--group", G_R, "--tables", T3, "--apply", "--verify-sa", sa)
+        code = self.run("--group", G_R, "--apply", "--verify-sa", sa)
         assert code == 1
 
     def test_verify_sa_ok(self, world, capsys):
         sa = "reader@p.iam.gserviceaccount.com"
-        code = self.run("--group", G_R, "--tables", T3, "--apply", "--verify-sa", sa)
+        code = self.run("--group", G_R, "--apply", "--verify-sa", sa)
         assert code == 0 and "[VERIFY-OK]" in capsys.readouterr().err
 
     def test_ddl_failure_exit_1(self, world):
         world.fail_ddl_on.add(T1)
-        code = self.run("--group", G_R, "--tables", f"{T1},{T2}", "--apply")
+        code = self.run("--group", G_R, "--apply")
         assert code == 1 and world.policy(T2, BYP_R) is not None
 
 

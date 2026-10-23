@@ -169,129 +169,134 @@ class TestPrincipalType:
         assert core.principal_type("123@cloudservices.gserviceaccount.com") == "serviceAgent"
 
 
-class TestSaHomeProject:
-    def test_variants(self):
-        assert core.sa_home_project("etl@prod-proj.iam.gserviceaccount.com") == "prod-proj"
-        assert core.sa_home_project("prod-proj@appspot.gserviceaccount.com") == "prod-proj"
-        assert core.sa_home_project("123-compute@developer.gserviceaccount.com") == "123"
-        assert core.sa_home_project("alice@x.com") == ""
+class TestClassifyMember:
+    @pytest.mark.parametrize("member, expected", [
+        ("user:Alice@x.com", ("alice@x.com", "user")),
+        ("user:etl@p.iam.gserviceaccount.com", ("etl@p.iam.gserviceaccount.com", "serviceAccount")),
+        ("serviceAccount:etl@p.iam.gserviceaccount.com", ("etl@p.iam.gserviceaccount.com", "serviceAccount")),
+        ("serviceAccount:service-1@gcp-sa-bigquery.iam.gserviceaccount.com",
+         ("service-1@gcp-sa-bigquery.iam.gserviceaccount.com", "serviceAgent")),
+        ("group:G@x.com", ("g@x.com", "group")),
+        ("domain:Trip.com", ("trip.com", "domain")),
+        ("allUsers", ("allUsers", "public")),
+        ("allAuthenticatedUsers", ("allAuthenticatedUsers", "public")),
+        ("principal://iam.googleapis.com/locations/global/workforcePools/p/subject/u",
+         ("principal://iam.googleapis.com/locations/global/workforcePools/p/subject/u", "federated")),
+        ("principalSet://iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/*",
+         ("principalSet://iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/*", "federated")),
+        ("deleted:user:old@x.com?uid=1", ("deleted:user:old@x.com?uid=1", "deleted")),
+        ("deleted:serviceAccount:s@p.iam.gserviceaccount.com?uid=2",
+         ("deleted:serviceAccount:s@p.iam.gserviceaccount.com?uid=2", "deleted")),
+    ])
+    def test_kinds(self, member, expected):
+        assert core.classify_member(member) == expected
 
-
-class TestIamMembers:
-    def test_splits_users_sas_and_groups(self):
-        principals, groups = core.split_iam_members([
-            "user:Alice@x.com", "serviceAccount:etl@p.iam.gserviceaccount.com",
-            "group:G@x.com", "domain:x.com", "allUsers", "allAuthenticatedUsers",
-            "deleted:user:old@x.com?uid=1", "projectOwner:p", "principal://iam.googleapis.com/x"])
-        assert principals == {"alice@x.com", "etl@p.iam.gserviceaccount.com"}
-        assert groups == {"g@x.com"}
+    @pytest.mark.parametrize("member", ["projectOwner:p", "projectEditor:p", "projectViewer:p", "", "  ",
+                                        "user:", "weird", "unknownPrefix:x"])
+    def test_skipped(self, member):
+        assert core.classify_member(member) is None
 
 
 class TestBindingMembers:
-    """IAM 策略 bindings -> 账号；只取能读表数据（含 bigquery.tables.getData）的角色。"""
-    OK = {"roles/viewer", "roles/bigquery.dataViewer", "roles/bigquery.dataEditor", "roles/bigquery.dataOwner"}
+    """IAM 策略 bindings -> [(值, 类型, 来源)]；不看角色，全部纳入。"""
 
-    def role_ok(self, role):
-        return role in self.OK
-
-    def test_filter_by_role_and_member_types(self):
+    def test_all_roles_and_member_types_with_source(self):
         bindings = [
             {"role": "roles/viewer", "members": ["user:A@x.com", "deleted:user:gone@x.com?uid=1", "domain:x.com"]},
-            {"role": "roles/bigquery.dataViewer", "members": ["serviceAccount:s@p.iam.gserviceaccount.com", "group:G@x.com",
-                                                              "allUsers", "principalSet://iam.googleapis.com/x"]},
-            {"role": "roles/storage.admin", "members": ["user:gcs@x.com"]},
+            {"role": "roles/storage.admin", "members": ["user:gcs@x.com", "group:G@x.com", "allUsers"]},
             {"role": "roles/bigquery.dataViewer", "members": ["user:cond@x.com"],
              "condition": {"expression": "request.time < timestamp('2030-01-01T00:00:00Z')"}},
+            {"role": "roles/browser", "members": ["projectViewer:p", "principalSet://iam.googleapis.com/x"]},
         ]
-        principals, groups = core.binding_members(bindings, self.role_ok)
-        assert principals == {"a@x.com", "s@p.iam.gserviceaccount.com", "cond@x.com"}
-        assert groups == {"g@x.com"}
+        got = core.binding_members(bindings, "项目 IAM p")
+        assert got == [
+            ("a@x.com", "user", "项目 IAM p: roles/viewer"),
+            ("deleted:user:gone@x.com?uid=1", "deleted", "项目 IAM p: roles/viewer"),
+            ("x.com", "domain", "项目 IAM p: roles/viewer"),
+            ("gcs@x.com", "user", "项目 IAM p: roles/storage.admin"),
+            ("g@x.com", "group", "项目 IAM p: roles/storage.admin"),
+            ("allUsers", "public", "项目 IAM p: roles/storage.admin"),
+            ("cond@x.com", "user", "项目 IAM p: roles/bigquery.dataViewer（带条件）"),
+            ("principalSet://iam.googleapis.com/x", "federated", "项目 IAM p: roles/browser")]
 
-    def test_missing_role_ignored(self):
-        assert core.binding_members([{"members": ["user:a@x.com"]}], self.role_ok) == (set(), set())
+    def test_missing_role_still_listed(self):
+        assert core.binding_members([{"members": ["user:a@x.com"]}], "组织 IAM") == [("a@x.com", "user", "组织 IAM: ?")]
 
 
 class TestDatasetAcl:
-    def role_ok(self, role):
-        return role in TestBindingMembers.OK
-
-    def test_entries_with_roles(self):
+    def test_all_entries_regardless_of_role(self):
         entries = [
             ("READER", "userByEmail", "Alice@x.com"),
             ("WRITER", "userByEmail", "etl@p.iam.gserviceaccount.com"),
             ("OWNER", "groupByEmail", "G@x.com"),
             ("roles/bigquery.dataViewer", "iamMember", "user:bob@x.com"),
-            ("roles/bigquery.dataViewer", "iamMember", "serviceAccount:s2@p.iam.gserviceaccount.com"),
-            ("roles/bigquery.dataViewer", "iamMember", "group:g2@x.com"),
-            ("roles/bigquery.metadataViewer", "userByEmail", "meta@x.com"),          # 读不到数据
-            ("READER", "specialGroup", "projectReaders"),
-            ("READER", "domain", "x.com"),
+            ("roles/bigquery.dataViewer", "iamMember", "principal://iam.googleapis.com/x"),
+            ("roles/bigquery.metadataViewer", "userByEmail", "meta@x.com"),          # 读不到数据，也列出
+            ("READER", "specialGroup", "projectReaders"),                            # 等同项目 Viewer，跳过
+            ("READER", "specialGroup", "allAuthenticatedUsers"),
+            ("READER", "domain", "X.com"),
             (None, "view", {"projectId": "p", "datasetId": "d", "tableId": "v"}),
             (None, "routine", {"projectId": "p", "datasetId": "d", "routineId": "r"}),
             (None, "dataset", {"dataset": {"projectId": "p", "datasetId": "d2"}}),
         ]
-        principals, groups = core.acl_members(entries, self.role_ok)
-        assert principals == {"alice@x.com", "etl@p.iam.gserviceaccount.com", "bob@x.com",
-                              "s2@p.iam.gserviceaccount.com"}
-        assert groups == {"g@x.com", "g2@x.com"}
+        got = core.acl_members(entries, "数据集 ACL p.d")
+        assert got == [
+            ("alice@x.com", "user", "数据集 ACL p.d: READER"),
+            ("etl@p.iam.gserviceaccount.com", "serviceAccount", "数据集 ACL p.d: WRITER"),
+            ("g@x.com", "group", "数据集 ACL p.d: OWNER"),
+            ("bob@x.com", "user", "数据集 ACL p.d: roles/bigquery.dataViewer"),
+            ("principal://iam.googleapis.com/x", "federated", "数据集 ACL p.d: roles/bigquery.dataViewer"),
+            ("meta@x.com", "user", "数据集 ACL p.d: roles/bigquery.metadataViewer"),
+            ("allAuthenticatedUsers", "public", "数据集 ACL p.d: READER"),
+            ("x.com", "domain", "数据集 ACL p.d: READER")]
 
-    def test_legacy_roles_mapped(self):
-        assert core.dataset_role_name("READER") == "roles/bigquery.dataViewer"
-        assert core.dataset_role_name("WRITER") == "roles/bigquery.dataEditor"
-        assert core.dataset_role_name("OWNER") == "roles/bigquery.dataOwner"
-        assert core.dataset_role_name("roles/x") == "roles/x"
 
+class TestFormatSources:
+    def test_order_dedup_and_note(self):
+        s = core.format_sources({"Group 成员: b@x.com", "项目 IAM p: roles/viewer", "账号目录", "组织 IAM: roles/browser",
+                                 "数据集 ACL p.d: READER", "项目 IAM p: roles/viewer"})
+        assert s == "账号目录；组织 IAM: roles/browser；项目 IAM p: roles/viewer；数据集 ACL p.d: READER；Group 成员: b@x.com"
+        assert core.format_sources({"数据集 ACL p.d: READER"}, note="外部域，未展开") == "数据集 ACL p.d: READER（外部域，未展开）"
 
-class TestExpandGroup:
-    def test_recursive_and_unresolved(self):
-        data = {"root@x.com": [("a@x.com", "USER"), ("sub@x.com", "GROUP")],
-                "sub@x.com": [("s@p.iam.gserviceaccount.com", "SERVICE_ACCOUNT"),
-                              ("ext@other.com", "GROUP")],
-                "ext@other.com": None}
-        members, unresolved = core.expand_group("root@x.com", data.get)
-        assert set(members) == {"a@x.com", "sub@x.com", "s@p.iam.gserviceaccount.com", "ext@other.com"}
-        assert members["s@p.iam.gserviceaccount.com"]["via"] == ["root@x.com", "sub@x.com"]
-        assert unresolved == [("ext@other.com", ["root@x.com", "sub@x.com"])]
-
-    def test_cycle_safe(self):
-        data = {"a@x.com": [("b@x.com", "GROUP")], "b@x.com": [("a@x.com", "GROUP")]}
-        members, unresolved = core.expand_group("a@x.com", data.get)
-        assert set(members) == {"a@x.com", "b@x.com"} and unresolved == []
+    def test_limit_five(self):
+        srcs = {f"表 IAM p.d.t{i}: roles/bigquery.dataViewer" for i in range(8)} | {"项目 SA: p"}
+        s = core.format_sources(srcs)
+        assert s.startswith("项目 SA: p；表 IAM p.d.t0") and s.endswith("；…共 9 处") and s.count("；") == 5
 
 
 class TestPrincipalRows:
-    def test_columns_types_and_sorting(self):
-        rows = core.build_principal_rows(
-            {"zed@x.com", "ETL@prod.iam.gserviceaccount.com",
-             "service-1@gcp-sa-bigquery.iam.gserviceaccount.com"})
-        assert [r["email"] for r in rows] == [
-            "etl@prod.iam.gserviceaccount.com",
-            "service-1@gcp-sa-bigquery.iam.gserviceaccount.com", "zed@x.com"]
-        assert list(rows[0]) == core.PRINCIPAL_COLUMNS
-        assert rows[0] == {"email": "etl@prod.iam.gserviceaccount.com", "principal_type": "serviceAccount",
-                           "home_project": "prod"}
-        assert rows[1] == {"email": "service-1@gcp-sa-bigquery.iam.gserviceaccount.com",
-                           "principal_type": "serviceAgent", "home_project": ""}
-        assert rows[2] == {"email": "zed@x.com", "principal_type": "user", "home_project": ""}
+    def book(self, *items):
+        b = core.PrincipalBook()
+        for it in items:
+            b.add(*it)
+        return b
 
-    def test_agents_not_excluded(self):
-        rows = core.build_principal_rows({"d@p.iam.gserviceaccount.com", "service-9@gcp-sa-x.iam.gserviceaccount.com"})
-        assert len(rows) == 2
+    def test_columns_types_sources_and_sorting(self):
+        b = self.book(("zed@x.com", "user", "账号目录"), ("etl@prod.iam.gserviceaccount.com", "serviceAccount", "项目 SA: prod"),
+                      ("etl@prod.iam.gserviceaccount.com", "serviceAccount", "项目 IAM prod: roles/bigquery.dataEditor"),
+                      ("trip.com", "domain", "表 IAM p.d.t: roles/bigquery.dataViewer"))
+        rows = core.build_principal_rows(b)
+        assert list(rows[0]) == core.PRINCIPAL_COLUMNS == ["email", "principal_type", "source"]
+        assert rows == [
+            {"email": "etl@prod.iam.gserviceaccount.com", "principal_type": "serviceAccount",
+             "source": "项目 SA: prod；项目 IAM prod: roles/bigquery.dataEditor"},
+            {"email": "trip.com", "principal_type": "domain", "source": "表 IAM p.d.t: roles/bigquery.dataViewer"},
+            {"email": "zed@x.com", "principal_type": "user", "source": "账号目录"}]
+
+    def test_group_type_wins_and_note(self):
+        b = self.book(("g@x.com", "user", "数据集 ACL p.d: READER"), ("g@x.com", "group", "账号目录 Group"))
+        b.add("g@x.com", "user", "Group 成员: h@x.com")
+        b.note("g@x.com", "未能展开")
+        assert core.build_principal_rows(b) == [{"email": "g@x.com", "principal_type": "group",
+                                                 "source": "账号目录 Group；数据集 ACL p.d: READER；Group 成员: h@x.com（未能展开）"}]
 
     def test_exclude_members_and_patterns(self):
-        rows = core.build_principal_rows(
-            {"copilot-api@p.iam.gserviceaccount.com", "copilot-u1@p.iam.gserviceaccount.com",
-             "keep@x.com"},
-            exclude_members=["Copilot-API@p.iam.gserviceaccount.com"],
-            exclude_patterns=["copilot-u*@*"])
+        b = self.book(("copilot-api@p.iam.gserviceaccount.com", "serviceAccount", "项目 SA: p"),
+                      ("copilot-u1@p.iam.gserviceaccount.com", "serviceAccount", "项目 SA: p"),
+                      ("keep@x.com", "user", "账号目录"), ("allUsers", "public", "组织 IAM: roles/viewer"))
+        rows = core.build_principal_rows(b, exclude_members=["Copilot-API@p.iam.gserviceaccount.com", "ALLUSERS"],
+                                         exclude_patterns=["copilot-u*@*"])
         assert [r["email"] for r in rows] == ["keep@x.com"]
-
-
-    def test_group_rows_typed_group_and_excludable(self):
-        rows = core.build_principal_rows({"a@x.com", "g@other.com"}, groups={"G@Other.com", "ext@vendor.com"},
-                                         exclude_patterns=["*@vendor.com"])
-        assert rows == [{"email": "a@x.com", "principal_type": "user", "home_project": ""},
-                        {"email": "g@other.com", "principal_type": "group", "home_project": ""}]
 
 
 class TestAuthorizedRefs:
@@ -305,8 +310,6 @@ class TestAuthorizedRefs:
         assert core.authorized_refs(entries) == [("授权视图", "p2.d2.v", "p2"), ("授权例程", "p3.d3.r", "p3"),
                                                  ("授权数据集", "p4.d4", "p4")]
 
-    def test_basic_roles(self):
-        assert core.BASIC_ROLES == {"roles/owner", "roles/editor", "roles/viewer"}
 
 class TestOwnDomain:
     def test_email_domain(self):
@@ -321,9 +324,10 @@ class TestOwnDomain:
         assert not core.is_own_domain("x@nottrip.com", own)
         assert not core.is_own_domain("x@trip.com", set()) and not core.is_own_domain("", own)
 
+
 class TestPrincipalColumns:
     def test_three_columns(self):
-        assert core.PRINCIPAL_COLUMNS == ["email", "principal_type", "home_project"]   # 不再输出 display_name / disabled
+        assert core.PRINCIPAL_COLUMNS == ["email", "principal_type", "source"]   # source 取代 home_project
 
 
 # --------------------------------------------------------------------------- #
@@ -353,34 +357,54 @@ class TestPolicyDdl:
 
 
 class TestConditionDimensions:
-    def test_dimensions_are_columns_except_id_and_sa(self):
-        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
+    ST = ("status", "INT64", "NULLABLE")
+
+    def test_dimensions_are_columns_except_id_sa_status(self):
+        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"), self.ST,
                   ("region", "STRING", "REPEATED"), ("prdtype", "STRING", "REPEATED"),
                   ("refername", "STRING", "REPEATED")]
         dims, warns, notes = core.condition_dimensions(fields)
-        assert dims == ["region", "prdtype", "refername"] and warns == [] and notes == []
+        assert dims == ["region", "prdtype", "refername"] and warns == [] and notes == []   # status 不再提示
 
     def test_new_dimension_picked_up_automatically(self):
-        fields = [("id", "STRING", "NULLABLE"), ("SA", "STRING", "NULLABLE"),
+        fields = [("id", "STRING", "NULLABLE"), ("SA", "STRING", "NULLABLE"), ("Status", "INTEGER", "NULLABLE"),
                   ("region", "STRING", "REPEATED"), ("channel", "STRING", "REPEATED")]
         dims, _, _ = core.condition_dimensions(fields)
         assert dims == ["region", "channel"]
 
     def test_non_array_column_excluded_with_note_not_warning(self):
-        # 普通的非数组列（如 status、updated_at）是正常情况：提示（[NOTE]），不是警告
+        # 普通的非数组列（如 updated_at）是正常情况：提示（[NOTE]），不是警告；status 是固定列，不提示
         fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
                   ("region", "STRING", "REPEATED"), ("updated_at", "TIMESTAMP", "NULLABLE"), ("status", "INTEGER", "NULLABLE")]
         dims, warns, notes = core.condition_dimensions(fields)
-        assert dims == ["region"] and warns == [] and len(notes) == 2 and "updated_at" in notes[0] and "status" in notes[1]
+        assert dims == ["region"] and warns == [] and len(notes) == 1 and "updated_at" in notes[0]
 
     def test_special_char_column_is_still_warning(self):
-        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"), ("odd col", "STRING", "REPEATED")]
+        fields = [("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"), self.ST, ("odd col", "STRING", "REPEATED")]
         dims, warns, notes = core.condition_dimensions(fields)
         assert dims == [] and len(warns) == 1 and "含有特殊字符" in warns[0] and notes == []
 
     def test_requires_sa_column(self):
-        with pytest.raises(ValueError, match="sa"):
-            core.condition_dimensions([("id", "STRING", "NULLABLE"), ("region", "STRING", "REPEATED")])
+        with pytest.raises(core.ConditionSchemaError, match="sa"):
+            core.condition_dimensions([("id", "STRING", "NULLABLE"), self.ST, ("region", "STRING", "REPEATED")])
+
+    def test_requires_status_column(self):
+        with pytest.raises(core.ConditionSchemaError, match="缺少 status 列"):
+            core.condition_dimensions([("id", "STRING", "NULLABLE"), ("sa", "STRING", "NULLABLE"),
+                                       ("region", "STRING", "REPEATED")])
+
+    @pytest.mark.parametrize("ftype, mode", [("STRING", "NULLABLE"), ("BOOL", "NULLABLE"), ("FLOAT64", "NULLABLE"),
+                                             ("INT64", "REPEATED")])
+    def test_status_must_be_int64(self, ftype, mode):
+        with pytest.raises(core.ConditionSchemaError, match="应为 INT64"):
+            core.condition_dimensions([("sa", "STRING", "NULLABLE"), ("status", ftype, mode),
+                                       ("region", "STRING", "REPEATED")])
+
+    @pytest.mark.parametrize("ftype", ["INT64", "INTEGER"])
+    def test_status_int64_aliases_accepted(self, ftype):
+        dims, _, _ = core.condition_dimensions([("sa", "STRING", "REQUIRED"), ("status", ftype, "REQUIRED"),
+                                                ("region", "STRING", "REPEATED")])
+        assert dims == ["region"]
 
 
 class TestSelectCopilotTables:
@@ -428,8 +452,13 @@ class TestCopilotFilter:
         flt = core.build_copilot_filter([("market", "region")], COND)
         assert flt == (
             f"(`market` IN (SELECT v FROM `{COND}` AS c, UNNEST(c.region) AS v "
-            f"WHERE c.sa = SESSION_USER()) OR EXISTS (SELECT 1 FROM `{COND}` AS c "
-            f"WHERE c.sa = SESSION_USER() AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0)))")
+            f"WHERE c.status = 1 AND c.sa = SESSION_USER()) OR EXISTS (SELECT 1 FROM `{COND}` AS c "
+            f"WHERE c.status = 1 AND c.sa = SESSION_USER() AND (c.region IS NULL OR ARRAY_LENGTH(c.region) = 0)))")
+
+    def test_every_subquery_requires_status_1(self):
+        flt = core.build_copilot_filter([("region", "region"), ("prd_type", "prdtype"), ("ref", "refername")], COND)
+        assert flt.count("WHERE c.status = 1 AND c.sa = SESSION_USER()") == 6       # 3 个维度 × (IN + EXISTS)
+        assert flt.count("c.sa = SESSION_USER()") == 6
 
     def test_multiple_dimensions_and(self):
         flt = core.build_copilot_filter([("region", "region"), ("prd_type", "prdtype")], COND)

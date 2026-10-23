@@ -46,7 +46,7 @@ def world(monkeypatch):
 
 
 def bypass(*args):
-    return apply_bypass_rls.main(["--group", G, "--registry-table", REG, "--datasets", f"{P}.dw", *args])
+    return apply_bypass_rls.main(["--group", G, "--registry-table", REG, *args])
 
 
 def copilot(tmp_path, *args, name="c.csv"):
@@ -329,19 +329,22 @@ class TestBadInputs:
     def test_s22_gbk_encoded_csv(self, world, tmp_path, capsys):
         f = tmp_path / "t.csv"
         f.write_bytes("项目.数据集.表\n".encode("gbk"))
-        code = apply_bypass_rls.main(["--group", G, "--registry-table", REG, "--tables", str(f), "--apply"])
+        code = rollback_rls.main(["--tables", str(f), "--principals", G, "--apply"])
         assert code == 2 and world.ddl_log == [] and "Traceback" not in capsys.readouterr().err
 
     def test_s23_huge_list_file(self, world, tmp_path):
         f = tmp_path / "t.csv"
         f.write_text("\n".join(TABLES * 250) + "\n", encoding="utf-8")       # 10000 行（含大量重复）
-        assert apply_bypass_rls.main(["--group", G, "--registry-table", REG, "--tables", str(f), "--apply"]) == 0
-        assert len(world.ddl_log) == len(TABLES)
+        assert bypass("--apply") == 0
+        n = len(world.ddl_log)
+        assert rollback_rls.main(["--tables", str(f), "--policy-names", BYP, "--apply"]) == 0
+        assert len(world.ddl_log) - n == len(TABLES)                       # 重复的表只处理一次
+        assert not any(world.policy(t, BYP) for t in TABLES)
 
     def test_s24_csv_is_a_directory(self, world, tmp_path, capsys):
         d = tmp_path / "dir.csv"
         d.mkdir()
-        code = apply_bypass_rls.main(["--group", G, "--registry-table", REG, "--tables", str(d), "--apply"])
+        code = rollback_rls.main(["--tables", str(d), "--principals", G, "--apply"])
         assert code == 2 and "Traceback" not in capsys.readouterr().err
 
     def test_s25_output_csv_unwritable(self, world, tmp_path, capsys):
@@ -355,6 +358,6 @@ class TestBadInputs:
         assert list_principals.main(["--projects", P, "-o", str(tmp_path / "p.csv")]) in (1, 130)
 
     def test_s27_empty_strings_and_whitespace_args(self, world, capsys):
-        assert apply_bypass_rls.main(["--group", G, "--registry-table", REG, "--tables", "", " ", "--apply"]) == 2
+        assert apply_bypass_rls.main(["--group", G, "--registry-table", " ", "--apply"]) == 2
         assert rollback_rls.main(["--tables", " ", "--principals", G]) == 2
         assert "Traceback" not in capsys.readouterr().err

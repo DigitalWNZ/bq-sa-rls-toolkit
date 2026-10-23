@@ -43,7 +43,7 @@ def world(monkeypatch):
 def invocations(tmp_path):
     return {
         list_principals: ["--projects", "p", "-o", str(tmp_path / "p.csv")],
-        apply_bypass_rls: ["--group", "g@x.com", "--tables", T1, "--registry-table", REG],
+        apply_bypass_rls: ["--group", "g@x.com", "--registry-table", REG],
         apply_copilot_rls: ["--condition-table", COND, "--mapping-table", MAP, "--registry-table", REG,
                             "--group", "group_copilot@x.com", "-o", str(tmp_path / "c.csv")],
         rollback_rls: ["--tables", T1, "--principals", SA],
