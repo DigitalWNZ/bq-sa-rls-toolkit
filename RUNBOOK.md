@@ -137,6 +137,22 @@ python apply_bypass_rls.py --group group_existingsa_write@trip.com --registry-ta
 - `[VERIFY-OK]` = 通过；`[VERIFY-FAIL]` = 300 秒内查不到数据或无法扮演（退出码 1）。
 - 重跑安全：已正确的表全部 `[NOOP]`。
 
+**3.4 可选：多个主体共用一条规则**（减少每张表的规则数）。用 `--principals` 代替 `--group`（二者只能给一个），配合 `--policy-name`：
+
+```bash
+# principals.csv：单列无表头，每行一个，必须带前缀 user: / group: / serviceAccount:
+#   group:group_existingsa_read@trip.com
+#   group:group_existingsa_write@trip.com
+#   serviceAccount:etl@trip-prod.iam.gserviceaccount.com
+python apply_bypass_rls.py --policy-name existing_all --principals principals.csv --registry-table $REG          # 演练
+python apply_bypass_rls.py --policy-name existing_all --principals principals.csv --registry-table $REG --apply
+```
+
+- 每张表只建一条 `rls_bypass_full_access_existing_all`，授权给文件里的全部主体。
+- **完整名单**：以后增减主体，修改 principals.csv 后重跑即可；演练日志的 `将新增` / `将移除` 必须先确认——**少写的主体会立刻失去全部可见**。
+- 从两条 `--group` 规则改成一条共享规则时：**先**建好共享规则（`--apply` 成功），**再**用第 8 步 C 按规则名删除两条旧规则；顺序反了会出现查到 0 行的窗口。
+- 规则名同名即覆盖，不检查是否与 `--group` 的规则撞名，请避免用 `group_..._trip_com` 这类与 Group 邮箱相同的后缀。
+
 ## 第 4–6 步：新增账号、Copilot Group、条件表（客户）
 
 1. 创建新增 SA（第 4 步）、为 Copilot SA 赋予扮演权限（第 5 步）。
@@ -228,8 +244,11 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 # B. 撤销某个白名单 Group 的规则
 python rollback_rls.py --datasets trip-prod.dw --principals group_existingsa_write@trip.com --apply
 
-# C. 按规则名删除
+# C. 按规则名删除（整条删除）
 python rollback_rls.py --tables tables.csv --policy-names rls_copilot_group_copilot_trip_com --apply
+
+# C2. 从共享规则（3.4）里只去掉某个账号，其余账号保留
+python rollback_rls.py --datasets trip-prod.dw --principals etl@trip-prod.iam.gserviceaccount.com --apply
 
 # D. 删除目标表上的全部规则（表恢复为没有 RLS：所有有读表权限的账号都看到全部数据）
 python rollback_rls.py --datasets trip-prod.dw --apply
@@ -240,8 +259,9 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 ```
 
 - `--principals` 按规则的**授权对象**匹配（能覆盖手工建的规则）；与 `--policy-names` 同时给出时取交集。
+- 给 `--principals` 时**只从规则里去掉这些主体**（日志 `[REMOVE]`，原过滤条件与其余主体保留）；规则的授权对象全部命中时才删除整条（`[DROP]`）。只授权给一个对象的规则（`--group` 规则、Copilot 规则）照旧整条删除。
 - 日志 `[NOTE]` 会列出「规则将被全部删除」的表，只提示不拦截。
-- 日志逐条打印被删除规则的完整内容（规则名、授权对象、过滤条件），需要恢复时据此重跑第 3 / 7 步即可。
+- 日志逐条打印被删除 / 被去掉主体的规则的完整内容（规则名、授权对象、过滤条件），需要恢复时据此重跑第 3 / 7 步即可。
 
 **中途中断怎么办**：任何脚本被 Ctrl-C（退出码 130）或进程被杀，都不会留下半条规则；直接重跑同一命令即可补齐，已完成的表会 `[NOOP]`（或在 rollback 中不再出现）。
 
@@ -257,6 +277,9 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | 退出码 2，参数错误 | 旧参数已删除（如 `--tables-file`；apply_bypass 的 `--tables` / `--datasets` / `--projects`）；表名必须 `project.dataset.table`（不接受冒号写法）；`.csv` 文件不存在 |
 | apply_copilot 退出码 2，`条件表缺少 status 列` / `status 列的类型是 …` | 条件表需要 `status INT64` 列（1 = 生效）：`ALTER TABLE … ADD COLUMN status INT64`，再把生效的行设为 1。未做任何变更 |
 | 某表 `[SKIP] … 不在登记表`（apply_copilot） | 登记表 `table_name` 与映射表 / `--tables` 中的表名不完全一致（大小写、空格、少了项目名都算不一致） |
+| apply_bypass 退出码 2，`--principals 中有不合格的值` | 每个主体都必须带前缀 `user:` / `group:` / `serviceAccount:`（SA 也要写）；不支持 `domain:` / `allUsers`；同一邮箱不能写成两种类型 |
+| apply_bypass 退出码 2，`必须同时给 --policy-name` / `--policy-name 只能与 --principals 搭配` | `--principals` 必须配 `--policy-name`（规则名后缀）；`--group` 不能配 `--policy-name` |
+| rollback `[ERROR] … 无法写进 GRANT TO 的值` | 要去掉主体的规则里还有 `principalSet://` / `allUsers` / `deleted:` 等授权对象，脚本不改动这条规则：手工处理，或用 `--policy-names` 整条删除 |
 | apply_bypass 漏了某张表 | 它在登记表中不是 `rls_enabled = 1`，或 `table_name` 写法不对（看 `[SCAN]` 行的数量与 `[WARN]`） |
 | `[ERROR] BigQuery 报 Group … 不存在，已停止` | `--group` 拼错，或 Group 刚创建 / 刚改过成员、还没同步到 BigQuery：核对拼写，或等几分钟后重跑。第一张表就失败时退出码 2、未做任何变更 |
 | 某表 `[SKIP] … 表不存在（可能已被删除）` | 映射表 / 登记表里还有这张表，但它已被 drop 或表名写错：清理映射表 / 登记表中的记录（其余表不受影响，退出码 1） |
@@ -286,6 +309,8 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | `[LOG]` | 运行日志文件位置（内容与屏幕输出完全相同） |
 | `[CREATE]` / `[REPLACE]` / `[NOOP]` | 新建 / 覆盖（打印旧内容）/ 已正确无需改动 |
 | `[DROP]` | rollback 将删除的规则 |
+| `[REMOVE]` | rollback 只从规则里去掉指定主体（原过滤条件与其余主体保留） |
+| `[PRINCIPALS]` | apply_bypass `--principals`：共享规则的完整授权对象名单 |
 | `[SKIP]` | 跳过（附原因） |
 | `[NOTE]` | 提示，不影响退出码（首次设置 RLS、将被全部删除的表、条件表总行数与 status = 1 的行数、没有 status = 1 的行、条件表中的非数组列不作为维度、展不开的外部域 Group、list_principals 扫描期间被删除的表） |
 | `[WARN]` | 数据问题，多数情况退出码 1（登记表冲突 / 表名格式不对、条件表 sa 不规范 / 重复）；条件表列名含特殊字符不影响退出码 |

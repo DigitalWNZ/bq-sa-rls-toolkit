@@ -124,14 +124,14 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com \
 | 2 | 参数错误（含 apply_bypass 传入已删除的 `--tables` / `--datasets` / `--projects`）/ 登记表不可用 / 条件表缺 `status` 列或类型不对 / 无法确定执行账号或 quota 项目 / 执行时第一张表即报 Group 不存在 —— **未做任何变更** |
 | 130 | 被用户中断（Ctrl-C） |
 
-**日志前缀**：`[LOG]` 运行日志文件位置；`[AUTH]` 账号；`[SCAN]` 目标范围；`[CREATE]` / `[NOOP]` / `[REPLACE]` / `[DROP]` 逐表计划；`[SKIP]` 跳过（附原因）；
+**日志前缀**：`[LOG]` 运行日志文件位置；`[AUTH]` 账号；`[SCAN]` 目标范围；`[CREATE]` / `[NOOP]` / `[REPLACE]` / `[DROP]` / `[REMOVE]` 逐表计划（`[REMOVE]`：rollback 只从规则里去掉主体）；`[PRINCIPALS]` 共享规则的授权对象；`[SKIP]` 跳过（附原因）；
 `[NOTE]` 提示（不影响退出码）；`[WARN]` 数据问题（退出码 1）；`[ERROR]` 失败；`[VERIFY-OK]` / `[VERIFY-FAIL]` 挂载后验证；`[VISIBLE]` 回退后可见行数；`[retry]` 自动重试；结尾 `=====` 之间为汇总。
 
 **规则命名**（脚本按名字识别自己建的规则）：
 
 | 脚本 | 规则名 |
 |---|---|
-| apply_bypass_rls.py | `rls_bypass_full_access_<Group 邮箱，小写，非字母数字换成 _>`，如 `rls_bypass_full_access_group_existingsa_read_trip_com` |
+| apply_bypass_rls.py | `--group`：`rls_bypass_full_access_<Group 邮箱，小写，非字母数字换成 _>`，如 `rls_bypass_full_access_group_existingsa_read_trip_com`；`--principals`：`rls_bypass_full_access_<--policy-name>` |
 | apply_copilot_rls.py | `rls_copilot_<Group 邮箱，同上>`，如 `rls_copilot_group_copilot_trip_com` |
 
 ## 客户维护的三张表
@@ -257,7 +257,9 @@ FILTER USING (TRUE)
 
 | 参数 | 说明 |
 |---|---|
-| `--group`（必填） | 白名单 Group 邮箱，只能一个 |
+| `--group` | 白名单 Group 邮箱，只能一个；每个 Group 一条规则。**与 `--principals` 二选一（必须且只能给一个）** |
+| `--principals` | 多个主体**共用一条**规则（用来减少每张表的规则数）：每个都**必须带前缀** `user:` / `group:` / `serviceAccount:`；值或 `.csv`，可重复累加 |
+| `--policy-name` | 与 `--principals` 搭配时必填：规则名后缀（小写字母、数字、下划线），脚本自动加前缀，如 `existing_all` → `rls_bypass_full_access_existing_all` |
 | `--registry-table`（必填） | 登记表 `project.dataset.table`：处理其中 `rls_enabled = 1` 的**全部**表 |
 | `--verify-sa` | 可选：执行后扮演该 Group 里的一个 SA 查表，300 秒内查到任意一行即通过；SA 无法扮演时立即失败 |
 | `--parallel` | 默认 16 |
@@ -274,6 +276,23 @@ FILTER USING (TRUE)
 | `table_name` 不是 `project.dataset.table` | `[WARN]` + `[SKIP]`，退出码 1 |
 | 同一 `table_name` 多行且 `rls_enabled` 不一致 | `[WARN]` + `[SKIP]`，退出码 1 |
 
+**多个主体共用一条规则（`--principals`）**：
+
+```sql
+CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access_existing_all`
+ON `trip-prod.dw.orders`
+GRANT TO ("group:group_existingsa_read@trip.com", "group:group_existingsa_write@trip.com",
+          "serviceAccount:etl@trip-prod.iam.gserviceaccount.com")
+FILTER USING (TRUE)
+```
+
+- 任何一个主体不带前缀，或写成 `domain:` / `allUsers` / `allAuthenticatedUsers` → 整次运行拒绝（退出码 2）；`serviceAccount:` 后必须是 `*.gserviceaccount.com`。
+- **完整名单**：规则的授权对象 = 本次 `--principals` 的全部。与表上现有的同名规则不同 → `[REPLACE]`，日志逐表列出 `将新增` / `将移除`（演练即可看到）。**少写的主体会被去掉**，对应账号立刻失去「全部可见」。
+- 同名即覆盖，**不检查**是否与 `--group` 建的规则撞名，请自行避免。
+- 主体不存在时与 `--group` 相同：第一张表即停止，退出码 2，未做任何变更。
+- 从共享规则里去掉某个主体：用去掉它之后的完整名单重跑；或用 rollback_rls `--principals`（只去掉该主体，见第 4 节）。
+- 一条规则可写多少个主体，BigQuery 文档未写明；实测 50 个可以。主体很多时建议先放进 Group。
+
 **首次设置提示**：表上原本没有任何规则时，新建第一条会让其它未被授权的账号查到 0 行；这些表在日志中以 `[NOTE]` 列出（「将为以下这些表首次设置RLS规则」），只提示、不拦截。
 
 ```bash
@@ -281,6 +300,9 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply
 python apply_bypass_rls.py --group group_existingsa_write@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply --verify-sa etl@trip-prod.iam.gserviceaccount.com
+# 多个主体共用一条规则（principals.csv：单列无表头，每行一个，必须带前缀）
+python apply_bypass_rls.py --policy-name existing_all --principals principals.csv \
+    --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply
 ```
 
 ### 3. apply_copilot_rls.py：Copilot Group 按条件表过滤（第 7 步）
@@ -351,24 +373,26 @@ python apply_copilot_rls.py ...同上... --apply
 
 ### 4. rollback_rls.py：回退（第 8 步）
 
-删除目标表上的 RLS 规则。
+删除目标表上的 RLS 规则，或从规则里去掉指定主体。
 
 | 参数 | 说明 |
 |---|---|
 | `--tables` / `--datasets` / `--projects` | 目标范围（必填至少一类，可叠加） |
-| `--principals` | 邮箱（Group / SA / user 均可，不分类型）：删除**授权对象里含这些邮箱**的规则（能覆盖手工建的规则） |
-| `--policy-names` | 规则名 |
+| `--principals` | 邮箱（Group / SA / user 均可，不分类型，不用写前缀）：授权对象里含这些邮箱的规则（能覆盖手工建的规则）——**只从规则里去掉这些主体**（`[REMOVE]`），规则的授权对象全部命中时才删除整条（`[DROP]`） |
+| `--policy-names` | 规则名：删除整条规则 |
 | `--verify-sa` | 可选：删除后扮演该 SA 逐表查询，打印「可见 N 行 / 表共 M 行」，只报告不判定 |
 | `--parallel` / `--apply` / `--gcloud-account` / `--quota-project` | 同上 |
 
-- `--principals` 与 `--policy-names` 同时给出时取**交集**；**两者都不给 = 删除目标表上的全部规则**。
+- `--principals` 与 `--policy-names` 同时给出时取**交集**（只在这些规则里去掉主体）；**两者都不给 = 删除目标表上的全部规则**。
+- `[REMOVE]`：用**原过滤条件**和剩余主体重建这条规则（`CREATE OR REPLACE`），例如从 apply_bypass_rls `--principals` 建的共享规则里去掉一个账号，其余账号不受影响。只授权给一个对象的规则（`--group` 建的规则、Copilot 规则）仍整条删除。剩余主体里有脚本无法写进 `GRANT TO` 的值（`principalSet://`、`allUsers`、`deleted:` 等）→ 这条规则 `[ERROR]`、不动它，退出码 1。
 - 某张表的规则将被全部删除时（删除后所有有读表权限的账号都能看到全部数据），日志 `[NOTE]` 列出，只提示不拦截；此时用 `DROP ALL ROW ACCESS POLICIES`。
-- 演练和执行都逐条打印被删除规则的完整内容（表、规则名、授权对象、过滤条件）和 DDL，可代替备份用于事后追查。
+- 演练和执行都逐条打印被删除 / 被去掉主体的规则的完整内容（表、规则名、授权对象、过滤条件）和 DDL，可代替备份用于事后追查。
 
 ```bash
 python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.com --apply        # 撤销 Copilot 规则
 python rollback_rls.py --tables tables.csv --policy-names rls_bypass_full_access_group_existingsa_read_trip_com --apply
 python rollback_rls.py --tables tables.csv --apply                                                 # 删除这些表上的全部规则
+python rollback_rls.py --tables tables.csv --principals etl@trip-prod.iam.gserviceaccount.com --apply  # 从共享规则里只去掉这个 SA
 ```
 
 ---

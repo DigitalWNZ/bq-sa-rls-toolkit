@@ -52,6 +52,11 @@ REQUIREMENTS = {
     "F25": ("list_principals：授权视图 / 数据集 / 例程所在项目不在扫描范围时 [NOTE] 列出这些项目", "（本地）"),
     "F26": ("list_principals：授权记录中的 Group 只展开一层；嵌套组只列组名", "test_e2e::test_01e"),
     "F27": ("list_principals：非具体账号也写入 CSV（domain / public / federated / deleted）", "（本地）"),
+    "F28": ("apply_bypass：--principals（必须带 user: / group: / serviceAccount: 前缀，值或 .csv）+ --policy-name，"
+            "多个主体共用一条 FILTER TRUE 规则；完整名单，REPLACE 时列出将新增 / 将移除；--group 不变、二者只能给一个",
+            "test_z_shared_bypass::s01–s05"),
+    "F29": ("rollback：按主体回退时只从规则里去掉这些主体（[REMOVE]，保留原过滤条件与其余主体），去光了才删除整条",
+            "test_z_shared_bypass::s06"),
 }
 
 P = "trip-prod"
@@ -137,7 +142,7 @@ def copilot(tmp_path, *args):
 
 
 def test_requirement_table_complete():
-    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 28)]
+    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 30)]
 
 
 # --------------------------------------------------------------------------- #
@@ -391,3 +396,33 @@ def test_F27_non_concrete_principals_written(world, tmp_path):
     _, rows, _ = lp(tmp_path, "--projects", P)
     assert [rows[k]["principal_type"] for k in ("trip.com", "allAuthenticatedUsers", "principalSet://iam.googleapis.com/x",
                                                  "deleted:user:a@trip.com?uid=9")] == ["domain", "public", "federated", "deleted"]
+
+
+def test_F28_shared_bypass_policy(world, tmp_path, capsys):
+    f = tmp_path / "principals.csv"
+    f.write_text(f"group:{G_R}\ngroup:{G_W}\nserviceAccount:{SA_A}\nuser:{U_C}\n", encoding="utf-8")
+    shared = core.BYPASS_PREFIX + "existing_all"
+    base = ["--policy-name", "existing_all", "--registry-table", REG]
+    assert apply_bypass_rls.main(["--principals", str(f), *base, "--apply"]) == 0
+    want = sorted([f"group:{G_R}", f"group:{G_W}", f"serviceAccount:{SA_A}", f"user:{U_C}"])
+    for t in (T1, T2, T3, T4):
+        assert sorted(world.policy(t, shared)["grantees"]) == want and len(world.policies(t)) == 1
+    assert world.policies(T_OFF) == []
+    capsys.readouterr()
+    assert apply_bypass_rls.main(["--principals", f"group:{G_R}", f"serviceAccount:{SA_A}", *base, "--apply"]) == 0
+    err = capsys.readouterr().err
+    assert f"将移除: ['group:{G_W}', 'user:{U_C}']" in err and err.count("[REPLACE]") == 4
+    assert apply_bypass_rls.main(["--principals", G_R, *base]) == 2                    # 不带前缀
+    with pytest.raises(SystemExit):
+        apply_bypass_rls.main(["--group", G_R, "--principals", f"group:{G_W}", *base])   # 二者只能给一个
+
+
+def test_F29_rollback_removes_only_given_principals(world, capsys):
+    shared = core.BYPASS_PREFIX + "existing_all"
+    apply_bypass_rls.main(["--principals", f"group:{G_R}", f"user:{U_C}", "--policy-name", "existing_all",
+                           "--registry-table", REG, "--apply"])
+    assert rollback_rls.main(["--tables", T1, "--principals", U_C, "--apply"]) == 0
+    assert world.policy(T1, shared)["grantees"] == [f"group:{G_R}"]
+    assert "[REMOVE]" in capsys.readouterr().err
+    assert rollback_rls.main(["--tables", T1, "--principals", G_R, "--apply"]) == 0
+    assert world.policy(T1, shared) is None

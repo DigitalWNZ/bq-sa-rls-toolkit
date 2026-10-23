@@ -38,6 +38,7 @@ class FakeWorld:
         self.ddl_log = []         # 执行过的 DDL
         self.fail_ddl_on = set()  # 这些表执行 DDL 时抛错
         self.missing_groups = set()       # 这些 Group 不存在：建规则时抛 BigQuery 的「Group … does not exist」
+        self.missing_members = set()      # 这些授权对象（"user:x" / "serviceAccount:x"）不存在：同样报「… does not exist」
         self.fail_drop_policies = set()   # 删除这些规则名时抛错（模拟逐条 DROP 中途失败）
         # list_principals（全部权威 API）
         self.crm_children = {}    # "organizations/1" / "folders/2" -> {"folders": [...], "projects": [(id, state)]}
@@ -145,6 +146,11 @@ class FakeWorld:
                 if g.startswith("group:") and g[6:] in self.missing_groups:
                     raise RuntimeError(f"400 Failed to create row access policy: IAM setPolicy failed for "
                                        f"RowAccessPolicy {m['name']} on table {t}: Group {g[6:]} does not exist.")
+                if g in self.missing_members:
+                    kind, _, email = g.partition(":")
+                    label = {"user": "User", "serviceAccount": "Service account"}.get(kind, kind)
+                    raise RuntimeError(f"400 Failed to create row access policy: IAM setPolicy failed for "
+                                       f"RowAccessPolicy {m['name']} on table {t}: {label} {email} does not exist.")
             pols = self.policies(t)
             pols[:] = [p for p in pols if p["id"] != m["name"]]
             pols.append({"id": m["name"], "filter": m["filter"], "grantees": grantees})

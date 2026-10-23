@@ -1,12 +1,12 @@
 # 测试
 
-> 最新一次完整测试：2026-10-22。**五类测试全部 100% 通过。**
+> 最新一次完整测试：2026-10-22；2026-10-23 新增的用例单独运行，全部通过。**五类测试全部 100% 通过。**
 
 | 类别 | 位置 | 数量 | 结果 | 环境 |
 |---|---|---|---|---|
-| 1 单体测试 | `tests/unit/` | 730 | ✅ 730 / 730 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
-| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py` | 40 | ✅ 40 / 40（全套约 19 分钟；r08 本次单独运行） | 真实 GCP（Argolis 测试组织） |
-| 3 功能测试 | `tests/functional/test_requirements.py` | 28 | ✅ 28 / 28 | 本地；每条需求另有对应的系统测试用例 |
+| 1 单体测试 | `tests/unit/` | 797 | ✅ 797 / 797 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
+| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py`、`test_z_shared_bypass.py` | 47 | ✅ 47 / 47（全套约 22 分钟；r08、s01–s06 单独运行） | 真实 GCP（Argolis 测试组织） |
+| 3 功能测试 | `tests/functional/test_requirements.py` | 30 | ✅ 30 / 30 | 本地；每条需求另有对应的系统测试用例 |
 | 4 性能测试 | `tests/perf/run_perf.py`、`simulate.py` | 1000 表 × 500 新增 × 100 存量 | ✅ 全部步骤成功，0 重试、0 错误 | 真实 GCP + 本地模拟 |
 | 5 稳定性测试 | `tests/stability/test_stability.py`、`tests/integration/test_zz_stability.py` | 28 + 4 | ✅ 32 / 32 | 本地 + 真实 GCP |
 
@@ -40,7 +40,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 
 ---
 
-## 1. 单体测试（730）
+## 1. 单体测试（797）
 
 用 `tests/unit/fakes.py` 中的 FakeWorld 模拟 GCP（表、规则、授权对象、登记表 / 条件表 / 映射表、IAM、账号目录、Group），直接调用四个脚本的 `main()`，断言退出码、日志、生成的 DDL 与最终规则状态。
 
@@ -60,8 +60,9 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | `test_log_file.py` | 17 | 运行日志文件：四个脚本默认写 `logs/<脚本名>_<时间戳>.log`、内容与屏幕逐字相同、`--log-dir`、目录不可写只 `[WARN]`、同一秒不覆盖、argparse 错误 / `--help` 不写、Ctrl-C 与参数错误也记录、32 线程并发不交错、写盘失败不影响脚本 |
 | `test_gcp_auth.py` | 19 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新；通过 gcloud 扮演 SA 时 `[AUTH]` 显示实际执行的 SA 与登录账号、扮演失败的提示 |
 | `test_gcp_ops.py` | 14 | 重试分类、404 判定、限速、挂载后验证（扮演失败立即失败）、getAncestry 解析、组织信息（customer ID、主域名） |
+| `test_shared_bypass.py` | 67 | apply_bypass `--principals` / `--policy-name`：前缀必填（不带前缀、`domain:`、`allUsers`、注入字符、类型与邮箱不符、同邮箱两种类型、空列表 → 退出码 2 且零 API 调用）、规则名后缀校验、与 `--group` 二选一、`.csv` 输入；一条规则含全部主体、顺序不同 NOOP、增减主体 REPLACE 并列出将新增 / 将移除、与 `--group` 规则共存、撞名按完整名单覆盖、user / SA / Group 不存在第一张表即停止；rollback `--principals` 只去掉指定主体（`[REMOVE]`，保留原过滤条件）、去光才删除、与 `--policy-names` 取交集、剩余授权对象无法重建 → `[ERROR]` 不动、DDL 失败报告 |
 
-## 2. 系统测试（40，真实 GCP）
+## 2. 系统测试（47，真实 GCP）
 
 `conftest.py` 在测试项目中准备：业务表（含列名不同、分区表、映射到不存在的列、映射表里没有、登记为未开启、没有 bypass 的表；每张 9 行，含 HK / SG / US × mobile 数据）、条件表 / 映射表 / 登记表（条件表有 `status` 列，另有一行 `status = 0` 的停用行；条件表、映射表、登记表自身、备用映射表都登记为 `rls_enabled = 0`；映射表 / 登记表中另有一张实际不存在的 `dropped_t`）、7 个测试 SA（存量读 / 写、通过数据集 ACL 授权、Copilot A / B / N / M）、4 个 Group（ReadOnly、Writable、ACL、Copilot）及其权限。然后按方案文档顺序运行四个脚本，并**以各账号身份实际查表**验证可见性。
 
@@ -76,8 +77,9 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | test_30–34 | rollback：不给筛选 = 全部（演练）、按 Copilot Group、按 user 与规则名、按 Group、删光不拦 |
 | r01–r07 | 登记表里的视图不支持 RLS 且被隔离、视图误配进映射表、条件表脏数据（大小写 / 前缀 / 组邮箱 / 乱码 / 特殊列名）、大小写修正后无需重跑、user 执行账号、不可扮演的 `--verify-sa` 立即失败、错误的 gcloud 账号、rollback 不存在的数据集 / 表 |
 | r08 | list_principals 扫描时**真实地**在列出表之后删掉一张表 → 真实 BigQuery 返回 404 → `[NOTE] 表已不存在（扫描期间被删除），跳过`、退出码 0、无 `[ERROR]`、其余主体照常写入 CSV |
+| s01–s06 | `test_z_shared_bypass.py`：`--principals` 用 `.csv` 输入 Group + 2 个 SA → 每张表一条共享规则、授权对象正好 3 个，两个 SA 只靠它就看到全部；重跑 NOOP（顺序不同）；去掉一个 SA → REPLACE、日志「将移除」、该 SA 立刻 0 行；名单里有不存在的 user / SA → 第一张表即停止、退出码 2、零变更（BigQuery 原文 `User … does not exist` / `Service account … does not exist`）；参数错误；**50 个主体写进一条规则成功**；rollback `--principals` 只从两条共享规则里去掉该 SA（`[REMOVE]`），其余主体照常可见；`--policy-names` 整条删除 |
 
-## 3. 功能测试（28：客户需求逐条映射）
+## 3. 功能测试（30：客户需求逐条映射）
 
 `REQUIREMENTS` 字典把每条客户需求映射到本地用例和真实环境用例；`test_requirement_table_complete` 保证每条需求都有用例。
 
@@ -110,6 +112,8 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | F25 | 授权视图 / 数据集 / 例程所在项目不在扫描范围时 `[NOTE]` 列出 | 本地 |
 | F26 | 授权记录中的 Group 只展开一层；嵌套组只列组名 | test_01e |
 | F27 | 非具体账号也写入 CSV（domain / public / federated / deleted） | 本地 |
+| F28 | apply_bypass `--principals`（必须带前缀，值或 `.csv`）+ `--policy-name`：多个主体共用一条 FILTER TRUE 规则；完整名单，REPLACE 时列出将新增 / 将移除；`--group` 不变、二者只能给一个 | s01–s05 |
+| F29 | rollback 按主体回退时只从规则里去掉这些主体（`[REMOVE]`），去光才删除整条 | s06 |
 
 ## 4. 性能测试
 

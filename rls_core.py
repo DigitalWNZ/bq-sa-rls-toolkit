@@ -440,6 +440,72 @@ def group_email(value):
 copilot_group = group_email          # 旧名（保持兼容）
 
 
+# --------------------------------------------------------------------------- #
+# apply_bypass_rls --principals：多个主体共用一条 FILTER TRUE 规则
+# --------------------------------------------------------------------------- #
+_BYPASS_MEMBER_PREFIXES = {"user": "user", "group": "group", "serviceaccount": "serviceAccount"}
+_SHARED_SUFFIX_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def parse_bypass_principals(values):
+    """
+    --principals 的值 -> 规范化的授权对象列表（按输入顺序去重）。
+    每个值都必须带前缀 user: / group: / serviceAccount:（前缀不区分大小写），邮箱一律小写；
+    serviceAccount: 必须是 *.gserviceaccount.com，user: / group: 不能是 SA 邮箱；
+    domain: / allUsers / allAuthenticatedUsers / 不带前缀 / 含引号等字符 -> 不合格。
+    同一邮箱写成两种类型 -> 不合格。有任何不合格的值、或结果为空 -> 抛 ValueError（列出全部问题）。
+    """
+    out, bad, kinds = [], [], {}
+    for raw in values:
+        v = str(raw).strip()
+        prefix, sep, email = v.partition(":")
+        kind = _BYPASS_MEMBER_PREFIXES.get(prefix.strip().lower()) if sep else None
+        email = email.strip().lower()
+        if kind is None:
+            bad.append(f"{v}（必须带前缀 user: / group: / serviceAccount:）")
+            continue
+        if not _EMAIL_RE.match(email) or any(ch in email for ch in "\"'`\\ "):
+            bad.append(f"{v}（邮箱格式不对）")
+            continue
+        is_sa = email.endswith("gserviceaccount.com")
+        if kind == "serviceAccount" and not is_sa:
+            bad.append(f"{v}（serviceAccount: 后应为 *.gserviceaccount.com）")
+            continue
+        if kind != "serviceAccount" and is_sa:
+            bad.append(f"{v}（SA 邮箱应写 serviceAccount: 前缀）")
+            continue
+        if kinds.get(email, kind) != kind:
+            bad.append(f"{v}（同一邮箱写成了 {kinds[email]}: 和 {kind}: 两种类型）")
+            continue
+        kinds[email] = kind
+        member = f"{kind}:{email}"
+        if member not in out:
+            out.append(member)
+    if bad:
+        raise ValueError("--principals 中有不合格的值：" + "；".join(bad))
+    if not out:
+        raise ValueError("--principals 至少需要一个主体")
+    return out
+
+
+def shared_bypass_policy_name(suffix):
+    """--policy-name 后缀 -> rls_bypass_full_access_<后缀>；后缀只允许小写字母、数字、下划线。"""
+    s = str(suffix).strip()
+    if not _SHARED_SUFFIX_RE.match(s):
+        raise ValueError(f"--policy-name 只允许小写字母、数字、下划线（脚本自动加前缀 {BYPASS_PREFIX}）: {suffix!r}")
+    name = BYPASS_PREFIX + s
+    if len(name) > POLICY_NAME_MAX:
+        raise ValueError(f"--policy-name 过长：加前缀后不能超过 {POLICY_NAME_MAX} 个字符")
+    return name
+
+
+def grantee_diff(old, new):
+    """(新增, 移除)：规范化后比较，各自排序。"""
+    o = {normalize_member(g) for g in (old or [])}
+    n = {normalize_member(g) for g in new}
+    return sorted(n - o), sorted(o - n)
+
+
 def invalid_sa_values(raw_values):
     """条件表 sa 列里不是裸邮箱的原值（带 user: / group: 等前缀、allUsers、乱码）：永远匹配不到 SESSION_USER()。"""
     return sorted({v for v in raw_values if isinstance(v, str) and not _EMAIL_RE.match(v.strip().lower())})
@@ -664,12 +730,19 @@ def remaining_policy_slots(existing_count):
 class RollbackPlan:
     to_drop: list = field(default_factory=list)
     drop_all: bool = False        # 表上所有规则都将被删除（需用 DROP ALL）
+    to_remove: list = field(default_factory=list)   # [(规则, 剩余授权对象, 去掉的授权对象)]：只去掉部分主体
+
+    @property
+    def empty(self):
+        return not (self.to_drop or self.to_remove)
 
 
 def plan_rollback(policies, principals=None, policy_names=None):
     """
     principals: 邮箱集合（不分类型）；规则授权对象里有其中任一邮箱即匹配。
     policy_names: 规则名集合。两者都给时取交集；都不给时选中全部规则。
+    给了 principals 时：匹配的规则只去掉这些主体（to_remove，用原过滤条件重建为剩余名单）；
+    授权对象全部命中才删除整条（to_drop）。
     """
     emails = {member_email(p) for p in principals} if principals else None
     names = set(policy_names) if policy_names else None
@@ -677,11 +750,23 @@ def plan_rollback(policies, principals=None, policy_names=None):
     for p in policies:
         if names is not None and p["id"] not in names:
             continue
-        if emails is not None and not ({member_email(g) for g in p["grantees"]} & emails):
-            continue
+        if emails is not None:
+            grantees = p["grantees"] or []
+            hit = [g for g in grantees if member_email(g) in emails]
+            if not hit:
+                continue
+            rest = [g for g in grantees if member_email(g) not in emails]
+            if rest:
+                plan.to_remove.append((p, rest, hit))
+                continue
         plan.to_drop.append(p)
-    plan.drop_all = bool(plan.to_drop) and len(plan.to_drop) == len(policies)
+    plan.drop_all = bool(plan.to_drop) and not plan.to_remove and len(plan.to_drop) == len(policies)
     return plan
+
+
+def unrebuildable_grantees(grantees):
+    """剩余授权对象里脚本无法写进 GRANT TO 的值（如 principalSet://、allUsers、deleted:）。"""
+    return [g for g in grantees if not _GRANTEE_RE.match(g)]
 
 
 # --------------------------------------------------------------------------- #

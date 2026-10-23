@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-为一个白名单 Group 在目标表上设置 FILTER TRUE 行级规则（Doc 第 3 步）：
-该 Group 的成员不受行级过滤、可见全部记录（前提是本来就有读表权限；本脚本不授予读表权限）。
+为白名单（一个 Group，或多个 user / group / SA）在目标表上设置 FILTER TRUE 行级规则（Doc 第 3 步）：
+被授权的账号不受行级过滤、可见全部记录（前提是本来就有读表权限；本脚本不授予读表权限）。
 
-每个 Group 单独一条规则，规则名 rls_bypass_full_access_<邮箱，小写，非字母数字换成 _>:
-  CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access_<group>` ON `表`
-  GRANT TO ("group:<group>") FILTER USING (TRUE)
-一次只处理一个 Group（--group），ReadOnly、Writable 各运行一次。
+两种用法（每次运行二选一，同时给或都不给 -> 参数错误，退出码 2）:
+  --group <Group 邮箱>: 每个 Group 单独一条规则，规则名 rls_bypass_full_access_<邮箱，小写，非字母数字换成 _>:
+    CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access_<group>` ON `表`
+    GRANT TO ("group:<group>") FILTER USING (TRUE)
+    一次只处理一个 Group，ReadOnly、Writable 各运行一次。
+  --principals <主体...> --policy-name <后缀>: 多个 user / group / SA 共用一条规则（减少每张表的规则数）:
+    CREATE OR REPLACE ROW ACCESS POLICY `rls_bypass_full_access_<后缀>` ON `表`
+    GRANT TO ("group:a@x", "user:b@x", "serviceAccount:c@p.iam.gserviceaccount.com") FILTER USING (TRUE)
+    - 每个主体都必须带前缀 user: / group: / serviceAccount:（不带前缀、domain: / allUsers 等 -> 退出码 2）；
+      可直接写值，也可写单列无表头的 .csv 文件；
+    - --policy-name 只写后缀（小写字母、数字、下划线），脚本自动加前缀 rls_bypass_full_access_；
+    - 完整名单: 规则的授权对象 = 本次 --principals 的全部；与表上现有的同名规则不同就 REPLACE，
+      日志逐表列出「将新增 / 将移除」的主体（少写的主体会被去掉，对应账号立刻失去全部可见）；
+    - 同名即覆盖，不检查是否与 --group 建的规则撞名（请自行避免）；
+    - 其余（登记表、首次设置提示、--verify-sa、Group 不存在立即停止、退出码）与 --group 相同。
 
 目标表 = 登记表中 rls_enabled = 1 的全部表（不再扫描项目 / 数据集，耗时与项目大小无关）:
   --registry-table 必填：登记表（adm_user_mem_copilot_tb），只读 table_name、rls_enabled 两列（不看 status）；
@@ -27,8 +38,11 @@
   python apply_bypass_rls.py --group group_existingsa_read@domain.com \\
       --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb
   python apply_bypass_rls.py ... --apply --verify-sa reader@prod.iam.gserviceaccount.com
+  python apply_bypass_rls.py --registry-table ... --policy-name existing_all \\
+      --principals group:group_existingsa_read@domain.com,serviceAccount:etl@prod.iam.gserviceaccount.com
+  python apply_bypass_rls.py --registry-table ... --policy-name existing_all --principals principals.csv --apply
 
-Group 不存在: 执行时 BigQuery 报「Group … does not exist」→ 不等待重试，立即停止（第一张需要变更的表先单独执行，
+Group（或 --principals 中的主体）不存在: 执行时 BigQuery 报「… does not exist」→ 不等待重试，立即停止（第一张需要变更的表先单独执行，
   它失败则其余表都不执行，退出码 2）。Group 刚创建 / 刚改成员时等几分钟后重跑。
 退出码: 0 成功；1 DDL 执行失败 / 验证失败 / 登记表记录冲突或表名格式不对 / 表不存在；2 参数错误 / 登记表不可用 / 第一张表即报 Group 不存在（未做任何变更）
 """
@@ -148,13 +162,19 @@ def execute_tables(tables, execute, n_workers, apply, needs_change, on_result):
     return ("abort_mid" if stop.is_set() else "ok"), not_run
 
 
-def log_group_abort(status, not_run, group):
-    """execute_tables 中止时的说明；返回该情况下的退出码（abort_first = 2：未做任何变更）。"""
+PRINCIPAL_MISSING_HINT = "若主体刚创建或 Group 刚改过成员，同步到 BigQuery 需要几分钟，请稍后重跑；否则请检查 --principals 是否拼错、前缀是否写对"
+
+
+def log_group_abort(status, not_run, group, what=None, hint=GROUP_MISSING_HINT, detail=""):
+    """
+    execute_tables 中止时的说明；返回该情况下的退出码（abort_first = 2：未做任何变更）。
+    what: 「…不存在」的主语（默认「Group <group> 」；--principals 时为「--principals 中有授权对象」）；detail 紧跟「不存在」。
+    """
+    what = what or f"Group {group} "
     if status == "abort_first":
-        ops.log(f"[ERROR] BigQuery 报 Group {group} 不存在，已停止：其余 {not_run} 张需要变更的表未执行，未做任何变更。"
-                f"{GROUP_MISSING_HINT}")
+        ops.log(f"[ERROR] BigQuery 报 {what}不存在{detail}，已停止：其余 {not_run} 张需要变更的表未执行，未做任何变更。{hint}")
         return 2
-    ops.log(f"[ERROR] 执行中 BigQuery 报 Group {group} 不存在，已停止：{not_run} 张需要变更的表未执行。{GROUP_MISSING_HINT}")
+    ops.log(f"[ERROR] 执行中 BigQuery 报 {what}不存在{detail}，已停止：{not_run} 张需要变更的表未执行。{hint}")
     return 1
 
 
@@ -186,8 +206,16 @@ def run_main(fn, argv):
 
 # --------------------------------------------------------------------------- #
 def _main(argv):
-    p = argparse.ArgumentParser(description="为一个白名单 Group 设置 FILTER TRUE 行级规则", allow_abbrev=False)
-    p.add_argument("--group", required=True, help="白名单 Group 邮箱（只能一个）")
+    p = argparse.ArgumentParser(description="为白名单设置 FILTER TRUE 行级规则（--group 一个 Group 一条规则，"
+                                            "或 --principals 多个主体共用一条规则）", allow_abbrev=False)
+    who = p.add_mutually_exclusive_group(required=True)          # 二选一：都不给 / 都给 -> argparse 报错，退出码 2
+    who.add_argument("--group", default=None, help="白名单 Group 邮箱（只能一个；与 --principals 二选一）")
+    who.add_argument("--principals", nargs="*", action="extend", default=None,
+                   help="多个主体共用一条规则（与 --group 二选一）：每个都必须带前缀 user: / group: / serviceAccount:，"
+                        "逗号或空格分隔；也可写 .csv 文件（单列无表头）。完整名单：规则的授权对象 = 这里的全部")
+    p.add_argument("--policy-name", default=None,
+                   help="与 --principals 搭配时必填：规则名后缀（小写字母、数字、下划线），"
+                        "脚本自动加前缀 rls_bypass_full_access_")
     p.add_argument("--registry-table", required=True,
                    help="登记表 project.dataset.table（adm_user_mem_copilot_tb）：处理其中 rls_enabled = 1 的全部表")
     p.add_argument("--parallel", type=int, default=16, help=PARALLEL_HELP)
@@ -200,19 +228,32 @@ def _main(argv):
     args = p.parse_args(argv)
     ops.start_log_file("apply_bypass_rls", args.log_dir)
 
-    groups = core.split_items([args.group])
-    if len(groups) != 1:
-        ops.log(f"[ERROR] --group 只能指定一个 Group，收到 {len(groups)} 个: {groups}")
+    shared = args.principals is not None
+    if shared and args.policy_name is None:
+        ops.log("[ERROR] 使用 --principals 时必须同时给 --policy-name（规则名后缀，如 existing_all）")
         return 2
+    if not shared and args.policy_name is not None:
+        ops.log("[ERROR] --policy-name 只能与 --principals 搭配；--group 的规则名由 Group 邮箱自动生成")
+        return 2
+    group = None
     try:
-        group = core.group_email(groups[0])                        # Group 邮箱格式（不能是 SA、不能带 user: 等前缀）
-        grantee = f"group:{group}"
-        policy_name = core.bypass_policy_name(group)
-        core.build_policy_ddl("p.d.t", policy_name, [grantee], "TRUE")   # 提前校验 Group 邮箱
+        if shared:
+            grantees = core.parse_bypass_principals(core.collect_values(args.principals))
+            policy_name = core.shared_bypass_policy_name(args.policy_name)
+        else:
+            groups = core.split_items([args.group])
+            if len(groups) != 1:
+                ops.log(f"[ERROR] --group 只能指定一个 Group，收到 {len(groups)} 个: {groups}")
+                return 2
+            group = core.group_email(groups[0])                    # Group 邮箱格式（不能是 SA、不能带 user: 等前缀）
+            grantees = [f"group:{group}"]
+            policy_name = core.bypass_policy_name(group)
+        core.build_policy_ddl("p.d.t", policy_name, grantees, "TRUE")   # 提前校验授权对象与规则名
         registry = core.parse_table_arg(args.registry_table)
     except (ValueError, OSError) as e:
         ops.log(f"[ERROR] {e}")
         return 2
+    grantee = ", ".join(grantees)
 
     try:
         auth = resolve_auth(args.gcloud_account, args.quota_project)
@@ -222,7 +263,12 @@ def _main(argv):
     ops.log(describe_auth(auth))
     ctx = ops.Ctx(auth.creds, auth.project)
     mode = "APPLY" if args.apply else "DRY-RUN"
-    ops.log(f"===== 模式: {mode}  规则: {policy_name}  授权对象: {grantee}  并行: {workers(args)} =====")
+    if shared:
+        ops.log(f"===== 模式: {mode}  规则: {policy_name}  授权对象: {len(grantees)} 个（共用一条规则）  并行: {workers(args)} =====")
+        ops.log(f"[PRINCIPALS] 规则 {policy_name} 的授权对象共 {len(grantees)} 个（完整名单，与现有规则不同的表将 REPLACE）：\n"
+                + "\n".join(f"  - {g}" for g in grantees))
+    else:
+        ops.log(f"===== 模式: {mode}  规则: {policy_name}  授权对象: {grantee}  并行: {workers(args)} =====")
     try:
         status = load_registry(ctx, registry)
     except ValueError as e:
@@ -246,7 +292,7 @@ def _main(argv):
     def plan_table(t):
         if not ops.table_exists(ctx, t):
             return None
-        return core.plan_upsert(ops.list_policies(ctx, t, grantees_for={policy_name}), policy_name, "TRUE", [grantee])
+        return core.plan_upsert(ops.list_policies(ctx, t, grantees_for={policy_name}), policy_name, "TRUE", grantees)
 
     plans = {}
     for t, pl, err in ops.parallel_map(plan_table, table_list, workers=workers(args), desc="plan"):
@@ -268,10 +314,14 @@ def _main(argv):
         lines = []
         if pl.action == "noop":
             return [f"[NOOP] {t}"], True, False
-        ddl = core.build_policy_ddl(t, policy_name, [grantee], "TRUE")
+        ddl = core.build_policy_ddl(t, policy_name, grantees, "TRUE")
         lines.append(f"[{pl.action.upper()}] {t}\n{ddl}")
         if pl.action == "replace":
             lines.append(f"  被覆盖的旧内容: grantees={pl.old['grantees']} filter={pl.old['filter']}")
+            if shared:
+                added, removed = core.grantee_diff(pl.old["grantees"], grantees)
+                lines.append(f"  将新增: {added or '无'}")
+                lines.append(f"  将移除: {removed or '无'}")
         if args.apply:
             try:
                 ops.run_ddl(ctx, ddl, ctx.table_location(t), retry_missing_principal=False)
@@ -297,7 +347,9 @@ def _main(argv):
     status, not_run = execute_tables(list(plans), execute, workers(args), args.apply,
                                      lambda t: plans[t].action != "noop", on_result)
     if status != "ok":
-        code = log_group_abort(status, not_run, group)
+        code = (log_group_abort(status, not_run, group, what="--principals 中有授权对象", detail="（是哪个见上方 [ERROR]）",
+                                hint=PRINCIPAL_MISSING_HINT)
+                if shared else log_group_abort(status, not_run, group))
         ops.log(abort_summary(mode, status, not_run, counts))
         return code
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-回退：删除目标表上的 RLS 规则（apply_bypass_rls.py / apply_copilot_rls.py 的逆操作，Doc 第 8 步）。
+回退：删除目标表上的 RLS 规则，或从规则里去掉指定主体（apply_bypass_rls.py / apply_copilot_rls.py 的逆操作，Doc 第 8 步）。
 
 参数的值可直接写（逗号 / 空格分隔），也可写单列无表头的 .csv 文件，可混用。
 
@@ -8,9 +8,12 @@
   --tables（project.dataset.table，反引号可选；不支持 project:dataset.table）、--datasets（project.dataset）、--projects
 
 删除哪些规则:
-  --principals     邮箱（Group / SA / user 均可，不分类型）：删除授权对象里含这些邮箱的规则（能覆盖手工建的规则）
-  --policy-names   规则名
-  两者同时给出时取交集；**两者都不给 = 删除目标表上的全部规则**
+  --principals     邮箱（Group / SA / user 均可，不分类型）：授权对象里含这些邮箱的规则（能覆盖手工建的规则）——
+                   只从规则里去掉这些主体（[REMOVE]：用原过滤条件重建为剩余名单，如 apply_bypass_rls --principals
+                   建的共享规则）；规则的授权对象全部命中时才删除整条（[DROP]）。剩余名单里有无法重建的写法
+                   （principalSet:// / allUsers / deleted: 等）-> 这条规则 [ERROR] 跳过、不动它，退出码 1
+  --policy-names   规则名：删除整条规则
+  两者同时给出时取交集（只在这些规则里去掉主体）；**两者都不给 = 删除目标表上的全部规则**
 
 删光提示: 某张表的规则将被全部删除时（删除后所有有读表权限的账号都能看到全部数据），
   这些表会在日志中列出，只作提示，不拦截。表上规则全部要删时使用 DROP ALL ROW ACCESS POLICIES。
@@ -95,7 +98,7 @@ def _main(argv):
         if err:
             failed = True
             ops.log(f"[ERROR] {t}: 读取现有规则失败: {err}")
-        elif res[0].to_drop:
+        elif not res[0].empty:
             plans[t] = res
 
     emptied = sorted(t for t, (pl, _) in plans.items() if pl.drop_all)
@@ -104,37 +107,58 @@ def _main(argv):
 
     # 阶段 2：并行执行
     def execute(t):
-        """返回 (日志行, 实际删除的规则数, 是否成功)。中途失败时仍返回已生成的 [DROP] 完整内容（已删规则可据此恢复）。"""
+        """
+        返回 (日志行, 实际删除的规则数, 实际去掉主体的规则数, 是否成功)。
+        中途失败时仍返回已生成的 [DROP] / [REMOVE] 完整内容（已改动的规则可据此恢复）。
+        """
         pl, n_all = plans[t]
-        lines = [f"[TABLE] {t}（共 {n_all} 条规则，删除 {len(pl.to_drop)} 条）"]
+        head = f"[TABLE] {t}（共 {n_all} 条规则，删除 {len(pl.to_drop)} 条"
+        lines = [head + (f"，从 {len(pl.to_remove)} 条中去掉主体）" if pl.to_remove else "）")]
+        steps, ok = [], True                       # [(DDL, 类别)]
         for pol in pl.to_drop:
             g = pol["grantees"] if pol["grantees"] is not None else "（未读取）"
             lines.append(f"  [DROP] `{pol['id']}` grantees={g} filter={pol['filter']}")
-        ddls = [core.drop_all_ddl(t)] if pl.drop_all else [core.drop_policy_ddl(t, pol["id"]) for pol in pl.to_drop]
-        done = 0
-        for ddl in ddls:
+        if pl.drop_all:
+            steps.append((core.drop_all_ddl(t), "drop"))
+        else:
+            steps += [(core.drop_policy_ddl(t, pol["id"]), "drop") for pol in pl.to_drop]
+        for pol, rest, hit in pl.to_remove:
+            lines.append(f"  [REMOVE] `{pol['id']}` 去掉: {sorted(hit)}；保留: {sorted(rest)}；"
+                         f"原 grantees={pol['grantees']} filter={pol['filter']}")
+            bad = core.unrebuildable_grantees(rest)
+            if bad:
+                ok = False
+                lines.append(f"  [ERROR] `{pol['id']}`: 保留的授权对象中有脚本无法写进 GRANT TO 的值 {bad}，"
+                             "这条规则不做改动，请手工处理")
+                continue
+            steps.append((core.build_policy_ddl(t, pol["id"], rest, pol["filter"]), "remove"))
+        done = {"drop": 0, "remove": 0}
+        for i, (ddl, kind) in enumerate(steps):
             lines.append(f"    DDL: {ddl}")
             if args.apply:
                 try:
                     ops.run_ddl(ctx, ddl, ctx.table_location(t))
                 except Exception as e:  # noqa: BLE001
-                    lines.append(f"  [ERROR] {t}: 第 {done + 1} / {len(ddls)} 条 DDL 执行失败"
-                                 f"（此前 {done} 条已执行，对应规则的完整内容见上方 [DROP]）: {e}")
-                    return lines, (0 if pl.drop_all else done), False
-                done += 1
+                    lines.append(f"  [ERROR] {t}: 第 {i + 1} / {len(steps)} 条 DDL 执行失败"
+                                 f"（此前 {i} 条已执行，对应规则的完整内容见上方 [DROP] / [REMOVE]）: {e}")
+                    n_drop = len(pl.to_drop) if (pl.drop_all and done["drop"]) else done["drop"]
+                    return lines, n_drop, done["remove"], False
+                done[kind] += 1
         if pl.drop_all:
             lines.append("  [NOTE] 该表已没有任何 RLS 规则，所有有读表权限的账号都能看到全部数据")
-        return lines, len(pl.to_drop), True
+        n_remove = sum(1 for _, k in steps if k == "remove")
+        return lines, len(pl.to_drop), n_remove, ok
 
-    total = 0
+    total, removed = 0, 0
     for t, res, err in ops.parallel_map(execute, list(plans), workers=workers(args), desc="ddl"):
         if err:
             failed = True
             ops.log(f"  [ERROR] {t}: {err}")
             continue
-        lines, n, ok = res
+        lines, n, m, ok = res
         ops.log("\n".join(lines))
         total += n
+        removed += m
         failed = failed or not ok
 
     if args.apply and args.verify_sa:
@@ -145,7 +169,8 @@ def _main(argv):
                 ops.log(f"[VISIBLE] {t}: {args.verify_sa} 查询失败: {str(err)[:200]}")
             else:
                 ops.log(f"[VISIBLE] {t}: {args.verify_sa} 可见 {res[0]} 行 / 表共 {res[1]} 行")
-    ops.log(f"===== 完成 ({mode})：{len(plans)} 张表，共 {total} 条规则 =====")
+    ops.log(f"===== 完成 ({mode})：{len(plans)} 张表，共 {total} 条规则"
+            + (f"；从 {removed} 条规则中去掉主体" if removed else "") + " =====")
     return 1 if failed else 0
 
 
