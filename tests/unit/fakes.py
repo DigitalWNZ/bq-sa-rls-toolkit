@@ -16,7 +16,9 @@ import rls_core as core
 
 def http_error(status, message):
     """与 googleapiclient 真实抛出的一样的 HttpError（resp.status = status）。"""
-    return HttpError(httplib2.Response({"status": status}), message.encode("utf-8"))
+    import json
+    body = json.dumps({"error": {"code": status, "message": message}}).encode("utf-8")   # 与真实响应同结构：reason = message
+    return HttpError(httplib2.Response({"status": status, "content-type": "application/json"}), body)
 
 _CREATE_RE = re.compile(
     r"CREATE OR REPLACE ROW ACCESS POLICY `(?P<name>[^`]+)`\s+ON `(?P<table>[^`]+)`\s+"
@@ -38,6 +40,10 @@ class FakeWorld:
         self.ddl_log = []         # 执行过的 DDL
         self.fail_ddl_on = set()  # 这些表执行 DDL 时抛错
         self.missing_groups = set()       # 这些 Group 不存在：建规则时抛 BigQuery 的「Group … does not exist」
+        self.table_iam_etag = {}          # "p.d.t" -> 写入次数（假 etag）
+        self.iam_conflicts = {}           # "p.d.t" -> 接下来几次 setIamPolicy 报并发冲突
+        self.fail_iam_set = set()         # 这些表 setIamPolicy 失败
+        self.iam_set_log = []             # [(表, 写入的策略)]
         self.missing_members = set()      # 这些授权对象（"user:x" / "serviceAccount:x"）不存在：同样报「… does not exist」
         self.fail_drop_policies = set()   # 删除这些规则名时抛错（模拟逐条 DROP 中途失败）
         # list_principals（全部权威 API）
@@ -353,6 +359,40 @@ def install(monkeypatch, world, script_module=None):
         world.hit("table_iam")
         return [dict(x) for x in world.table_iam.get(t, [])]
 
+    def table_iam_policy(ctx, t):
+        """表级 IAM 完整策略（bindings 存在 world.table_iam；etag 每次写入加 1）。"""
+        guard(f"table_iam:{t}")
+        world.hit("table_iam")
+        t = core.fq(t)
+        if t not in world.tables:
+            raise http_error(404, f"Not found: Table {t}")
+        with world._ddl_lock:
+            return {"version": 1, "etag": f"e{world.table_iam_etag.get(t, 0)}",
+                    "bindings": [{**dict(b), "members": list(b.get("members", []))} for b in world.table_iam.get(t, [])]}
+
+    def set_table_iam_policy(ctx, t, policy):
+        world.hit("table_iam_set")
+        t = core.fq(t)
+        with world._ddl_lock:
+            if t in world.fail_iam_set:
+                raise RuntimeError(f"boom setIamPolicy on {t}")
+            if world.iam_conflicts.get(t, 0) > 0:          # 模拟读取之后被别人改过：etag 不一致
+                world.iam_conflicts[t] -= 1
+                world.table_iam_etag[t] = world.table_iam_etag.get(t, 0) + 1
+                raise http_error(409, "There were concurrent policy changes. etag mismatch")
+            if policy.get("version", 1) != 1:              # 与真实 BigQuery 一致：表级 IAM 只支持 v1
+                raise http_error(400, f"Unsupported policy version {policy['version']}; max supported version is 1.")
+            if policy.get("etag") != f"e{world.table_iam_etag.get(t, 0)}":
+                raise http_error(409, "etag mismatch")
+            for b in policy.get("bindings", []):           # 与真实 BigQuery 报错文本一致（Group 不存在）
+                for m in b.get("members", []):
+                    if m.startswith("group:") and m[6:] in world.missing_groups:
+                        raise RuntimeError(f"400 Group {m[6:]} does not exist.")
+            world.table_iam[t] = [dict(b) for b in policy.get("bindings", [])]
+            world.table_iam_etag[t] = world.table_iam_etag.get(t, 0) + 1
+            world.iam_set_log.append((t, policy))
+            return dict(policy)
+
     def group_members_typed(ctx, g, reasons=None):
         """直接成员 [(email, type)]；world.groups 中没有或为 None = 读不到（返回 None 并写原因）。"""
         world.hit("group")
@@ -375,5 +415,6 @@ def install(monkeypatch, world, script_module=None):
                      ("project_service_accounts", project_service_accounts), ("project_datasets", project_datasets),
                      ("dataset_access", dataset_access), ("dataset_tables", dataset_tables),
                      ("table_iam_bindings", table_iam_bindings), ("group_members_typed", group_members_typed),
-                     ("directory_groups", directory_groups)):
+                     ("directory_groups", directory_groups), ("table_iam_policy", table_iam_policy),
+                     ("set_table_iam_policy", set_table_iam_policy)):
         monkeypatch.setattr(ops, name, fn)

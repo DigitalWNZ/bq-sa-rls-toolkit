@@ -669,3 +669,60 @@ def table_iam_bindings(ctx, table):
 def is_not_found_error(e):
     """BigQuery 返回 404（资源不存在）：googleapiclient 的 HttpError 404，或 google-cloud 客户端的 NotFound。"""
     return isinstance(e, NotFound) or (isinstance(e, HttpError) and e.resp.status == 404)
+
+
+def table_iam_policy(ctx, table):
+    """表级 IAM 完整策略（含 etag）。BigQuery 表级 IAM 只支持 v1 策略（不支持条件授权，2026-10-23 实测）。"""
+    p, d, t = core.parse_table(table)
+    _iam_limiter.wait()
+    return execute_with_backoff(ctx.bqapi.tables().getIamPolicy(
+        resource=f"projects/{p}/datasets/{d}/tables/{t}", body={}),
+        desc=f"table getIamPolicy {table}")
+
+
+def brief_error(e, limit=500):
+    """
+    简短的错误说明：googleapiclient 的 HttpError 只取「HTTP 状态码 + 报错正文」（其 Details 里带有几十行服务端堆栈，
+    2026-10-23 实测表级 setIamPolicy 报 Group 不存在时长达数 KB）；其它异常取 str(e) 前 limit 个字符。
+    """
+    if isinstance(e, HttpError):
+        reason = getattr(e, "reason", None) or ""
+        return f"HTTP {e.resp.status}: {reason}"[:limit] if reason else str(e)[:limit]
+    return str(e)[:limit]
+
+
+def is_policy_conflict_error(e):
+    """
+    setIamPolicy 并发修改冲突：HTTP 409，或报错正文是「concurrent policy changes」。
+    不按 etag 等字样宽泛匹配：BigQuery 的 400 报错详情里带有内部堆栈，可能恰好含这些词（2026-10-23 实测误判）。
+    """
+    if isinstance(e, HttpError):
+        return e.resp.status == 409
+    return "concurrent policy changes" in str(e).lower()
+
+
+def update_table_iam(ctx, table, mutate, attempts=5):
+    """
+    读 -> mutate(policy) -> 写 表级 IAM。mutate 返回新策略，或 None（无需改动，不写）。
+    并发修改冲突时重新读取、重新合并后再写（最多 attempts 次）；其它错误直接抛出。返回写入的新策略或 None。
+    """
+    for i in range(attempts):
+        new = mutate(table_iam_policy(ctx, table))
+        if new is None:
+            return None
+        try:
+            return set_table_iam_policy(ctx, table, new)
+        except Exception as e:  # noqa: BLE001
+            if not is_policy_conflict_error(e) or i == attempts - 1:
+                raise
+            log(f"    [retry] {table}: IAM 策略被并发修改，重新读取后重试（{i + 1}/{attempts - 1}）")
+            time.sleep(min(10.0, 1.0 * (i + 1)) * (0.5 + random.random()))
+
+
+def set_table_iam_policy(ctx, table, policy):
+    """写回表级 IAM 策略（policy 须带读取时的 etag；并发修改时 BigQuery 返回 409 / etag 冲突）。"""
+    p, d, t = core.parse_table(table)
+    _iam_limiter.wait()
+    return execute_with_backoff(ctx.bqapi.tables().setIamPolicy(
+        resource=f"projects/{p}/datasets/{d}/tables/{t}", body={"policy": policy}),
+        desc=f"table setIamPolicy {table}")

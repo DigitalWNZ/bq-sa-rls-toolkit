@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-回退：删除目标表上的 RLS 规则，或从规则里去掉指定主体（apply_bypass_rls.py / apply_copilot_rls.py 的逆操作，Doc 第 8 步）。
+回退：删除目标表上的 RLS 规则，或从规则里去掉指定主体（apply_bypass_rls.py / apply_copilot_rls.py 的逆操作，Doc 第 9 步）。
 
 参数的值可直接写（逗号 / 空格分隔），也可写单列无表头的 .csv 文件，可混用。
 

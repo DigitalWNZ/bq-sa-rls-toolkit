@@ -110,18 +110,18 @@ def run(n_tables, n_new, n_existing, parallel, latency=None):
         assert code in allow, f"{name} 退出码 {code}\n{log[-2000:]}"
 
     step("1 list_principals", lambda: list_principals.main(["--projects", P, "-o", f"{tmp}/p.csv", *par]))
-    byp = ["--registry-table", REG]                         # 第 3 步：只看登记表
-    step("3 apply_bypass (read 组)", lambda: apply_bypass_rls.main(
+    byp = ["--registry-table", REG]                         # 第 4 步：只看登记表
+    step("4 apply_bypass (read 组)", lambda: apply_bypass_rls.main(
         ["--group", G_R, *byp, "--apply", *par]))
-    step("3 apply_bypass (write 组)", lambda: apply_bypass_rls.main(
+    step("4 apply_bypass (write 组)", lambda: apply_bypass_rls.main(
         ["--group", G_W, *byp, "--apply", *par]))
-    step("7 apply_copilot 首次（每表一条 Group 规则）", lambda: apply_copilot_rls.main([*auth, "-o", f"{tmp}/c.csv", "--apply", *par]))
-    step("7 apply_copilot 重跑(NOOP)", lambda: apply_copilot_rls.main([*auth, "-o", f"{tmp}/c.csv", "--apply", *par]))
+    step("8 apply_copilot 首次（每表一条 Group 规则）", lambda: apply_copilot_rls.main([*auth, "-o", f"{tmp}/c.csv", "--apply", *par]))
+    step("8 apply_copilot 重跑(NOOP)", lambda: apply_copilot_rls.main([*auth, "-o", f"{tmp}/c.csv", "--apply", *par]))
     w.condition_sas[COND].append(f"late@{P}.iam.gserviceaccount.com")     # 新增账号：只写条件表（并加入 Group），规则不变
-    step("7 apply_copilot 新增 1 账号后重跑(NOOP)", lambda: apply_copilot_rls.main([*auth, "-o", f"{tmp}/c.csv", "--apply", *par]))
-    step("8 rollback Copilot Group 规则（按主体）", lambda: rollback_rls.main(
+    step("8 apply_copilot 新增 1 账号后重跑(NOOP)", lambda: apply_copilot_rls.main([*auth, "-o", f"{tmp}/c.csv", "--apply", *par]))
+    step("9 rollback Copilot Group 规则（按主体）", lambda: rollback_rls.main(
         ["--datasets", f"{P}.{DS}", "--principals", G_COP, "--apply", *par]))
-    step("8 rollback 全部", lambda: rollback_rls.main(
+    step("9 rollback 全部", lambda: rollback_rls.main(
         ["--datasets", f"{P}.{DS}", "--apply", *par]))
     mp.undo()
     return rows, 3                                                          # 每表：2 条 bypass + 1 条 Copilot

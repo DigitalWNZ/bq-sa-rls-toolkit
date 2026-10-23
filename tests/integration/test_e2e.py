@@ -1,6 +1,6 @@
 """
 端到端集成测试：按 Doc 流程在真实 GCP 项目上依次运行 4 个脚本，并以各账号身份查表验证可见性。
-  第 1 步 list_principals.py → 第 3 步 apply_bypass_rls.py → 第 7 步 apply_copilot_rls.py → 第 8 步 rollback_rls.py
+  第 1 步 list_principals.py → 第 4 步 apply_bypass_rls.py → 第 8 步 apply_copilot_rls.py → 第 9 步 rollback_rls.py
 用例之间有先后依赖（按文件顺序执行）。
 """
 
@@ -222,7 +222,7 @@ def test_03_list_principals_files_and_exclusions(world, tmp_path):
 
 
 # =========================================================================== #
-# 第 3 步：apply_bypass_rls.py（目标表 = 登记表中 rls_enabled = 1 的全部表）
+# 第 4 步：apply_bypass_rls.py（目标表 = 登记表中 rls_enabled = 1 的全部表）
 # =========================================================================== #
 # 登记表中 rls_enabled = 1 的表：实际存在的 6 张 + 已被 drop 的 dropped_t（[SKIP] 表不存在，退出码 1）
 BYP_TABLES = L.TARGET_TABLES + [L.T_NOBYPASS]
@@ -334,7 +334,7 @@ def test_14_bypass_replace_prints_old_content(world):
 
 
 # =========================================================================== #
-# 第 7 步：apply_copilot_rls.py
+# 第 8 步：apply_copilot_rls.py
 # =========================================================================== #
 def copilot(*args):
     return L.run_cli("apply_copilot_rls.py", "--condition-table", L.T_COND, "--registry-table", L.T_REGISTRY,
@@ -343,7 +343,7 @@ def copilot(*args):
 
 def test_20_copilot_no_bypass_gate_dry_run(world, tmp_path):
     # bypass 闸门已删除：没有 bypass 规则的表照常计划建规则，首次设置 RLS 的表只作提示（演练，不做变更）
-    # （no_bypass_t 在登记表中开启，第 3 步已给它建了 bypass 规则：先清掉，还原成「没有任何规则」的表）
+    # （no_bypass_t 在登记表中开启，第 4 步已给它建了 bypass 规则：先清掉，还原成「没有任何规则」的表）
     L.run_sql(f"DROP ALL ROW ACCESS POLICIES ON `{L.T_NOBYPASS}`")
     out = tmp_path / "plan.csv"
     code, log = copilot("--mapping-table", L.T_MAPPING_NB, "-o", str(out))
@@ -507,7 +507,7 @@ def test_26_copilot_rerun_noop_and_replace(world, tmp_path):
 
 
 # =========================================================================== #
-# 第 8 步：rollback_rls.py
+# 第 9 步：rollback_rls.py
 # =========================================================================== #
 def test_30_rollback_no_filter_means_all_dry_run(world):
     # 删除全部保护已删除：不给 --principals / --policy-names = 删除全部规则（这里只演练，不做变更）

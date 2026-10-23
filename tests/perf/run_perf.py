@@ -237,7 +237,7 @@ def main():
     auth = ["--condition-table", T_COND, "--mapping-table", T_MAP, "--registry-table", T_REG, "--group", G_COP]
     tmp = "/tmp/rls_perf"
     os.makedirs(tmp, exist_ok=True)
-    byp = ["--registry-table", T_REG]                          # 第 3 步：只看登记表（全部业务表都登记为 rls_enabled = 1）
+    byp = ["--registry-table", T_REG]                          # 第 4 步：只看登记表（全部业务表都登记为 rls_enabled = 1）
     n_dim_tables = sum(1 for i in range(a.tables) if table_dims(i, a.tables))
     last = {}
 
@@ -253,24 +253,24 @@ def main():
 
     step("1 list_principals (项目范围)", lambda: cli("list_principals.py", "--projects", L.PROJECT, "-o", f"{tmp}/p.csv", *par),
          note=lambda: f"输出 {sum(1 for _ in csv.DictReader(open(f'{tmp}/p.csv', encoding='utf-8-sig')))} 个主体")
-    step("3 apply_bypass (ReadOnly 组)", lambda: cli(
+    step("4 apply_bypass (ReadOnly 组)", lambda: cli(
         "apply_bypass_rls.py", "--group", G_R, *byp, "--apply", *par),
         note=summary)
-    step("3 apply_bypass (Writable 组)", lambda: cli(
+    step("4 apply_bypass (Writable 组)", lambda: cli(
         "apply_bypass_rls.py", "--group", G_W, *byp, "--apply", *par), note=summary)
-    step("3 apply_bypass 重跑 (全部 NOOP)", lambda: cli(
+    step("4 apply_bypass 重跑 (全部 NOOP)", lambda: cli(
         "apply_bypass_rls.py", "--group", G_W, *byp, "--apply", *par), note=summary)
-    step("7 apply_copilot 演练", lambda: cli("apply_copilot_rls.py", *auth, "-o", f"{tmp}/c0.csv", *par), note=summary)
-    step("7 apply_copilot 执行（每表一条 Group 规则）", lambda: cli("apply_copilot_rls.py", *auth, "-o", f"{tmp}/c1.csv", "--apply", *par),
+    step("8 apply_copilot 演练", lambda: cli("apply_copilot_rls.py", *auth, "-o", f"{tmp}/c0.csv", *par), note=summary)
+    step("8 apply_copilot 执行（每表一条 Group 规则）", lambda: cli("apply_copilot_rls.py", *auth, "-o", f"{tmp}/c1.csv", "--apply", *par),
          note=lambda: summary() + f"；审核 CSV {sum(1 for _ in csv.DictReader(open(f'{tmp}/c1.csv', encoding='utf-8-sig')))} 行")
-    step("7 apply_copilot 重跑（全部 NOOP）", lambda: cli("apply_copilot_rls.py", *auth, "-o", f"{tmp}/c2.csv", "--apply", *par),
+    step("8 apply_copilot 重跑（全部 NOOP）", lambda: cli("apply_copilot_rls.py", *auth, "-o", f"{tmp}/c2.csv", "--apply", *par),
          note=summary)
     step("验证: 新增账号在三列表上只见 HK", lambda: L.expect_amounts(probe_cp, tbl(1), L.HK, timeout=900))
     step("验证: 新增账号在无维度列的表上 0 行", lambda: L.expect_amounts(probe_cp, tbl(a.tables - 1), []))
     step("验证: 存量账号可见全部", lambda: L.expect_amounts(probe_ex, tbl(1), L.ALL_AMOUNTS))
-    step("8 rollback Copilot Group 规则（按主体，读取授权对象）", lambda: cli(
+    step("9 rollback Copilot Group 规则（按主体，读取授权对象）", lambda: cli(
         "rollback_rls.py", "--datasets", f"{L.PROJECT}.{DS}", "--principals", G_COP, "--apply", *par), note=summary)
-    step("8 rollback 全部（带授权对象日志）", lambda: cli(
+    step("9 rollback 全部（带授权对象日志）", lambda: cli(
         "rollback_rls.py", "--datasets", f"{L.PROJECT}.{DS}", "--apply", *par), note=summary)
 
     # ---- 报告 ----

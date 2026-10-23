@@ -11,6 +11,7 @@ import pytest
 
 import apply_bypass_rls
 import apply_copilot_rls
+import grant_table_viewer
 import list_principals
 import rls_core as core
 import rollback_rls
@@ -57,6 +58,9 @@ REQUIREMENTS = {
             "test_z_shared_bypass::s01–s05"),
     "F29": ("rollback：按主体回退时只从规则里去掉这些主体（[REMOVE]，保留原过滤条件与其余主体），去光了才删除整条",
             "test_z_shared_bypass::s06"),
+    "F30": ("grant_table_viewer：给多个 Group（--groups，值或 .csv）统一授予多张表（--tables / --datasets / --projects）"
+            "的表级 BigQuery Data Viewer；已授权 NOOP；只加缺少的；其它授权保留；Group 不存在第一张表即停止",
+            "test_z_grant_viewer::g01–g05"),
 }
 
 P = "trip-prod"
@@ -142,7 +146,7 @@ def copilot(tmp_path, *args):
 
 
 def test_requirement_table_complete():
-    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 30)]
+    assert sorted(REQUIREMENTS) == [f"F{i:02d}" for i in range(1, 31)]
 
 
 # --------------------------------------------------------------------------- #
@@ -426,3 +430,18 @@ def test_F29_rollback_removes_only_given_principals(world, capsys):
     assert "[REMOVE]" in capsys.readouterr().err
     assert rollback_rls.main(["--tables", T1, "--principals", G_R, "--apply"]) == 0
     assert world.policy(T1, shared) is None
+
+
+def test_F30_grant_table_viewer(world, monkeypatch, capsys):
+    install(monkeypatch, world, grant_table_viewer)
+    world.table_iam[T1] = [{"role": "roles/bigquery.dataEditor", "members": ["user:w@trip.com"]}]
+    assert grant_table_viewer.main(["--groups", f"{G_R},{G_W}", "--datasets", f"{P}.dw", "--apply"]) == 0
+    for t in (T1, T2, T4, T_OFF):                                     # 不看登记表：dw 下全部普通表
+        assert sorted(m for b in world.table_iam[t] if b["role"] == core.VIEWER_ROLE for m in b["members"]) == \
+            sorted([f"group:{G_R}", f"group:{G_W}"])
+    assert {"role": "roles/bigquery.dataEditor", "members": ["user:w@trip.com"]} in world.table_iam[T1]
+    assert world.table_iam.get(T3) is None
+    capsys.readouterr()
+    assert grant_table_viewer.main(["--groups", G_R, "--tables", T1, T3, "--apply"]) == 0
+    err = capsys.readouterr().err
+    assert f"[NOOP] {T1}" in err and f"[GRANT] {T3}" in err

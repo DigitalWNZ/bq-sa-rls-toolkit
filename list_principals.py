@@ -41,14 +41,14 @@
   principal_type ∈ serviceAccount / serviceAgent / user / group / domain / public / federated / deleted；
   非邮箱的主体 email 列写原始值（如 trip.com、allAuthenticatedUsers、principalSet://…、deleted:user:a@x.com?uid=1）；
   source 写「位置: 角色」，多处用「；」分隔，最多列 5 处（超过时写「…共 N 处」）。
-运行日志: 屏幕输出原样另存到 logs/list_principals_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录；四个脚本相同）。
+运行日志: 屏幕输出原样另存到 logs/list_principals_<YYYYMMDD_HHMMSS>.log（--log-dir 可改目录；五个脚本相同）。
 文件参数均为单列、无表头的 .csv。
 
 示例:
   python list_principals.py --organizations 123456789012          # 执行账号 / quota 项目自动确定（见下）
   python list_principals.py --projects projects.csv --exclude-patterns 'copilot-*@*'
 
-执行账号与 quota 项目（四个脚本相同）:
+执行账号与 quota 项目（五个脚本相同）:
   账号：--gcloud-account → gcloud 当前活动账号（gcloud auth login 后的那个）→ application-default 凭证 → 报错
   quota 项目：--quota-project → gcloud 默认项目（gcloud config set project）→ application-default 凭证的 quota 项目 → 报错
 
@@ -58,7 +58,7 @@
     roles/bigquery.metadataViewer（列数据集、读数据集 ACL、列表）
   - Workspace / Cloud Identity：有「用户 → 读取」（读账号目录的 user）和「群组 → 读取」（列出 / 展开 Group）权限的管理员
   - quota 项目：启用 cloudresourcemanager、iam、bigquery、cloudidentity、admin（Admin SDK）API；执行账号在该项目上有
-    roles/serviceusage.serviceUsageConsumer（四个脚本相同；缺少时 API 调用报 403 USER_PROJECT_DENIED）
+    roles/serviceusage.serviceUsageConsumer（五个脚本相同；缺少时 API 调用报 403 USER_PROJECT_DENIED）
 
 退出码: 0 成功（外部域的 Group 展不开不算失败）；1 部分读取失败 / 本组织域名的 Group 展不开（其余结果仍写入 CSV）；2 参数错误
 """

@@ -4,9 +4,9 @@
 
 | 类别 | 位置 | 数量 | 结果 | 环境 |
 |---|---|---|---|---|
-| 1 单体测试 | `tests/unit/` | 797 | ✅ 797 / 797 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
-| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py`、`test_z_shared_bypass.py` | 47 | ✅ 47 / 47（全套约 22 分钟；r08、s01–s06 单独运行） | 真实 GCP（Argolis 测试组织） |
-| 3 功能测试 | `tests/functional/test_requirements.py` | 30 | ✅ 30 / 30 | 本地；每条需求另有对应的系统测试用例 |
+| 1 单体测试 | `tests/unit/` | 829 | ✅ 829 / 829 | 本地（FakeWorld 模拟 BigQuery / IAM / Cloud Identity；Cloud Identity 部分另用 HttpMockSequence 模拟真实响应） |
+| 2 系统测试 | `tests/integration/test_e2e.py`、`test_z_abnormal.py`、`test_z_shared_bypass.py`、`test_z_grant_viewer.py` | 52 | ✅ 52 / 52（全套约 24 分钟；r08、s01–s06、g01–g05 单独运行） | 真实 GCP（Argolis 测试组织） |
+| 3 功能测试 | `tests/functional/test_requirements.py` | 31 | ✅ 31 / 31 | 本地；每条需求另有对应的系统测试用例 |
 | 4 性能测试 | `tests/perf/run_perf.py`、`simulate.py` | 1000 表 × 500 新增 × 100 存量 | ✅ 全部步骤成功，0 重试、0 错误 | 真实 GCP + 本地模拟 |
 | 5 稳定性测试 | `tests/stability/test_stability.py`、`tests/integration/test_zz_stability.py` | 28 + 4 | ✅ 32 / 32 | 本地 + 真实 GCP |
 
@@ -40,7 +40,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 
 ---
 
-## 1. 单体测试（797）
+## 1. 单体测试（829）
 
 用 `tests/unit/fakes.py` 中的 FakeWorld 模拟 GCP（表、规则、授权对象、登记表 / 条件表 / 映射表、IAM、账号目录、Group），直接调用四个脚本的 `main()`，断言退出码、日志、生成的 DDL 与最终规则状态。
 
@@ -54,15 +54,16 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | `test_list_principals.py` | 86 | list_principals：**列出全部主体、不看角色**（读不到数据的角色、自定义角色、非具体账号也列出）；无授权 SA、待删除项目的 SA（成功 / 拒绝）、账号目录的 user 与 Group、多层文件夹、条件授权、服务代理、读取失败报错；`--projects` 读上级文件夹 / 组织策略（多层、读取失败、去重、无上级）；**Group 只展开一层、嵌套组只列组名**；展不开的 Group（外部域 `[NOTE]` / 本域 `[ERROR]`、辅助域名、跑脚本账号域名）；`source` 列；范围外授权视图 `[NOTE]`；**扫描期间表被删除（读表 IAM 返回 404）→ `[NOTE]` 跳过、退出码 0、其余照常；403 / 400 / 5xx 及其它位置的 404 仍 `[ERROR]`** |
 | `test_gate_removal.py` | 31 | 已去掉的「闸门」：只提示不拦截；旧参数被拒 |
 | `test_scripts.py` | 35 | 四个脚本的主流程 |
-| `test_normal_cases.py` | 28 | 正常系：每条设计决定一个用例，含第 1 → 3 → 7 → 8 步端到端流程 |
+| `test_normal_cases.py` | 28 | 正常系：每条设计决定一个用例，含第 1 → 4 → 8 → 9 步端到端流程 |
 | `test_auth_defaults.py` | 18 | 执行账号 / quota 项目自动确定；确定不了 → 退出码 2 + 提示 |
 | `test_review_fixes.py` | 27 | 独立审查报告的修复项：BigQuery 报 Group 不存在时不重试、第一张表即停止（退出码 2、其余零 DDL）、执行中途出现则停止未开始的表；apply_bypass `--group` 格式检查；映射表列名不区分大小写；rollback 中途失败仍输出已删规则内容；Cloud Identity 403 无权限 / API 未启用 / 429 重试 / 5xx 用尽 / 空组 / 嵌套组读不到（HttpMockSequence）；Cloud Identity 只取直接成员、列出账号目录 Group（分页） |
 | `test_log_file.py` | 17 | 运行日志文件：四个脚本默认写 `logs/<脚本名>_<时间戳>.log`、内容与屏幕逐字相同、`--log-dir`、目录不可写只 `[WARN]`、同一秒不覆盖、argparse 错误 / `--help` 不写、Ctrl-C 与参数错误也记录、32 线程并发不交错、写盘失败不影响脚本 |
 | `test_gcp_auth.py` | 19 | 凭证：活动账号、默认项目、回退 ADC、token 到期刷新；通过 gcloud 扮演 SA 时 `[AUTH]` 显示实际执行的 SA 与登录账号、扮演失败的提示 |
 | `test_gcp_ops.py` | 14 | 重试分类、404 判定、限速、挂载后验证（扮演失败立即失败）、getAncestry 解析、组织信息（customer ID、主域名） |
 | `test_shared_bypass.py` | 67 | apply_bypass `--principals` / `--policy-name`：前缀必填（不带前缀、`domain:`、`allUsers`、注入字符、类型与邮箱不符、同邮箱两种类型、空列表 → 退出码 2 且零 API 调用）、规则名后缀校验、与 `--group` 二选一、`.csv` 输入；一条规则含全部主体、顺序不同 NOOP、增减主体 REPLACE 并列出将新增 / 将移除、与 `--group` 规则共存、撞名按完整名单覆盖、user / SA / Group 不存在第一张表即停止；rollback `--principals` 只去掉指定主体（`[REMOVE]`，保留原过滤条件）、去光才删除、与 `--policy-names` 取交集、剩余授权对象无法重建 → `[ERROR]` 不动、DDL 失败报告 |
+| `test_grant_table_viewer.py` | 32 | grant_table_viewer：`--groups` 校验（带前缀 / SA / 格式不对 / 为空 → 退出码 2 且零 API 调用）、范围必填、`.csv` 与去重、数据集 / 项目展开；演练不写入、执行后重跑全部 NOOP、只加缺少的 Group、其它角色与成员保留、写入的策略保持 v1；表不存在 `[SKIP]`、读 / 写失败 `[ERROR]` 其余照常；并发冲突（409）重新读取后重试、用尽报错；Group 不存在第一张表即停止；HTTP 报错只打印正文（不打印服务端堆栈）；运行日志 |
 
-## 2. 系统测试（47，真实 GCP）
+## 2. 系统测试（52，真实 GCP）
 
 `conftest.py` 在测试项目中准备：业务表（含列名不同、分区表、映射到不存在的列、映射表里没有、登记为未开启、没有 bypass 的表；每张 9 行，含 HK / SG / US × mobile 数据）、条件表 / 映射表 / 登记表（条件表有 `status` 列，另有一行 `status = 0` 的停用行；条件表、映射表、登记表自身、备用映射表都登记为 `rls_enabled = 0`；映射表 / 登记表中另有一张实际不存在的 `dropped_t`）、7 个测试 SA（存量读 / 写、通过数据集 ACL 授权、Copilot A / B / N / M）、4 个 Group（ReadOnly、Writable、ACL、Copilot）及其权限。然后按方案文档顺序运行四个脚本，并**以各账号身份实际查表**验证可见性。
 
@@ -78,8 +79,9 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | r01–r07 | 登记表里的视图不支持 RLS 且被隔离、视图误配进映射表、条件表脏数据（大小写 / 前缀 / 组邮箱 / 乱码 / 特殊列名）、大小写修正后无需重跑、user 执行账号、不可扮演的 `--verify-sa` 立即失败、错误的 gcloud 账号、rollback 不存在的数据集 / 表 |
 | r08 | list_principals 扫描时**真实地**在列出表之后删掉一张表 → 真实 BigQuery 返回 404 → `[NOTE] 表已不存在（扫描期间被删除），跳过`、退出码 0、无 `[ERROR]`、其余主体照常写入 CSV |
 | s01–s06 | `test_z_shared_bypass.py`：`--principals` 用 `.csv` 输入 Group + 2 个 SA → 每张表一条共享规则、授权对象正好 3 个，两个 SA 只靠它就看到全部；重跑 NOOP（顺序不同）；去掉一个 SA → REPLACE、日志「将移除」、该 SA 立刻 0 行；名单里有不存在的 user / SA → 第一张表即停止、退出码 2、零变更（BigQuery 原文 `User … does not exist` / `Service account … does not exist`）；参数错误；**50 个主体写进一条规则成功**；rollback `--principals` 只从两条共享规则里去掉该 SA（`[REMOVE]`），其余主体照常可见；`--policy-names` 整条删除 |
+| g01–g05 | `test_z_grant_viewer.py`：Group（成员为对数据集没有读权限的 SA）授权前查表 403，`--apply` 后能读到全部行；表上原有的其它角色授权保留；重跑 NOOP；`--datasets` 只给缺少的表授权；Group 不存在 → 第一张表即停止、退出码 2、零变更（BigQuery 原文 `IAM setPolicy failed for Table …: Group … does not exist.`）；表不存在 `[SKIP]`、参数错误退出码 2；已有部分 Group 时只加缺少的 |
 
-## 3. 功能测试（30：客户需求逐条映射）
+## 3. 功能测试（31：客户需求逐条映射）
 
 `REQUIREMENTS` 字典把每条客户需求映射到本地用例和真实环境用例；`test_requirement_table_complete` 保证每条需求都有用例。
 
@@ -114,6 +116,7 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | F27 | 非具体账号也写入 CSV（domain / public / federated / deleted） | 本地 |
 | F28 | apply_bypass `--principals`（必须带前缀，值或 `.csv`）+ `--policy-name`：多个主体共用一条 FILTER TRUE 规则；完整名单，REPLACE 时列出将新增 / 将移除；`--group` 不变、二者只能给一个 | s01–s05 |
 | F29 | rollback 按主体回退时只从规则里去掉这些主体（`[REMOVE]`），去光才删除整条 | s06 |
+| F30 | grant_table_viewer：给多个 Group 统一授予多张表的表级 BigQuery Data Viewer；已授权 NOOP、只加缺少的、其它授权保留；Group 不存在第一张表即停止 | g01–g05 |
 
 ## 4. 性能测试
 
@@ -165,6 +168,14 @@ python tests/perf/simulate.py --tables 1000 --new 500 --existing 100
 | r13 | **apply_bypass 与 apply_copilot 同时运行** | copilot 退出码 0；bypass 处理登记表中全部开启的表（只有不存在的 `dropped_t` 被 `[SKIP]`，退出码 1）；两种规则互不覆盖 |
 
 ---
+
+## 测试中发现并修复的问题（2026-10-23，grant_table_viewer）
+
+| 问题 | 发现方式 | 修复 |
+|---|---|---|
+| BigQuery 表级 IAM 只支持 v1 策略：写 `version: 3` 报 400 `Unsupported policy version 3` | 系统测试 g01 | 不再请求 / 写入 v3，保持读到的版本；假环境同样拒绝 v3，防止回归 |
+| 400 报错详情里的服务端堆栈恰好含 etag 等字样，被误判为并发冲突而重试 4 次 | 系统测试 g01 | 并发冲突只认 HTTP 409（或正文为 concurrent policy changes） |
+| HTTP 报错把几 KB 的服务端堆栈打进日志 | 系统测试 g03 | 只打印「HTTP 状态码 + 报错正文」 |
 
 ## 测试中发现并修复的问题（2026-10-19）
 

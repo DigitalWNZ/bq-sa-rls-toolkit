@@ -499,6 +499,60 @@ def shared_bypass_policy_name(suffix):
     return name
 
 
+# --------------------------------------------------------------------------- #
+# grant_table_viewer：表级 BigQuery Data Viewer
+# --------------------------------------------------------------------------- #
+VIEWER_ROLE = "roles/bigquery.dataViewer"
+
+
+def parse_groups(values):
+    """--groups 的值 -> 规范化的 Group 邮箱列表（按输入顺序去重）；校验规则与 --group 相同，列出全部不合格的值。"""
+    out, bad = [], []
+    for v in values:
+        try:
+            g = group_email(v)
+        except ValueError:
+            bad.append(str(v))
+            continue
+        if g not in out:
+            out.append(g)
+    if bad:
+        raise ValueError("--groups 应为 Group 邮箱（裸邮箱，不带 group: 前缀，不能是 SA）：" + "，".join(bad))
+    if not out:
+        raise ValueError("--groups 至少需要一个 Group")
+    return out
+
+
+def _unconditional_viewer_members(policy):
+    return {m.lower() for b in (policy or {}).get("bindings", [])
+            if b.get("role") == VIEWER_ROLE and not b.get("condition") for m in b.get("members", [])}
+
+
+def plan_table_viewer(policy, groups):
+    """(缺少的 Group, 已有的 Group)：只看无条件的 dataViewer 授权（带条件的授权里的 Group 不算已有）。"""
+    have = _unconditional_viewer_members(policy)
+    missing = [g for g in groups if f"group:{g}" not in have]
+    return missing, [g for g in groups if g not in missing]
+
+
+def add_viewer_members(policy, groups):
+    """
+    返回加入了 Group 的新策略（不修改原对象）：加进已有的无条件 dataViewer 授权，没有就新建一条；
+    其它授权、etag、version 原样保留（BigQuery 表级 IAM 只支持 v1，写 version 3 会报 400；
+    带条件的授权在表级不会出现，万一有也原样保留、不往里加）。
+    """
+    import copy
+    new = copy.deepcopy(policy or {})
+    bindings = new.setdefault("bindings", [])
+    target = next((b for b in bindings if b.get("role") == VIEWER_ROLE and not b.get("condition")), None)
+    if target is None:
+        target = {"role": VIEWER_ROLE, "members": []}
+        bindings.append(target)
+    have = {m.lower() for m in target["members"]}
+    target["members"] += [f"group:{g}" for g in groups if f"group:{g}" not in have]
+    return new
+
+
 def grantee_diff(old, new):
     """(新增, 移除)：规范化后比较，各自排序。"""
     o = {normalize_member(g) for g in (old or [])}

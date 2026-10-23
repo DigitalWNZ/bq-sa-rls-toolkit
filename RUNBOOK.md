@@ -7,13 +7,14 @@
 
 - [阶段 0：准备](#阶段-0准备)
 - [第 1 步：列出现有 SA 和 user](#第-1-步列出现有-sa-和-user)
-- [第 2 步：现存账号加入白名单 Group（客户）](#第-2-步现存账号加入白名单-group客户)
-- [第 3 步：为白名单 Group 设置 FILTER TRUE 规则](#第-3-步为白名单-group-设置-filter-true-规则)
-- [第 4–6 步：新增账号、Copilot Group、条件表（客户）](#第-46-步新增账号copilot-group条件表客户)
-- [第 7 步：为 Copilot Group 设置规则](#第-7-步为-copilot-group-设置规则)
+- [第 2 步：把现有 SA 和 user 加入白名单 Group（客户）](#第-2-步把现有-sa-和-user-加入白名单-group客户)
+- [第 3 步：为 Group 授予表的读权限](#第-3-步为-group-授予表的读权限)
+- [第 4 步：为白名单 Group 设置 FILTER TRUE 规则](#第-4-步为白名单-group-设置-filter-true-规则)
+- [第 5–7 步：新增账号、Copilot Group、条件表（客户）](#第-57-步新增账号copilot-group条件表客户)
+- [第 8 步：为 Copilot Group 设置规则](#第-8-步为-copilot-group-设置规则)
 - [验收](#验收)
 - [日常运维](#日常运维)
-- [第 8 步：应急回退](#第-8-步应急回退)
+- [第 9 步：应急回退](#第-9-步应急回退)
 - [常见问题](#常见问题)
 - [附录：退出码与日志速查](#附录退出码与日志速查)
 
@@ -48,7 +49,7 @@
 4. 在 Google Cloud Console / IAM，quota 项目上，给跑脚本的 user / SA 授权：**Service Usage Consumer**。（目的：允许以 quota 项目的名义调用 API）
 5. 在 Google Cloud Console / IAM：
    - quota 项目上，授权 **BigQuery Job User**；（目的：运行 BigQuery 查询和 DDL）
-   - 需要设 RLS 的业务表所在项目（或数据集）上，授权 **BigQuery Data Owner**；（目的：创建、修改、删除 RLS 规则）
+   - 需要设 RLS 的业务表所在项目（或数据集）上，授权 **BigQuery Data Owner**；（目的：创建、修改、删除 RLS 规则；第 3 步给 Group 授予表的读权限）
    - 三张控制表（condition、mapping、copilot_tb）所在的项目（或数据集）上，授权 **BigQuery Data Viewer**。（目的：读取控制表）
 6. （user 跑脚本时）在执行脚本的机器上执行一次 `gcloud auth login`；（SA 跑脚本时）由运维人员扮演该 SA（运维人员需对该 SA 有 Service Account Token Creator，并执行 `gcloud config set auth/impersonate_service_account <SA 邮箱>`），或在挂载了该 SA 的 GCE 虚拟机 / Cloud Run 上运行。
 
@@ -94,7 +95,7 @@ python list_principals.py --organizations 123456789012 --exclude-patterns 'copil
 
 **客户审核**：从 CSV 中挑出现存的 SA / user，决定各自进 ReadOnly 还是 Writable Group。
 
-## 第 2 步：现存账号加入白名单 Group（客户）
+## 第 2 步：把现有 SA 和 user 加入白名单 Group（客户）
 
 ```bash
 gcloud identity groups memberships add --group-email=group_existingsa_read@trip.com \
@@ -104,11 +105,29 @@ gcloud identity groups memberships add --group-email=group_existingsa_read@trip.
 - `--billing-project`：用 quota 项目（0.2 第 1 条已启用 Cloud Identity API）调用该 API；不加时 gcloud 会用执行命令者的默认项目，若该项目没启用 Cloud Identity API 会报 `SERVICE_DISABLED`。
 - 成员变更在 BigQuery 生效通常需要几分钟。
 
-## 第 3 步：为白名单 Group 设置 FILTER TRUE 规则
+## 第 3 步：为 Group 授予表的读权限
 
-**3.1 登记表**：脚本**只处理**登记表中 `rls_enabled = 1` 的表（不扫描项目 / 数据集，与项目里有多少张表无关）。把要设置 RLS 的表登记为 `rls_enabled = 1`；三张客户表（条件表 / 映射表 / 登记表）登记为 `0`（或不登记）。`table_name` 写 `project.dataset.table`（反引号可选），脚本按原始字符串精确比较。
+用 `grant_table_viewer.py` 给一个或多个 Group 统一授予表级 **BigQuery Data Viewer**（读表权限）。已经有读表权限的 Group（例如在数据集 / 项目层级已授权）可跳过本步。
 
-**3.2 演练**（不做变更）：
+```bash
+python grant_table_viewer.py --groups group_existingsa_read@trip.com,group_existingsa_write@trip.com --tables tables.csv   # 演练
+python grant_table_viewer.py --groups groups.csv --tables tables.csv --apply                                            # 执行
+python grant_table_viewer.py --groups groups.csv --datasets trip-prod.dw --apply                                        # 整个数据集的普通表
+```
+
+检查日志：`[GRANT] <表>: 新增 [...]；已有 [...]`（只加缺少的 Group）、`[NOOP]`（已授权）、`[SKIP]`（表不存在）。
+
+- 新增业务表后，把新表写进 `--tables`（或用 `--datasets`）重跑即可；已授权的表 `[NOOP]`。
+- **注意 RLS**：表上还没有任何 RLS 规则时，授权后 Group 成员能看到全部数据。白名单 Group 本来就应看全部，没有问题；**需要按行过滤的 Group（如 Copilot Group）请在第 4 步之后再授权**（表上已有规则后，没有被规则授权的成员查到 0 行）。
+- 只改这张表自己的 IAM，不动数据集 / 项目层级的授权；不提供撤销，需要时在控制台手工去掉。
+- Group 写错或刚创建：第一张表即停止（退出码 2、未做任何变更），核对拼写或等几分钟后重跑。
+- 权限：0.2 第 5 条的 BigQuery Data Owner 已包含（已用只有 0.2 权限的 user 和 SA 实测）。
+
+## 第 4 步：为白名单 Group 设置 FILTER TRUE 规则
+
+**4.1 登记表**：脚本**只处理**登记表中 `rls_enabled = 1` 的表（不扫描项目 / 数据集，与项目里有多少张表无关）。把要设置 RLS 的表登记为 `rls_enabled = 1`；三张客户表（条件表 / 映射表 / 登记表）登记为 `0`（或不登记）。`table_name` 写 `project.dataset.table`（反引号可选），脚本按原始字符串精确比较。
+
+**4.2 演练**（不做变更）：
 
 ```bash
 REG=trip-bq-admin.bq_auth.adm_user_mem_copilot_tb
@@ -124,7 +143,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com --registry-tab
 
 > `--tables` / `--datasets` / `--projects` 已删除（传入即退出码 2）。
 
-**3.3 执行**，ReadOnly、Writable 各一次。建议用 `--verify-sa` 指定组内一个有读表权限的 SA，执行后扮演它查表做挂载后验证（可选）。
+**4.3 执行**，ReadOnly、Writable 各一次。建议用 `--verify-sa` 指定组内一个有读表权限的 SA，执行后扮演它查表做挂载后验证（可选）。
 
 - **前提**：在要扮演的 SA 上（Google Cloud Console / IAM & Admin → Service Accounts → 该 SA → Permissions），给跑脚本的 user / SA 授权：**Service Account Token Creator**。否则规则照常建好，但会报 `[VERIFY-FAIL] … 无法扮演`、退出码 1。
 
@@ -137,7 +156,7 @@ python apply_bypass_rls.py --group group_existingsa_write@trip.com --registry-ta
 - `[VERIFY-OK]` = 通过；`[VERIFY-FAIL]` = 300 秒内查不到数据或无法扮演（退出码 1）。
 - 重跑安全：已正确的表全部 `[NOOP]`。
 
-**3.4 可选：多个主体共用一条规则**（减少每张表的规则数）。用 `--principals` 代替 `--group`（二者只能给一个），配合 `--policy-name`：
+**4.4 可选：多个主体共用一条规则**（减少每张表的规则数）。用 `--principals` 代替 `--group`（二者只能给一个），配合 `--policy-name`：
 
 ```bash
 # principals.csv：单列无表头，每行一个，必须带前缀 user: / group: / serviceAccount:
@@ -150,13 +169,13 @@ python apply_bypass_rls.py --policy-name existing_all --principals principals.cs
 
 - 每张表只建一条 `rls_bypass_full_access_existing_all`，授权给文件里的全部主体。
 - **完整名单**：以后增减主体，修改 principals.csv 后重跑即可；演练日志的 `将新增` / `将移除` 必须先确认——**少写的主体会立刻失去全部可见**。
-- 从两条 `--group` 规则改成一条共享规则时：**先**建好共享规则（`--apply` 成功），**再**用第 8 步 C 按规则名删除两条旧规则；顺序反了会出现查到 0 行的窗口。
+- 从两条 `--group` 规则改成一条共享规则时：**先**建好共享规则（`--apply` 成功），**再**用第 9 步 C 按规则名删除两条旧规则；顺序反了会出现查到 0 行的窗口。
 - 规则名同名即覆盖，不检查是否与 `--group` 的规则撞名，请避免用 `group_..._trip_com` 这类与 Group 邮箱相同的后缀。
 
-## 第 4–6 步：新增账号、Copilot Group、条件表（客户）
+## 第 5–7 步：新增账号、Copilot Group、条件表（客户）
 
-1. 创建新增 SA（第 4 步）、为 Copilot SA 赋予扮演权限（第 5 步）。
-2. 把全部新增 SA / user 加入 **Copilot Group**（第 6 步）。High / Low / All 等 Group 只用于表级读写权限，与 RLS 无关。
+1. 创建新增 SA（第 5 步）、为 Copilot SA 赋予扮演权限（第 6 步）。
+2. 把全部新增 SA / user 加入 **Copilot Group**（第 7 步）。High / Low / All 等 Group 只用于表级读写权限，与 RLS 无关。
 3. **给 Copilot Group 授予条件表读权限**（必需：规则里的子查询以查询者身份读条件表，否则查询业务表报 Access Denied）：
 
    ```bash
@@ -165,10 +184,10 @@ python apply_bypass_rls.py --policy-name existing_all --principals principals.cs
    ```
 
    注意：组内成员因此能读到整张条件表。
-4. 在条件表中为每个新增账号写一行：`sa` 用**小写裸邮箱**；`status` = **1**（只有 `status = 1` 的行生效，0 / NULL / 其它值等同没有这一行）；维度列为 `ARRAY<STRING>`，NULL / 空数组 = 该维度全部可见。条件表必须有 `status` 列（INT64），否则第 7 步报错退出（退出码 2，未做任何变更）。
+4. 在条件表中为每个新增账号写一行：`sa` 用**小写裸邮箱**；`status` = **1**（只有 `status = 1` 的行生效，0 / NULL / 其它值等同没有这一行）；维度列为 `ARRAY<STRING>`，NULL / 空数组 = 该维度全部可见。条件表必须有 `status` 列（INT64），否则第 8 步报错退出（退出码 2，未做任何变更）。
 5. 在映射表中为每张业务表写维度映射（`table_name, col_name, to_name`），并在登记表中把这些表登记为 `rls_enabled = 1`。
 
-## 第 7 步：为 Copilot Group 设置规则
+## 第 8 步：为 Copilot Group 设置规则
 
 ```bash
 AUTH="--condition-table trip-bq-admin.bq_auth.adm_user_mem_copilot_condition \
@@ -223,17 +242,17 @@ CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=copilot-a@trip-ai.iam.gserviceaccount.
 | 撤销 Copilot 账号 | 移出 Group、删除条件表行，或把 `status` 改为 0 | **不用** |
 | 恢复 Copilot 账号 | 条件表 `status` 改回 1 | **不用** |
 | 新增现存类账号（需要看全部） | 加入 ReadOnly / Writable Group | **不用** |
-| 新增业务表 | 登记表加一行（`rls_enabled = 1`）+ 映射表加维度 → 依次跑第 3 步（两个白名单 Group）和第 7 步 | 要（只处理有变化的表） |
-| 修改某表的映射维度 / 条件表新增维度列 | 跑第 7 步 | 要（变化的表 REPLACE） |
-| 某表不再需要 RLS | 登记表改 `rls_enabled = 0`（第 3 步以后不再处理它），再用 rollback 删除该表规则 | 要 |
-| 增加第二个 Copilot Group | 对新 Group 跑第 7 步（每表多一条规则） | 要 |
+| 新增业务表 | 需要时先跑第 3 步给 Group 授读权限；登记表加一行（`rls_enabled = 1`）+ 映射表加维度 → 依次跑第 4 步（两个白名单 Group）和第 8 步 | 要（只处理有变化的表） |
+| 修改某表的映射维度 / 条件表新增维度列 | 跑第 8 步 | 要（变化的表 REPLACE） |
+| 某表不再需要 RLS | 登记表改 `rls_enabled = 0`（第 4 步以后不再处理它），再用 rollback 删除该表规则 | 要 |
+| 增加第二个 Copilot Group | 对新 Group 跑第 8 步（每表多一条规则） | 要 |
 
 > [!IMPORTANT]
 > 条件表、映射表、登记表决定了谁能看到什么，**只允许客户的权限系统写入**；审核时特别注意「维度为空数组 = 全部可见」。
 
 **变更追查**：规则的创建 / 修改 / 删除都在 BigQuery 审计日志中（保留 400 天），查询方法见 [README：审计日志](README.md#审计日志)。
 
-## 第 8 步：应急回退
+## 第 9 步：应急回退
 
 先演练（不加 `--apply`）确认日志里列出的将删除规则，再执行。
 
@@ -247,13 +266,13 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_existingsa_wri
 # C. 按规则名删除（整条删除）
 python rollback_rls.py --tables tables.csv --policy-names rls_copilot_group_copilot_trip_com --apply
 
-# C2. 从共享规则（3.4）里只去掉某个账号，其余账号保留
+# C2. 从共享规则（4.4）里只去掉某个账号，其余账号保留
 python rollback_rls.py --datasets trip-prod.dw --principals etl@trip-prod.iam.gserviceaccount.com --apply
 
 # D. 删除目标表上的全部规则（表恢复为没有 RLS：所有有读表权限的账号都看到全部数据）
 python rollback_rls.py --datasets trip-prod.dw --apply
 
-# 删除后验证某 SA 的可见行数（只报告；前提同 3.3 的 --verify-sa）
+# 删除后验证某 SA 的可见行数（只报告；前提同 4.3 的 --verify-sa）
 python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.com --apply \
     --verify-sa copilot-a@trip-ai.iam.gserviceaccount.com
 ```
@@ -261,7 +280,7 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 - `--principals` 按规则的**授权对象**匹配（能覆盖手工建的规则）；与 `--policy-names` 同时给出时取交集。
 - 给 `--principals` 时**只从规则里去掉这些主体**（日志 `[REMOVE]`，原过滤条件与其余主体保留）；规则的授权对象全部命中时才删除整条（`[DROP]`）。只授权给一个对象的规则（`--group` 规则、Copilot 规则）照旧整条删除。
 - 日志 `[NOTE]` 会列出「规则将被全部删除」的表，只提示不拦截。
-- 日志逐条打印被删除 / 被去掉主体的规则的完整内容（规则名、授权对象、过滤条件），需要恢复时据此重跑第 3 / 7 步即可。
+- 日志逐条打印被删除 / 被去掉主体的规则的完整内容（规则名、授权对象、过滤条件），需要恢复时据此重跑第 4 / 8 步即可。
 
 **中途中断怎么办**：任何脚本被 Ctrl-C（退出码 130）或进程被杀，都不会留下半条规则；直接重跑同一命令即可补齐，已完成的表会 `[NOOP]`（或在 rollback 中不再出现）。
 
@@ -280,13 +299,15 @@ python rollback_rls.py --datasets trip-prod.dw --principals group_copilot@trip.c
 | apply_bypass 退出码 2，`--principals 中有不合格的值` | 每个主体都必须带前缀 `user:` / `group:` / `serviceAccount:`（SA 也要写）；不支持 `domain:` / `allUsers`；同一邮箱不能写成两种类型 |
 | apply_bypass 退出码 2，`必须同时给 --policy-name` / `--policy-name 只能与 --principals 搭配` | `--principals` 必须配 `--policy-name`（规则名后缀）；`--group` 不能配 `--policy-name` |
 | rollback `[ERROR] … 无法写进 GRANT TO 的值` | 要去掉主体的规则里还有 `principalSet://` / `allUsers` / `deleted:` 等授权对象，脚本不改动这条规则：手工处理，或用 `--policy-names` 整条删除 |
+| grant_table_viewer `[ERROR] BigQuery 报 --groups 中有 Group 不存在` | Group 拼错，或刚创建 / 刚改过成员尚未同步到 BigQuery：核对后等几分钟重跑（第一张表即停止时未做任何变更） |
+| grant_table_viewer 授权后 Group 成员仍读不到 | 表上有 RLS 规则但没有授权给该成员（查到 0 行），或成员刚加入 Group 尚未同步；表级授权只给读表权限，不绕过 RLS |
 | apply_bypass 漏了某张表 | 它在登记表中不是 `rls_enabled = 1`，或 `table_name` 写法不对（看 `[SCAN]` 行的数量与 `[WARN]`） |
 | `[ERROR] BigQuery 报 Group … 不存在，已停止` | `--group` 拼错，或 Group 刚创建 / 刚改过成员、还没同步到 BigQuery：核对拼写，或等几分钟后重跑。第一张表就失败时退出码 2、未做任何变更 |
 | 某表 `[SKIP] … 表不存在（可能已被删除）` | 映射表 / 登记表里还有这张表，但它已被 drop 或表名写错：清理映射表 / 登记表中的记录（其余表不受影响，退出码 1） |
 | Copilot 账号查到 0 行 | 依次检查：在 Copilot Group 里吗？条件表有该账号的行吗（小写裸邮箱）？该行 `status` 是 1 吗？维度值与业务列的值一致吗？Group 刚变更需等几分钟 |
-| Copilot 账号查询报 Access Denied | Copilot Group 没有条件表读权限（见第 4–6 步第 3 点） |
-| 现存账号突然查到 0 行 | 该表上有规则但没有它所在 Group 的 bypass 规则：用第 3 步补上（重跑只会 CREATE 缺的表） |
-| `[VERIFY-FAIL] … 无法扮演` | 跑脚本的 user / SA 对 `--verify-sa` 指定的 SA 没有 Service Account Token Creator（见 3.3 前提），或该 SA 不存在 |
+| Copilot 账号查询报 Access Denied | Copilot Group 没有条件表读权限（见第 5–7 步第 3 点） |
+| 现存账号突然查到 0 行 | 该表上有规则但没有它所在 Group 的 bypass 规则：用第 4 步补上（重跑只会 CREATE 缺的表） |
+| `[VERIFY-FAIL] … 无法扮演` | 跑脚本的 user / SA 对 `--verify-sa` 指定的 SA 没有 Service Account Token Creator（见 4.3 前提），或该 SA 不存在 |
 | 视图上 `[ERROR]` | BigQuery 视图不支持 RLS；从登记表 / 映射表 / `--tables` 中去掉视图 |
 | 大量 `[retry]` | BigQuery 速率限制；脚本会自动退避重试。持续出现时降低 `--parallel`（建议不超过 32） |
 | 组织范围 `[ERROR] 账号目录` | 跑脚本的 user / SA 没有 Admin 控制台的 Users → Read 角色（见 0.2 第 2 条）；其余结果已写入 CSV |

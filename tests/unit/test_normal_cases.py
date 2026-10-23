@@ -60,7 +60,7 @@ def cai_iam(resource, members, role="roles/viewer"):
 
 
 # =========================================================================== #
-# 第 3 步 apply_bypass_rls.py
+# 第 4 步 apply_bypass_rls.py
 # =========================================================================== #
 class TestApplyBypassNormal:
     @pytest.fixture
@@ -153,10 +153,10 @@ class TestApplyBypassNormal:
 
 
 # =========================================================================== #
-# 第 7 步 apply_copilot_rls.py
+# 第 8 步 apply_copilot_rls.py
 # =========================================================================== #
 # =========================================================================== #
-# 第 8 步 rollback_rls.py
+# 第 9 步 rollback_rls.py
 # =========================================================================== #
 def cop_rule(email):
     """一条只授权给单个账号的规则（回退测试用；如手工建的规则或旧版按账号的 Copilot 规则）。"""
@@ -240,7 +240,7 @@ class TestRollbackNormal:
 
 
 # =========================================================================== #
-# 端到端：按 Doc 顺序 1 → 3 → 7 → 8
+# 端到端：按 Doc 顺序 1 → 4 → 8 → 9
 # =========================================================================== #
 class TestEndToEndFlow:
     def test_full_flow(self, monkeypatch, tmp_path):
@@ -258,13 +258,13 @@ class TestEndToEndFlow:
             monkeypatch.setattr(mod, "resolve_auth", fake_auth)
 
         assert list_principals.main(["--projects", P, "-o", str(tmp_path / "p.csv")]) == 0            # 第 1 步
-        assert apply_copilot_rls.main([*AUTH, "-o", str(tmp_path / "c.csv"), "--apply"]) == 0          # 第 7 步先于第 3 步：不再拦截
+        assert apply_copilot_rls.main([*AUTH, "-o", str(tmp_path / "c.csv"), "--apply"]) == 0          # 第 8 步先于第 4 步：不再拦截
         assert {x["id"] for x in w.policies(T1)} == {COP_G}                                         # 每表一条 Group 规则
-        assert apply_bypass_rls.main(["--group", G_R, *BYP_ARGS, "--apply"]) == 0   # 第 3 步补 bypass
+        assert apply_bypass_rls.main(["--group", G_R, *BYP_ARGS, "--apply"]) == 0   # 第 4 步补 bypass
         assert apply_bypass_rls.main(["--group", G_W, *BYP_ARGS, "--apply"]) == 0
         assert apply_copilot_rls.main([*AUTH, "-o", str(tmp_path / "c.csv"), "--apply"]) == 0          # 重跑：NOOP
         assert {x["id"] for x in w.policies(T1)} == {BYP_R, BYP_W, COP_G}
-        assert rollback_rls.main(["--datasets", f"{P}.dw", "--principals", G_COP, "--apply"]) == 0         # 第 8 步：撤 Copilot Group 规则
+        assert rollback_rls.main(["--datasets", f"{P}.dw", "--principals", G_COP, "--apply"]) == 0         # 第 9 步：撤 Copilot Group 规则
         assert COP_G not in {x["id"] for x in w.policies(T1)} and BYP_R in {x["id"] for x in w.policies(T1)}
         assert rollback_rls.main(["--datasets", f"{P}.dw", "--apply"]) == 0                               # 不给筛选 = 全部删除
         assert w.policies(T1) == [] and w.policies(T2) == [] and w.policies(COND) == []

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-为白名单（一个 Group，或多个 user / group / SA）在目标表上设置 FILTER TRUE 行级规则（Doc 第 3 步）：
+为白名单（一个 Group，或多个 user / group / SA）在目标表上设置 FILTER TRUE 行级规则（Doc 第 4 步）：
 被授权的账号不受行级过滤、可见全部记录（前提是本来就有读表权限；本脚本不授予读表权限）。
 
 两种用法（每次运行二选一，同时给或都不给 -> 参数错误，退出码 2）:

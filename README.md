@@ -1,7 +1,7 @@
 # BigQuery 行级权限（RLS）工具集
 
-为 BigQuery 表批量设置 / 回退行级权限（Row-Level Security）的 4 个 Python 脚本，对应方案文档
-「[BigQuery 行级权限 (RLS) 方案](https://docs.google.com/document/d/1SYnwBy28UIU6abcUZskOT_Quccqx5oxYlAkIIIzJ53c/edit)」中由 GCP 提供的 4 个步骤。
+为 BigQuery 表批量设置 / 回退行级权限（Row-Level Security）的 5 个 Python 脚本，对应方案文档
+「[BigQuery 行级权限 (RLS) 方案](https://docs.google.com/document/d/1SYnwBy28UIU6abcUZskOT_Quccqx5oxYlAkIIIzJ53c/edit)」中由 GCP 提供的 5 个步骤（第 1、3、4、8、9 步）。
 
 | 文档 | 内容 |
 |---|---|
@@ -18,9 +18,10 @@
 - [客户维护的三张表](#客户维护的三张表)
 - [脚本详解](#脚本详解)
   - [1. list_principals.py](#1-list_principalspy列出全部-sa-和-user第-1-步)
-  - [2. apply_bypass_rls.py](#2-apply_bypass_rlspy白名单-group-不受行级过滤第-3-步)
-  - [3. apply_copilot_rls.py](#3-apply_copilot_rlspycopilot-group-按条件表过滤第-7-步)
-  - [4. rollback_rls.py](#4-rollback_rlspy回退第-8-步)
+  - [2. apply_bypass_rls.py](#2-apply_bypass_rlspy白名单-group-不受行级过滤第-4-步)
+  - [3. apply_copilot_rls.py](#3-apply_copilot_rlspycopilot-group-按条件表过滤第-8-步)
+  - [4. rollback_rls.py](#4-rollback_rlspy回退第-9-步)
+  - [5. grant_table_viewer.py](#5-grant_table_viewerpy给-group-统一授予表级读权限第-3-步)
 - [权限要求汇总](#权限要求汇总)
 - [安全须知（信任边界）](#安全须知信任边界)
 - [限制与注意事项](#限制与注意事项)
@@ -34,26 +35,27 @@
 ```mermaid
 flowchart TD
     subgraph S1["第一阶段：现存 SA / user 白名单（零中断）"]
-        A["1. 列出现有 SA 和 user<br/>list_principals.py"] --> B["2. 把现存账号加入 ReadOnly / Writable Group<br/>（客户）"]
-        B --> C["3. 为 ReadOnly / Writable Group 设置 FILTER TRUE 规则<br/>apply_bypass_rls.py"]
+        A["1. 列出现有 SA 和 user<br/>list_principals.py"] --> B["2. 把现有 SA 和 user 加入 ReadOnly / Writable Group<br/>（客户）"]
+        B --> V["3. 为 Group 授予表的读权限（BigQuery Data Viewer）<br/>grant_table_viewer.py"]
+        V --> C["4. 为 ReadOnly / Writable Group 设置 FILTER TRUE 规则<br/>apply_bypass_rls.py"]
     end
     subgraph S2["第二阶段：新增 SA / user 细粒度行级权限"]
-        D["4. 创建新增 SA（含 Copilot SA）<br/>（客户）"] --> E["5. 为 Copilot SA 赋予扮演权限<br/>（客户）"]
-        E --> F["6. 把新增账号加入 Copilot Group，在条件表中登记可见范围<br/>（客户）"]
-        F --> G["7. 为 Copilot Group 在每张表上设置一条按条件表过滤的规则<br/>apply_copilot_rls.py"]
+        D["5. 创建新增 SA（含 Copilot SA）<br/>（客户）"] --> E["6. 为 Copilot SA 赋予扮演权限<br/>（客户）"]
+        E --> F["7. 把新增账号加入 Copilot Group，在条件表中登记可见范围<br/>（客户）"]
+        F --> G["8. 为 Copilot Group 在每张表上设置一条按条件表过滤的规则<br/>apply_copilot_rls.py"]
     end
     subgraph S3["应急"]
-        H["8. 回退<br/>rollback_rls.py"]
+        H["9. 回退<br/>rollback_rls.py"]
     end
     C --> D
     G -.-> H
 ```
 
 **为什么分两个 Group**：BigQuery 的 RLS 一旦在表上建了第一条规则，**没有被任何规则授权的账号会查到 0 行**。
-所以先用第 3 步给现存账号所在的 Group 建「全部可见」（`FILTER USING (TRUE)`）的规则，保证现有生产不受影响；
-再用第 7 步给新增账号所在的 Copilot Group 建按条件表过滤的规则。
+所以先用第 4 步给现存账号所在的 Group 建「全部可见」（`FILTER USING (TRUE)`）的规则，保证现有生产不受影响；
+再用第 8 步给新增账号所在的 Copilot Group 建按条件表过滤的规则。
 
-**为什么第 7 步是 Group 级别**：每张表最多 400 条规则（BigQuery 硬限制）。客户已有 457 个新增账号，按账号建规则会超限。
+**为什么第 8 步是 Group 级别**：每张表最多 400 条规则（BigQuery 硬限制）。客户已有 457 个新增账号，按账号建规则会超限。
 现在每张表只给 Copilot Group 建**一条**规则；过滤条件里按 `SESSION_USER()`（当前查询者）实时查条件表，
 所以同一个 Group 里的 A 只看 region = US、B 只看 region = JP，互不影响。**新增账号只需加入 Group 并在条件表加一行，无需重跑脚本。**
 
@@ -62,9 +64,10 @@ flowchart TD
 | 文件 | 说明 |
 |---|---|
 | `list_principals.py` | 第 1 步：列出指定组织 / 项目下的全部主体（SA、user、Group 等，不看角色；白名单候选），输出 CSV |
-| `apply_bypass_rls.py` | 第 3 步：为一个白名单 Group 在目标表上设置 `FILTER USING (TRUE)` 规则 |
-| `apply_copilot_rls.py` | 第 7 步：为 Copilot Group 在每张表上设置一条按条件表过滤的规则 |
-| `rollback_rls.py` | 第 8 步：删除目标表上的 RLS 规则（按主体 / 规则名 / 全部） |
+| `apply_bypass_rls.py` | 第 4 步：为一个白名单 Group 在目标表上设置 `FILTER USING (TRUE)` 规则 |
+| `apply_copilot_rls.py` | 第 8 步：为 Copilot Group 在每张表上设置一条按条件表过滤的规则 |
+| `rollback_rls.py` | 第 9 步：删除目标表上的 RLS 规则（按主体 / 规则名 / 全部） |
+| `grant_table_viewer.py` | 第 3 步：给多个 Group 统一授予多张表的表级 BigQuery Data Viewer（读权限） |
 | `rls_core.py` | 纯逻辑：参数解析、规则命名、DDL 生成、计划（CREATE / NOOP / REPLACE）、CSV |
 | `gcp_ops.py` | GCP 调用：BigQuery / IAM / Resource Manager / Cloud Identity / Admin SDK，含重试、限速、并行 |
 | `gcp_auth.py` | 凭证：自动确定执行账号与 quota 项目，token 自动刷新 |
@@ -88,7 +91,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com \
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply
 ```
 
-### 执行账号与 quota 项目（四个脚本相同，均可不写）
+### 执行账号与 quota 项目（五个脚本相同，均可不写）
 
 | 项 | 确定顺序 | 都取不到时 |
 |---|---|---|
@@ -101,7 +104,7 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com \
 
 | 项 | 约定 |
 |---|---|
-| 默认演练 | 三个 RLS 脚本默认**只演练**（打印将执行的 DDL，不做变更）；加 `--apply` 才执行。list_principals 只读 |
+| 默认演练 | 四个会做变更的脚本（grant_table_viewer、apply_bypass、apply_copilot、rollback）默认**只演练**（打印将执行的变更，不做变更）；加 `--apply` 才执行。list_principals 只读 |
 | 列表参数 | `--tables` / `--datasets` / `--projects` / `--principals` / `--policy-names` / `--organizations`：值可直接写（逗号或空格分隔），也可写 **`.csv` 文件**（单列、无表头、每行一个值；空行忽略；不支持注释），可混用；**同一参数写多次会累加** |
 | `.csv` 判定 | 以 `.csv` 结尾（不区分大小写）且没有被反引号包住即当作文件；文件不存在 → 退出码 2 |
 | 表名写法 | 参数和参数文件中一律 `project.dataset.table`（必须三段），**反引号可选**（可直接从 SQL / 控制台复制，如 `` `trip-prod.dw.orders` ``）；**不接受** `project:dataset.table`。数据集 `project.dataset`，同样反引号可选。（在 shell 里写反引号要加引号：`--tables '`p.d.t`'`） |
@@ -113,9 +116,9 @@ python apply_bypass_rls.py --group group_existingsa_read@trip.com \
 | 错误输出 | 不输出 Python 堆栈，打印 `[ERROR] <类型>: <信息>`（设 `RLS_DEBUG=1` 可看完整堆栈） |
 | 暂时性错误 | 速率限制 / 后端错误 / 网络超时自动指数退避重试（总计 300 秒内） |
 | 输出 CSV | UTF-8 BOM（Excel 可直接打开）；单元格做公式注入防护 |
-| 运行日志 | 四个脚本每次运行都把屏幕输出**原样**另存到 **当前目录下的 `logs/<脚本名>_<YYYYMMDD_HHMMSS>.log`**（目录不存在自动创建；同一秒重名加 `_2`；永不覆盖、不自动清理）。`--log-dir <目录>` 可改保存位置。第一行 `[LOG] 日志文件: …` 提示文件位置；日志文件建不了时只打印 `[WARN]`，脚本照常运行。参数写错导致 argparse 报错、或 `--help` 时不生成。日志含账号邮箱 / 表名，`.gitignore` 已忽略 |
+| 运行日志 | 五个脚本每次运行都把屏幕输出**原样**另存到 **当前目录下的 `logs/<脚本名>_<YYYYMMDD_HHMMSS>.log`**（目录不存在自动创建；同一秒重名加 `_2`；永不覆盖、不自动清理）。`--log-dir <目录>` 可改保存位置。第一行 `[LOG] 日志文件: …` 提示文件位置；日志文件建不了时只打印 `[WARN]`，脚本照常运行。参数写错导致 argparse 报错、或 `--help` 时不生成。日志含账号邮箱 / 表名，`.gitignore` 已忽略 |
 
-**退出码**（四个脚本相同）：
+**退出码**（五个脚本相同）：
 
 | 码 | 含义 |
 |---|---|
@@ -188,7 +191,7 @@ apply_bypass **只处理**登记表中 `rls_enabled = 1` 的表（不扫描项�
 | `--exclude-patterns` | 从输出中去掉匹配通配符的邮箱，如 `'copilot-*@*'` |
 | `-o` | 输出 CSV，默认 `principals.csv` |
 | `--parallel` | 并发数，默认 16 |
-| `--gcloud-account` / `--quota-project` | 可选，见[快速开始](#执行账号与-quota-项目四个脚本相同均可不写) |
+| `--gcloud-account` / `--quota-project` | 可选，见[快速开始](#执行账号与-quota-项目五个脚本相同均可不写) |
 
 **从哪里列出谁**
 
@@ -242,7 +245,7 @@ python list_principals.py --organizations 123456789012
 python list_principals.py --projects trip-prod,trip-etl --exclude-patterns 'copilot-*@*' -o existing.csv
 ```
 
-### 2. apply_bypass_rls.py：白名单 Group 不受行级过滤（第 3 步）
+### 2. apply_bypass_rls.py：白名单 Group 不受行级过滤（第 4 步）
 
 为**一个**白名单 Group 在目标表上建 `FILTER USING (TRUE)` 规则：组内成员不受行级过滤、可见全部记录（前提是本来就有读表权限；**本脚本不授予读表权限**）。ReadOnly、Writable 各运行一次。
 
@@ -305,7 +308,7 @@ python apply_bypass_rls.py --policy-name existing_all --principals principals.cs
     --registry-table trip-bq-admin.bq_auth.adm_user_mem_copilot_tb --apply
 ```
 
-### 3. apply_copilot_rls.py：Copilot Group 按条件表过滤（第 7 步）
+### 3. apply_copilot_rls.py：Copilot Group 按条件表过滤（第 8 步）
 
 每张表给 `--group` 建**一条**规则，组内每个 SA / user 按条件表各自只看到规定的数据。
 
@@ -369,9 +372,9 @@ python apply_copilot_rls.py ...同上... --apply
 ```
 
 > [!NOTE]
-> 表上原本没有任何规则时，Copilot 规则会让现存账号查到 0 行（日志 `[NOTE]` 列出这些表）。正常流程中第 3 步已为现存账号的 Group 建好 bypass 规则；如有遗漏，用 apply_bypass_rls.py 补上即可。
+> 表上原本没有任何规则时，Copilot 规则会让现存账号查到 0 行（日志 `[NOTE]` 列出这些表）。正常流程中第 4 步已为现存账号的 Group 建好 bypass 规则；如有遗漏，用 apply_bypass_rls.py 补上即可。
 
-### 4. rollback_rls.py：回退（第 8 步）
+### 4. rollback_rls.py：回退（第 9 步）
 
 删除目标表上的 RLS 规则，或从规则里去掉指定主体。
 
@@ -395,11 +398,35 @@ python rollback_rls.py --tables tables.csv --apply                              
 python rollback_rls.py --tables tables.csv --principals etl@trip-prod.iam.gserviceaccount.com --apply  # 从共享规则里只去掉这个 SA
 ```
 
+### 5. grant_table_viewer.py：给 Group 统一授予表级读权限（第 3 步）
+
+给一个或多个 Group 授予一批表的**表级** BigQuery Data Viewer（`roles/bigquery.dataViewer`）。新增业务表后重跑即可，已授权的表 `[NOOP]`。
+
+| 参数 | 说明 |
+|---|---|
+| `--groups`（必填） | Group 邮箱：裸邮箱，不带 `group:` 前缀，不能是 SA；可写多个、可写 `.csv`、可重复累加 |
+| `--tables` / `--datasets` / `--projects` | 目标范围，至少给一类，可叠加；数据集 / 项目展开为其中全部**普通表**（视图不包括；显式写在 `--tables` 里的视图照样授权） |
+| `--parallel` / `--apply` / `--gcloud-account` / `--quota-project` / `--log-dir` | 同上 |
+
+- 角色固定为 `roles/bigquery.dataViewer`；**只看这张表自己的 IAM**（数据集 / 项目层级已有的授权不读、不改）。
+- 逐表：所有 Group 都已在无条件的 dataViewer 授权里 → `[NOOP]`；否则 `[GRANT] <表>: 新增 [...]；已有 [...]`，只加缺少的。其它角色、其它成员原样保留（BigQuery 表级 IAM 只支持 v1 策略，没有条件授权）。
+- 并发修改冲突（etag）→ 重新读取、重新合并后重试；表不存在 → `[SKIP]`、退出码 1；其它失败 → `[ERROR]`、其余照常、退出码 1。
+- Group 不存在：与 apply_bypass 相同，第一张需要变更的表即停止，退出码 2，未做任何变更。
+- **不看登记表、不检查 RLS**：表上还没有任何 RLS 规则时，授权后 Group 成员能看到全部数据；有规则时只能看到规则允许的行。
+- **不提供撤销**（需要时在控制台或用 `bq remove-iam-policy-binding` 手工处理）。
+- 配额：每张表读、写 IAM 各一次，受 BigQuery IamPolicy 配额限制（脚本自动限速，约每分钟 700 张表）。范围很大时，考虑改为数据集级授权。
+- 不输出 CSV，运行日志即记录。
+
+```bash
+python grant_table_viewer.py --groups group_high@trip.com,group_low@trip.com --tables tables.csv            # 演练
+python grant_table_viewer.py --groups groups.csv --datasets trip-prod.dw --apply                            # 执行
+```
+
 ---
 
 ## 权限要求汇总
 
-与 [RUNBOOK 0.2](RUNBOOK.md#02-授予跑脚本的-user--sa-权限一次) 一致：跑脚本的 user / SA 被授予下面这些权限后，便可运行四个脚本（已在测试环境用新建、无任何权限的 user 和 SA 各实测一遍）。
+与 [RUNBOOK 0.2](RUNBOOK.md#02-授予跑脚本的-user--sa-权限一次) 一致：跑脚本的 user / SA 被授予下面这些权限后，便可运行五个脚本（已在测试环境用新建、无任何权限的 user 和 SA 各实测一遍）。
 
 | # | 在哪里 | 授予跑脚本的 user / SA | 用于 |
 |---|---|---|---|
@@ -407,9 +434,9 @@ python rollback_rls.py --tables tables.csv --principals etl@trip-prod.iam.gservi
 | 2 | admin.google.com（Workspace / Cloud Identity） | 自定义管理员角色，只勾 **Users → Read**、**Groups → Read** | 第 1 步：列出账号目录中的 user 和 Group、展开 Group 成员 |
 | 3 | 组织层级 IAM | **Browser**、**Security Reviewer**、**BigQuery Metadata Viewer** | 第 1 步：遍历项目、列出 SA、读取各层级 IAM 与 BigQuery 授权 |
 | 4 | quota 项目 IAM | **Service Usage Consumer** | 全部脚本：以 quota 项目的名义调用 API（缺少时所有调用报 403 `USER_PROJECT_DENIED`） |
-| 5 | quota 项目 IAM | **BigQuery Job User** | 第 3、7、8 步：运行查询与 DDL |
-| 5 | 业务表所在项目（或数据集） | **BigQuery Data Owner** | 第 3、7、8 步：创建、修改、删除行级规则 |
-| 5 | 三张控制表所在项目（或数据集） | **BigQuery Data Viewer** | 第 3、7 步：读取登记表、条件表、映射表 |
+| 5 | quota 项目 IAM | **BigQuery Job User** | 第 4、8、9 步：运行查询与 DDL |
+| 5 | 业务表所在项目（或数据集） | **BigQuery Data Owner** | 第 3 步：读写表级 IAM（`bigquery.tables.getIamPolicy` / `setIamPolicy`）；第 4、8、9 步：创建、修改、删除行级规则 |
+| 5 | 三张控制表所在项目（或数据集） | **BigQuery Data Viewer** | 第 4、8 步：读取登记表、条件表、映射表 |
 | 6 | 登录方式 | user：`gcloud auth login`；SA：由运维人员扮演（需对该 SA 有 Service Account Token Creator，`gcloud config set auth/impersonate_service_account <SA>`），或在挂载该 SA 的 GCE 虚拟机 / Cloud Run 上运行 | 全部脚本 |
 
 可选：使用 `--verify-sa` 或按 RUNBOOK「验收」以某个 SA 身份查表时，需在该 SA 上给跑脚本的 user / SA 授予 **Service Account Token Creator**。

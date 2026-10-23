@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-为 Copilot Group 设置行级规则（Doc 第 7 步）：每张表给 --group 建一条规则，组内每个 SA / user 按条件表各自只看到规定的数据。
+为 Copilot Group 设置行级规则（Doc 第 8 步）：每张表给 --group 建一条规则，组内每个 SA / user 按条件表各自只看到规定的数据。
 
 数据来源（三张表都必填，格式 project.dataset.table）:
   --condition-table  adm_user_mem_copilot_condition（id, sa, status, region[], prdtype[], refername[] ...）
