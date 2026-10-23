@@ -37,7 +37,7 @@ flowchart TD
     subgraph S1["第一阶段：现存 SA / user 白名单（零中断）"]
         A["1. 列出现有 SA 和 user<br/>list_principals.py"] --> B["2. 把现有 SA 和 user 加入 ReadOnly / Writable Group<br/>（客户）"]
         B --> V["3. 为 Group 授予表的读权限（BigQuery Data Viewer）<br/>grant_table_viewer.py"]
-        V --> C["4. 为 ReadOnly / Writable Group 设置 FILTER TRUE 规则<br/>apply_bypass_rls.py"]
+        V --> C["4. 为现有 SA 和 user 所在的 ReadOnly / Writable Group 设置 FILTER TRUE 规则<br/>apply_bypass_rls.py"]
     end
     subgraph S2["第二阶段：新增 SA / user 细粒度行级权限"]
         D["5. 创建新增 SA（含 Copilot SA）<br/>（客户）"] --> E["6. 为 Copilot SA 赋予扮演权限<br/>（客户）"]
@@ -52,7 +52,7 @@ flowchart TD
 ```
 
 **为什么分两个 Group**：BigQuery 的 RLS 一旦在表上建了第一条规则，**没有被任何规则授权的账号会查到 0 行**。
-所以先用第 4 步给现存账号所在的 Group 建「全部可见」（`FILTER USING (TRUE)`）的规则，保证现有生产不受影响；
+所以先用第 4 步给现有 SA 和 user 所在的 Group 建「全部可见」（`FILTER USING (TRUE)`）的规则，保证现有生产不受影响；
 再用第 8 步给新增账号所在的 Copilot Group 建按条件表过滤的规则。
 
 **为什么第 8 步是 Group 级别**：每张表最多 400 条规则（BigQuery 硬限制）。客户已有 457 个新增账号，按账号建规则会超限。
